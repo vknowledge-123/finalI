@@ -1941,6 +1941,22 @@
       }, 3000);
     }
 
+    async function readJsonResponse(response) {
+      const text = await response.text();
+      let data = {};
+      if (text) {
+        try {
+          data = JSON.parse(text);
+        } catch (_) {
+          throw new Error(text.slice(0, 180) || `HTTP ${response.status}`);
+        }
+      }
+      if (!response.ok) {
+        throw new Error(data.error || data.detail || `HTTP ${response.status}`);
+      }
+      return data;
+    }
+
     function toggleVisibility(id) {
       const el = document.getElementById(id);
       el.type = el.type === 'password' ? 'text' : 'password';
@@ -2111,20 +2127,24 @@
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body)
         });
-        const d = await r.json();
-        if (d.error) throw d.error;
+        const d = await readJsonResponse(r);
+        if (d.error) throw new Error(d.detail || d.error);
         if (broker === "ZERODHA") {
           const selectResponse = await fetch("/api/broker-config", {
             method: "POST", headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ user_id: USER_ID, broker: "ZERODHA" })
           });
-          const selected = await selectResponse.json();
-          if (selected.error) throw selected.error;
+          const selected = await readJsonResponse(selectResponse);
+          if (selected.error) throw new Error(selected.detail || selected.error);
         }
-        toast(broker === "DHAN" ? "Dhan connected successfully" : "Credentials saved successfully");
+        if (d.warning) {
+          toast("Dhan saved, but feed startup needs checking", "error");
+        } else {
+          toast(broker === "DHAN" ? "Dhan connected successfully" : "Credentials saved successfully");
+        }
         closeCred();
       } catch (e) {
-        toast(e, 'error');
+        toast((e && e.message) ? e.message : String(e), 'error');
       }
     }
 

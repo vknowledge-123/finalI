@@ -100,6 +100,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+log = logging.getLogger("app.main")
 
 # make sure your module loggers show INFO
 logging.getLogger("trade_engine").setLevel(logging.INFO)
@@ -1324,45 +1325,61 @@ async def broker_config(user_id: int = 1) -> Dict[str, Any]:
 
 @app.post("/api/broker-config")
 async def save_broker_config(payload: Dict[str, Any]) -> Dict[str, Any]:
-    user_id = int(payload.get("user_id", 1))
-    broker = str(payload.get("broker") or "ZERODHA").strip().upper()
-    if broker not in {"ZERODHA", "DHAN"}:
-        return {"error": "UNSUPPORTED_BROKER"}
+    try:
+        user_id = int(payload.get("user_id", 1))
+        broker = str(payload.get("broker") or "ZERODHA").strip().upper()
+        if broker not in {"ZERODHA", "DHAN"}:
+            return {"error": "UNSUPPORTED_BROKER"}
 
-    if broker == "DHAN":
-        client_id = str(payload.get("client_id") or "").strip()
-        access_token = str(payload.get("access_token") or "").strip()
-        if not client_id or not access_token:
-            return {"error": "DHAN_CLIENT_ID_ACCESS_TOKEN_REQUIRED"}
-        if not _is_test_mode():
+        if broker == "DHAN":
+            client_id = str(payload.get("client_id") or "").strip()
+            access_token = str(payload.get("access_token") or "").strip()
+            if not client_id or not access_token:
+                return {"error": "DHAN_CLIENT_ID_ACCESS_TOKEN_REQUIRED"}
+            if not _is_test_mode():
+                try:
+                    response = await asyncio.to_thread(
+                        dhanhq(DhanContext(client_id, access_token)).get_fund_limits
+                    )
+                    if not _dhan_response_ok(response):
+                        return {"error": "DHAN_AUTHENTICATION_FAILED"}
+                except Exception as exc:
+                    log.warning("Dhan authentication failed | user=%s err=%s", user_id, exc)
+                    return {"error": "DHAN_AUTHENTICATION_FAILED", "detail": str(exc)}
+            await store.save_dhan_credentials(user_id, client_id, access_token)
+
+        await store.save_broker(user_id, broker)
+        _SESSION_CACHE.pop(user_id, None)
+        SYMBOL_TOKEN.clear()
+        TOKEN_TO_SYMBOL.clear()
+        SUB_TOKENS.clear()
+        eng = await ensure_engine(user_id)
+        await eng.configure_broker()
+
+        warning = ""
+        if broker == "DHAN" and not _is_test_mode():
             try:
-                response = await asyncio.to_thread(
-                    dhanhq(DhanContext(client_id, access_token)).get_fund_limits
-                )
-                if not _dhan_response_ok(response):
-                    return {"error": "DHAN_AUTHENTICATION_FAILED"}
+                await _stop_kite_ticker()
+                await build_symbol_token_map_from_dhan(user_id)
+                await subscribe_symbols_for_user(user_id, list(STOCK_INDEX_MAPPING.keys()))
+                await subscribe_dhan_sector_indices_for_user(user_id)
+                await start_dhan_feed(user_id)
+            except Exception as exc:
+                warning = "DHAN_FEED_START_FAILED"
+                log.exception("Dhan broker saved but feed startup failed | user=%s", user_id)
+        elif broker == "ZERODHA":
+            try:
+                await _stop_dhan_feed()
             except Exception:
-                return {"error": "DHAN_AUTHENTICATION_FAILED"}
-        await store.save_dhan_credentials(user_id, client_id, access_token)
+                log.exception("Dhan feed stop failed while switching broker | user=%s", user_id)
 
-    await store.save_broker(user_id, broker)
-    _SESSION_CACHE.pop(user_id, None)
-    SYMBOL_TOKEN.clear()
-    TOKEN_TO_SYMBOL.clear()
-    SUB_TOKENS.clear()
-    eng = await ensure_engine(user_id)
-    await eng.configure_broker()
-
-    if broker == "DHAN" and not _is_test_mode():
-        await _stop_kite_ticker()
-        await build_symbol_token_map_from_dhan(user_id)
-        await subscribe_symbols_for_user(user_id, list(STOCK_INDEX_MAPPING.keys()))
-        await subscribe_dhan_sector_indices_for_user(user_id)
-        await start_dhan_feed(user_id)
-    elif broker == "ZERODHA":
-        await _stop_dhan_feed()
-
-    return {"ok": True, "broker": broker}
+        result: Dict[str, Any] = {"ok": True, "broker": broker}
+        if warning:
+            result["warning"] = warning
+        return result
+    except Exception as exc:
+        log.exception("Broker config save failed")
+        return {"error": "BROKER_CONFIG_SAVE_FAILED", "detail": str(exc)}
 
 
 @app.get("/connect/zerodha")
