@@ -290,6 +290,13 @@ def _extract_ltp_from_response(response: Any) -> float:
     return 0.0
 
 
+def _short_repr(value: Any, limit: int = 500) -> str:
+    text = repr(value)
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)] + "..."
+
+
 def _is_broker_validation_error(exc: Any) -> bool:
     text = str(exc or "").upper()
     markers = (
@@ -1362,15 +1369,39 @@ class TradeEngine:
                         security_id = await DHAN_INSTRUMENTS.security_id(symbol)
                         if security_id:
                             segment = DHAN_INSTRUMENTS.exchange_segment_for_symbol(symbol, self.dhan)
-                            response = await self.market_data_worker.submit(
-                                self.dhan.ohlc_data,
-                                {segment: [int(security_id)]},
-                            )
+                            payload = {segment: [int(security_id)]}
+                            response = await self.market_data_worker.submit(self.dhan.ohlc_data, payload)
                             last_price = _extract_ltp_from_response(response)
                             if last_price > 0:
                                 return last_price
-                    except Exception:
-                        pass
+                            quote_fn = getattr(self.dhan, "quote_data", None)
+                            if callable(quote_fn):
+                                quote_response = await self.market_data_worker.submit(quote_fn, payload)
+                                last_price = _extract_ltp_from_response(quote_response)
+                                if last_price > 0:
+                                    return last_price
+                                log.warning(
+                                    "DHAN_LTP_EMPTY | user=%s symbol=%s security_id=%s segment=%s ohlc=%s quote=%s",
+                                    self.user_id,
+                                    symbol,
+                                    security_id,
+                                    segment,
+                                    _short_repr(response),
+                                    _short_repr(quote_response),
+                                )
+                            else:
+                                log.warning(
+                                    "DHAN_LTP_EMPTY | user=%s symbol=%s security_id=%s segment=%s ohlc=%s",
+                                    self.user_id,
+                                    symbol,
+                                    security_id,
+                                    segment,
+                                    _short_repr(response),
+                                )
+                        else:
+                            log.warning("DHAN_LTP_SECURITY_ID_MISSING | user=%s symbol=%s", self.user_id, symbol)
+                    except Exception as exc:
+                        log.warning("DHAN_LTP_FETCH_FAIL | user=%s symbol=%s err=%s", self.user_id, symbol, exc)
                 await asyncio.sleep(0.5)
                 continue
             ok = await self._ensure_kite_ready()

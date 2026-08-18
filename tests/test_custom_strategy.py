@@ -24,6 +24,7 @@ from app.custom_strategy import (
     validate_custom_config,
 )
 from app.memory_store import InMemoryStore
+from app.dhan_broker import DHAN_INSTRUMENTS
 from app.trade_engine import (
     AlertConfig,
     MarketDataWorker,
@@ -470,6 +471,36 @@ class HistoricalDataTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(price, 625.5)
         self.assertEqual(engine.market_data_worker.submit.await_args.args[1:], ("NSE:SBIN",))
+
+    async def test_dhan_ltp_fallback_uses_quote_when_ohlc_is_empty(self) -> None:
+        class FakeDhan:
+            NSE = "NSE_EQ"
+            FNO = "NSE_FNO"
+            INDEX = "IDX_I"
+
+            def ohlc_data(self, _payload):
+                return {}
+
+            def quote_data(self, _payload):
+                return {}
+
+        engine = TradeEngine(1, InMemoryStore())
+        engine.broker = "DHAN"
+        engine.dhan_client_id = "client"
+        engine.dhan_access_token = "token"
+        engine.dhan = FakeDhan()
+        DHAN_INSTRUMENTS.register_instrument("SBIN", "3045")
+        engine.market_data_worker.submit = AsyncMock(
+            side_effect=[
+                {"status": "success", "data": {"NSE_EQ": {"3045": {}}}},
+                {"status": "success", "data": {"NSE_EQ": {"3045": {"last_price": 625.5}}}},
+            ]
+        )
+
+        price = await engine._fetch_ltp("SBIN")
+
+        self.assertEqual(price, 625.5)
+        self.assertEqual(engine.market_data_worker.submit.await_count, 2)
 
 
 class TradeEngineIntegrationTests(unittest.IsolatedAsyncioTestCase):

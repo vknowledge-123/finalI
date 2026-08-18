@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .chartink_client import normalize_alert_name, normalize_symbol, normalize_symbols, parse_chartink_payload
 from .service_bootstrap import configure_logging, init_store
-from .service_queues import ALERT_QUEUE
+from .service_queues import ALERT_QUEUE, MARKET_SUBSCRIPTION_QUEUE
 
 configure_logging("alert_service")
 
@@ -17,7 +17,7 @@ app = FastAPI(title="AlgoEdge Alert Service")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -76,7 +76,15 @@ async def shutdown() -> None:
 @app.get("/health")
 async def health() -> Dict[str, Any]:
     depth = await store.redis.llen(ALERT_QUEUE) if store is not None else -1
-    return {"ok": True, "service": "alert", "queue": ALERT_QUEUE, "queue_depth": depth}
+    sub_depth = await store.redis.llen(MARKET_SUBSCRIPTION_QUEUE) if store is not None else -1
+    return {
+        "ok": True,
+        "service": "alert",
+        "queue": ALERT_QUEUE,
+        "queue_depth": depth,
+        "market_subscription_queue": MARKET_SUBSCRIPTION_QUEUE,
+        "market_subscription_queue_depth": sub_depth,
+    }
 
 
 @app.api_route("/webhook/chartink", methods=["POST", "GET"])
@@ -115,6 +123,18 @@ async def chartink_webhook(request: Request, user_id: int = 1) -> Dict[str, Any]
         },
     )
     if symbols:
+        await store.redis.rpush(
+            MARKET_SUBSCRIPTION_QUEUE,
+            json.dumps(
+                {
+                    "user_id": int(user_id),
+                    "symbols": symbols,
+                    "source": "chartink_alert",
+                    "timestamp": time.time(),
+                },
+                separators=(",", ":"),
+            ),
+        )
         await store.redis.rpush(ALERT_QUEUE, json.dumps(job, separators=(",", ":")))
 
     return {
@@ -126,4 +146,3 @@ async def chartink_webhook(request: Request, user_id: int = 1) -> Dict[str, Any]
         "result": initial_result,
         "latency_ms": round((time.perf_counter() - started) * 1000.0, 2),
     }
-
