@@ -17,7 +17,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from jinja2 import Template
 from kiteconnect import KiteConnect, KiteTicker 
-from dhanhq import DhanContext, dhanhq
+from dhanhq import DhanContext, MarketFeed, dhanhq
 from .redis_store import RedisStore, now_ist, now_ist_date
 from .chartink_client import (
     parse_chartink_payload,

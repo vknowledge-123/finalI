@@ -1952,7 +1952,7 @@
         }
       }
       if (!response.ok) {
-        throw new Error(data.error || data.detail || `HTTP ${response.status}`);
+        throw new Error(data.detail || data.message || data.error || `HTTP ${response.status}`);
       }
       return data;
     }
@@ -1968,7 +1968,8 @@
     async function openCred() {
       document.getElementById("credModal").classList.remove("hidden");
       try {
-        const d = await (await fetch(`/api/broker-config?user_id=${USER_ID}`)).json();
+        const resp = await fetch(`/api/broker-config?user_id=${USER_ID}`);
+        const d = await readJsonResponse(resp);
         document.getElementById("broker_select").value = d.broker || "ZERODHA";
       } catch (e) {}
       toggleBrokerFields();
@@ -2008,7 +2009,7 @@
       try {
         const limit = document.getElementById("cfg_topn").value || 3;
         const r = await fetch(`/api/sectors/top?user_id=${USER_ID}&limit=${limit}`);
-        const d = await r.json();
+        const d = await readJsonResponse(r);
 
         const cont = document.getElementById("topSecContainer");
         const list = document.getElementById("topSecList");
@@ -2045,7 +2046,7 @@
     async function loadSectorCacheStatus() {
       try {
         const r = await fetch(`/api/sectors/cache?user_id=${USER_ID}`);
-        const d = await r.json();
+        const d = await readJsonResponse(r);
         renderSectorCacheBadge(d.cache || null);
       } catch (e) {
         renderSectorCacheBadge(null);
@@ -2158,7 +2159,8 @@
     async function refreshZ() {
       const el = document.getElementById("zbadge");
       try {
-        const r = await (await fetch(`/api/broker-status?user_id=${USER_ID}`)).json();
+        const resp = await fetch(`/api/broker-status?user_id=${USER_ID}`);
+        const r = await readJsonResponse(resp);
         const brokerLabel = r.broker === "DHAN" ? "DHAN" : "KITE";
         if (r.connected) {
         const label = r.ticker_connected ? `${brokerLabel} CONNECTED` : `${brokerLabel} AUTH OK`;
@@ -2307,7 +2309,8 @@
 
     async function loadPnlExitCfg() {
       try {
-        const d = await (await fetch(`/api/pnl-exit-config?user_id=${USER_ID}`)).json();
+        const resp = await fetch(`/api/pnl-exit-config?user_id=${USER_ID}`);
+        const d = await readJsonResponse(resp);
         PNL_EXIT_CFG = d.config || null;
         fillPnlExitForm(PNL_EXIT_CFG);
       } catch (e) {
@@ -2326,8 +2329,8 @@
         const r = await fetch("/api/pnl-exit-config", {
           method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload)
         });
-        const d = await r.json();
-        if (d.error) throw d.error;
+        const d = await readJsonResponse(r);
+        if (d.error) throw new Error(d.detail || d.error);
         PNL_EXIT_CFG = d.config || payload;
       } catch (e) {
         console.error("Failed to save P&L exit config", e);
@@ -2335,7 +2338,8 @@
     }
 
       async function loadCfgList() {
-      const d = await (await fetch(`/api/alert-config?user_id=${USER_ID}`)).json();
+      const resp = await fetch(`/api/alert-config?user_id=${USER_ID}`);
+      const d = await readJsonResponse(resp);
       const list = document.getElementById("cfgList");
       list.innerHTML = "";
       const cfgs = d.configs || {};
@@ -2401,7 +2405,8 @@
     }
 
     async function fillCfg(name) {
-      const d = await (await fetch(`/api/alert-config?user_id=${USER_ID}`)).json();
+      const resp = await fetch(`/api/alert-config?user_id=${USER_ID}`);
+      const d = await readJsonResponse(resp);
       const c = (d.configs || {})[name];
       if (!c) return;
 
@@ -2709,13 +2714,13 @@
         const r = await fetch("/api/alert-config", {
           method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload)
         });
-        const d = await r.json();
-        if (d.error) throw d.error;
+        const d = await readJsonResponse(r);
+        if (d.error) throw new Error(d.detail || d.error);
         await savePnlExitCfg();
         toast(`Strategy '${payload.alert_name}' Saved`);
         loadCfgList();
         closeCfg(); // Auto close on save
-      } catch (e) { toast(e, 'error'); }
+      } catch (e) { toast((e && e.message) ? e.message : String(e), 'error'); }
     }
 
     async function deleteCfg(name) {
@@ -2726,8 +2731,8 @@
           method: "DELETE", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ user_id: USER_ID, alert_name: name })
         });
-        const d = await r.json();
-        if (!d.deleted) throw "Delete failed";
+        const d = await readJsonResponse(r);
+        if (!d.deleted) throw new Error(d.detail || d.error || "Delete failed");
         toast(`Strategy '${name}' deleted`);
         loadCfgList();
 
@@ -2736,7 +2741,7 @@
           document.getElementById("cfg_alert").value = "";
         }
       } catch (e) {
-        toast("Failed to delete strategy", 'error');
+        toast((e && e.message) ? e.message : "Failed to delete strategy", 'error');
       }
     }
 
@@ -3204,7 +3209,7 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
         });
-        const d = await r.json();
+        const d = await readJsonResponse(r);
         if (d.error) {
           const msg = d.message || d.error;
           document.getElementById("bt_summary").innerHTML = "";
@@ -3212,13 +3217,13 @@
           document.getElementById("bt_body").innerHTML = `<tr><td colspan="8" class="px-3 py-6 text-center text-rose-300 italic">${msg}</td></tr>`;
           document.getElementById("bt_detail_count").textContent = "0 rows";
           document.getElementById("bt_detail_body").innerHTML = `<tr><td colspan="11" class="px-3 py-6 text-center text-rose-300 italic">${msg}</td></tr>`;
-          throw d.error;
+          throw new Error(d.error);
         }
         renderBacktest(d.result || {});
         status.textContent = `Done: ${d.result.total_trades || 0} trades, net P&L ₹${Number(d.result.net_pnl || 0).toFixed(2)}`;
       } catch (e) {
         status.textContent = "Backtest failed.";
-        toast(String(e), "error");
+        toast((e && e.message) ? e.message : String(e), "error");
       }
     }
 
@@ -3438,7 +3443,8 @@
 
     async function loadAlerts() {
       try {
-        const d = await (await fetch(`/api/alerts?user_id=${USER_ID}&limit=50`)).json();
+        const resp = await fetch(`/api/alerts?user_id=${USER_ID}&limit=50`);
+        const d = await readJsonResponse(resp);
         ALERTS.length = 0;
         (d.alerts || []).forEach(a => {
           let t = 0;
@@ -3480,7 +3486,14 @@
     }
 
     async function refreshPositions() {
-      const d = await (await fetch(`/api/positions?user_id=${USER_ID}`)).json();
+      let d;
+      try {
+        const resp = await fetch(`/api/positions?user_id=${USER_ID}`);
+        d = await readJsonResponse(resp);
+      } catch (e) {
+        console.error(e);
+        return;
+      }
       const pos = d.positions || [];
       const activePos = pos.filter(p => ['PENDING_ENTRY', 'OPEN', 'EXITING', 'EXIT_CONDITIONS_MET', 'ERROR'].includes(p.status));
       activePos.sort((a, b) => a.symbol.localeCompare(b.symbol));
@@ -3538,11 +3551,11 @@
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ user_id: USER_ID, symbol: sym })
         });
-        const d = await r.json();
-        if (d.error) throw d.error;
+        const d = await readJsonResponse(r);
+        if (d.error) throw new Error(d.detail || d.error);
         toast(`Exit order sent for ${sym}`);
         setTimeout(refreshPositions, 500);
-      } catch (e) { toast(e, 'error'); }
+      } catch (e) { toast((e && e.message) ? e.message : String(e), 'error'); }
     }
 
     async function exitAllPositions() {
@@ -3552,10 +3565,10 @@
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ user_id: USER_ID })
         });
-        const d = await r.json();
+        const d = await readJsonResponse(r);
         toast(`Triggered exit for ${d.count} positions`);
         // Auto refresh happens via WS, but manual sync is good backup
-      } catch (e) { toast("Failed to exit all", 'error'); }
+      } catch (e) { toast((e && e.message) ? e.message : "Failed to exit all", 'error'); }
     }
 
     async function clearAllAlerts() {
@@ -3564,11 +3577,11 @@
         const r = await fetch(`/api/alerts?user_id=${USER_ID}`, {
           method: "DELETE"
         });
-        const d = await r.json();
-        if (d.error) throw d.error;
+        const d = await readJsonResponse(r);
+        if (d.error) throw new Error(d.detail || d.error);
         toast("All alerts cleared successfully");
         loadAlerts(); // Refresh to show empty table
-      } catch (e) { toast(e, 'error'); }
+      } catch (e) { toast((e && e.message) ? e.message : String(e), 'error'); }
     }
 
     /* --- WebSocket --- */
