@@ -3363,10 +3363,12 @@
           let tslVal = null;
           if (p) {
             let tslPrice = 0.0;
-            if (p.strategy_mode === 'PRECISION_SNIPER' || p.strategy_mode === 'GMMA_OBV' || p.strategy_mode === 'GMMA_GOLD_CROSS' || p.strategy_mode === 'LIQUIDITY_SWEEP' || p.strategy_mode === 'PURE_LIQUIDITY_SWEEP' || p.strategy_mode === 'GVK_TREND') {
+            const tslPct = Number(p.tsl_pct || 0);
+            if (tslPct > 0 && Number(p.trail_price || 0) > 0) {
+              tslPrice = Number(p.trail_price || 0);
+            } else if (p.strategy_mode === 'PRECISION_SNIPER' || p.strategy_mode === 'GMMA_OBV' || p.strategy_mode === 'GMMA_GOLD_CROSS' || p.strategy_mode === 'LIQUIDITY_SWEEP' || p.strategy_mode === 'PURE_LIQUIDITY_SWEEP' || p.strategy_mode === 'GVK_TREND') {
               tslPrice = Number(p.trail_price || p.sl_price || 0);
             }
-            const tslPct = Number(p.tsl_pct || 0);
             if (tslPrice <= 0 && tslPct > 0) {
               const stepwise = !!p.tsl_stepwise;
               const entryPx = Number(p.entry_price || 0);
@@ -3659,13 +3661,22 @@
             if (p) {
               let tslPrice = 0.0;
               const tslPct = Number(p.tsl_pct || 0);
+              const previousTrail = Number(p.trail_price || 0);
               // Update high/low locally for immediate TSL feedback
               if (p.side === 'BUY') {
                 p.highest = Math.max(Number(p.highest || 0), Number(d.ltp));
-                if (tslPct > 0 && p.highest > 0) tslPrice = p.highest * (1.0 - tslPct / 100.0);
+                if (tslPct > 0 && p.highest > 0) {
+                  const computedTrail = p.highest * (1.0 - tslPct / 100.0);
+                  tslPrice = previousTrail > 0 ? Math.max(previousTrail, computedTrail) : computedTrail;
+                  p.trail_price = tslPrice;
+                }
               } else if (p.side === 'SELL') {
                 p.lowest = (Number(p.lowest) === 0 ? Number(d.ltp) : Math.min(Number(p.lowest), Number(d.ltp)));
-                if (tslPct > 0 && p.lowest > 0) tslPrice = p.lowest * (1.0 + tslPct / 100.0);
+                if (tslPct > 0 && p.lowest > 0) {
+                  const computedTrail = p.lowest * (1.0 + tslPct / 100.0);
+                  tslPrice = previousTrail > 0 ? Math.min(previousTrail, computedTrail) : computedTrail;
+                  p.trail_price = tslPrice;
+                }
               }
 
               if (tslPrice > 0) {

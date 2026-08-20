@@ -788,6 +788,65 @@ class TradeEngineIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(position.status, "EXITING")
         self.assertEqual(position.qty, 20)
 
+    async def test_classic_target_hit_triggers_exit_from_live_tick(self) -> None:
+        store = InMemoryStore()
+        engine = TradeEngine(1, store)
+        position = Position(
+            trade_id="abrel-target",
+            user_id=1,
+            symbol="ABREL",
+            alert_name="classic",
+            side="BUY",
+            product="MIS",
+            qty=1,
+            initial_qty=1,
+            entry_price=1402.0,
+            target_price=1423.03,
+            sl_price=1387.98,
+            tsl_pct=0.6,
+            highest=1402.0,
+            trail_price=1393.59,
+        )
+        engine.positions["ABREL"] = position
+        engine._exit_position = AsyncMock()
+
+        await engine.on_tick("ABREL", 1425.40, 1400, 1425.40, 1400)
+        await asyncio.sleep(0)
+
+        engine._exit_position.assert_awaited_once_with("ABREL", "TARGET")
+        self.assertEqual(position.status, "EXITING")
+        self.assertEqual(position.exit_reason, "TARGET")
+
+    async def test_classic_buy_tsl_ratches_up_and_never_reduces(self) -> None:
+        store = InMemoryStore()
+        engine = TradeEngine(1, store)
+        position = Position(
+            trade_id="classic-tsl",
+            user_id=1,
+            symbol="SBIN",
+            alert_name="classic",
+            side="BUY",
+            product="MIS",
+            qty=1,
+            initial_qty=1,
+            entry_price=100.0,
+            target_price=200.0,
+            sl_price=95.0,
+            tsl_pct=2.0,
+            highest=100.0,
+            trail_price=98.0,
+        )
+        engine.positions["SBIN"] = position
+        engine._exit_position = AsyncMock()
+
+        await engine.on_tick("SBIN", 110.0, 100, 110.0, 100)
+        first_trail = position.trail_price
+        await engine.on_tick("SBIN", 109.0, 100, 110.0, 108.0)
+
+        self.assertAlmostEqual(first_trail, 107.8)
+        self.assertAlmostEqual(position.trail_price, first_trail)
+        engine._exit_position.assert_not_awaited()
+
     async def test_custom_strategy_pyramiding_adds_before_custom_exit_checks(self) -> None:
         store = InMemoryStore()
         engine = TradeEngine(1, store)

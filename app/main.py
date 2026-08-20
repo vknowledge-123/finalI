@@ -904,6 +904,7 @@ async def start_dhan_feed(user_id: int) -> None:
                 )
                 if pos:
                     await store.upsert_position(user_id, symbol, pos.to_public())
+                    ws_mgr.broadcast_nowait(user_id, {"type": "pos", "position": pos.to_public()})
             except Exception as exc:
                 print("[DHAN] tick handle error:", exc)
 

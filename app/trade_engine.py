@@ -565,6 +565,35 @@ def _stepwise_anchor_short(entry: float, lowest: float, step_pct: float) -> floa
     return float(entry) * (1.0 - (idx * step))
 
 
+def _classic_tsl_line(pos: "Position") -> float:
+    if float(pos.tsl_pct or 0.0) <= 0:
+        return 0.0
+    if pos.side == "BUY" and float(pos.highest or 0.0) > 0:
+        anchor = float(pos.highest)
+        if pos.tsl_stepwise and float(pos.entry_price) > 0:
+            anchor = _stepwise_anchor_long(float(pos.entry_price), float(pos.highest), float(pos.tsl_pct))
+        return anchor * (1.0 - float(pos.tsl_pct) / 100.0)
+    if pos.side == "SELL" and float(pos.lowest or 0.0) > 0:
+        anchor = float(pos.lowest)
+        if pos.tsl_stepwise and float(pos.entry_price) > 0:
+            anchor = _stepwise_anchor_short(float(pos.entry_price), float(pos.lowest), float(pos.tsl_pct))
+        return anchor * (1.0 + float(pos.tsl_pct) / 100.0)
+    return 0.0
+
+
+def _ratchet_classic_tsl(pos: "Position", computed_line: float) -> float:
+    if computed_line <= 0:
+        return 0.0
+    previous = float(pos.trail_price or 0.0)
+    if previous <= 0:
+        pos.trail_price = float(computed_line)
+    elif pos.side == "BUY":
+        pos.trail_price = max(previous, float(computed_line))
+    else:
+        pos.trail_price = min(previous, float(computed_line))
+    return float(pos.trail_price or computed_line)
+
+
 def _is_within_entry_window(start_time: str, end_time: str) -> bool:
     """
     Check if current IST time is within the entry time window.
@@ -2326,6 +2355,8 @@ class TradeEngine:
                     pyramid_max_adds=max(0, int(cfg.pyramid_max_adds or 0)),
                     pyramid_last_add_price=entry,
                 )
+                if (not custom_signal or is_index_option_execution) and pos.tsl_pct > 0:
+                    _ratchet_classic_tsl(pos, _classic_tsl_line(pos))
 
                 self.positions[execution_symbol] = pos
                 if custom_signal:
@@ -3029,16 +3060,7 @@ class TradeEngine:
         # tsl line for BUY/SELL
         tsl_line = 0.0
         if pos.tsl_pct > 0:
-            if pos.side == "BUY" and pos.highest > 0:
-                anchor = float(pos.highest)
-                if pos.tsl_stepwise and float(pos.entry_price) > 0:
-                    anchor = _stepwise_anchor_long(float(pos.entry_price), float(pos.highest), float(pos.tsl_pct))
-                tsl_line = anchor * (1.0 - pos.tsl_pct / 100.0)
-            elif pos.side == "SELL" and pos.lowest > 0:
-                anchor = float(pos.lowest)
-                if pos.tsl_stepwise and float(pos.entry_price) > 0:
-                    anchor = _stepwise_anchor_short(float(pos.entry_price), float(pos.lowest), float(pos.tsl_pct))
-                tsl_line = anchor * (1.0 + pos.tsl_pct / 100.0)
+            tsl_line = _ratchet_classic_tsl(pos, _classic_tsl_line(pos))
 
         # distances (signed)
         tgt_dist = 0.0
@@ -3289,16 +3311,7 @@ class TradeEngine:
 
         tsl_line = 0.0
         if pos.product == "MIS" and pos.tsl_pct > 0:
-            if pos.side == "BUY" and pos.highest > 0:
-                anchor = float(pos.highest)
-                if pos.tsl_stepwise and entry > 0:
-                    anchor = _stepwise_anchor_long(entry, float(pos.highest), float(pos.tsl_pct))
-                tsl_line = anchor * (1.0 - float(pos.tsl_pct) / 100.0)
-            elif pos.side == "SELL" and pos.lowest > 0:
-                anchor = float(pos.lowest)
-                if pos.tsl_stepwise and entry > 0:
-                    anchor = _stepwise_anchor_short(entry, float(pos.lowest), float(pos.tsl_pct))
-                tsl_line = anchor * (1.0 + float(pos.tsl_pct) / 100.0)
+            tsl_line = float(pos.trail_price or _classic_tsl_line(pos) or 0.0)
 
         # distance sign: + means ltp above level, - means below (generic)
         dt = _pct_dist(ltp, tgt) if tgt > 0 else 0.0
