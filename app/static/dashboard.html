@@ -3282,7 +3282,7 @@
           // Check for live position updates
           const sym = (r.symbol || '').trim();
           const symLabel = sym || '--';
-          const livePos = POS_MAP[sym];
+          const livePos = POS_MAP[sym] || POS_SNAPSHOT[sym];
           let statusLabel = r.status;
           let statusReason = r.reason;
           let sideLabel = r.side; // keep original side
@@ -3358,6 +3358,7 @@
           const prod = p ? (p.product || 'MIS') : null;
           const pnlClass = p ? (pnlNum > 0 ? 'text-emerald-400 font-bold' : pnlNum < 0 ? 'text-rose-400 font-bold' : 'text-slate-400') : 'text-slate-600';
           const sector = p ? (p.sector || '') : '';
+          const canSquareOff = p && ['PENDING_ENTRY', 'OPEN', 'EXITING', 'EXIT_CONDITIONS_MET', 'ERROR'].includes(p.status);
 
           // TSL calc if we have position
           let tslVal = null;
@@ -3432,7 +3433,7 @@
                 </div>
               </td>
               <td class="px-3 py-3 text-center">
-                ${p ? `<button onclick="squareoff('${p.symbol}')" class="px-3 py-1 text-[10px] font-black uppercase tracking-widest bg-rose-500/10 text-rose-400 border border-rose-500/20 rounded-lg hover:bg-rose-500/20 hover:text-white hover:border-rose-500/40 transition-all duration-300">SQ OFF</button>` : '<span class="text-slate-600">--</span>'}
+                ${canSquareOff ? `<button onclick="squareoff('${p.symbol}')" class="px-3 py-1 text-[10px] font-black uppercase tracking-widest bg-rose-500/10 text-rose-400 border border-rose-500/20 rounded-lg hover:bg-rose-500/20 hover:text-white hover:border-rose-500/40 transition-all duration-300">SQ OFF</button>` : '<span class="text-slate-600">--</span>'}
               </td>
             </tr>
           `;
@@ -3697,8 +3698,9 @@
 
           if (d.type === 'pos' || d.type === 'pos_refresh') {
             if (d.type === 'pos' && d.position) {
+              POS_SNAPSHOT[d.position.symbol] = { ...d.position };
               // Update or remove from map based on status
-              if (d.position.status === 'OPEN') {
+              if (['PENDING_ENTRY', 'OPEN', 'EXITING', 'EXIT_CONDITIONS_MET', 'ERROR'].includes(d.position.status)) {
                 POS_MAP[d.position.symbol] = d.position;
               } else {
                 // Remove closed/error positions from map

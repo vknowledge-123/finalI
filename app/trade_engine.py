@@ -3584,10 +3584,10 @@ class TradeEngine:
                         float(pos.pnl),
                     )
 
-                    # Delete from Redis and memory instead of keeping CLOSED positions
+                    # Keep CLOSED snapshot in Redis for dashboard/history, but
+                    # remove it from live in-memory monitoring.
                     try:
-                        await self.store.delete_position(self.user_id, symbol)
-                        # Remove from memory
+                        await self.store.upsert_position(self.user_id, symbol, pos.to_public())
                         if symbol in self.positions:
                             del self.positions[symbol]
                         log.info("🗑️ POSITION_DELETED | %s (CLOSED)", symbol)
@@ -3605,7 +3605,7 @@ class TradeEngine:
 
                         # ✅ Trigger UI refresh
                         if self.broadcast_cb:
-                            self.broadcast_cb(self.user_id, {"type": "pos_refresh"})
+                            self.broadcast_cb(self.user_id, {"type": "pos", "position": pos.to_public()})
                             
                     except Exception as e:
                         log.debug("📝 DELETE_POS_FAIL | user=%s symbol=%s err=%s", self.user_id, symbol, e)

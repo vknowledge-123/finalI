@@ -639,6 +639,58 @@ class DhanTradeEngineTests(unittest.IsolatedAsyncioTestCase):
         if engine._pnl_exit_task:
             engine._pnl_exit_task.cancel()
 
+    async def test_full_exit_keeps_closed_snapshot_for_dashboard_history(self) -> None:
+        store = InMemoryStore()
+        await store.save_broker(1, "DHAN")
+        await store.save_dhan_credentials(1, "client", "token")
+        engine = TradeEngine(1, store)
+        await engine.configure_broker()
+        pos = Position(
+            trade_id="T1",
+            user_id=1,
+            symbol="ABREL",
+            alert_name="TEST",
+            side="BUY",
+            product="MIS",
+            qty=1,
+            initial_qty=1,
+            entry_price=1402.0,
+            target_price=1423.03,
+            sl_price=1387.98,
+            ltp=1436.0,
+            pnl=34.0,
+            status="OPEN",
+        )
+        engine.positions["ABREL"] = pos
+        await store.upsert_position(1, "ABREL", pos.to_public())
+        await store.mark_open(1, "ABREL", "T1")
+        engine._place_order_with_execution = AsyncMock(
+            return_value=OrderExecution(
+                order_id="EXIT-1",
+                symbol="ABREL",
+                side="SELL",
+                qty=1,
+                status="COMPLETE",
+                avg_price=1436.0,
+                filled_qty=1,
+                remaining_qty=0,
+            )
+        )
+
+        await engine._exit_position("ABREL", "TARGET")
+
+        stored_positions = await store.list_positions(1)
+        stored = next(row for row in stored_positions if row["symbol"] == "ABREL")
+        self.assertEqual(stored["status"], "CLOSED")
+        self.assertEqual(stored["qty"], 0)
+        self.assertEqual(stored["exit_reason"], "TARGET")
+        self.assertEqual(stored["exit_order_id"], "EXIT-1")
+        self.assertNotIn("ABREL", engine.positions)
+        self.assertEqual(await store.get_open(1, "ABREL"), "")
+        engine.order_worker.task.cancel()
+        if engine._pnl_exit_task:
+            engine._pnl_exit_task.cancel()
+
     async def test_dhan_candles_request_uses_intraday_time_boundaries(self) -> None:
         store = InMemoryStore()
         await store.save_broker(1, "DHAN")
