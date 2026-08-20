@@ -290,6 +290,75 @@ def _extract_ltp_from_response(response: Any) -> float:
     return 0.0
 
 
+def _nested_number(data: Any, keys: Tuple[str, ...]) -> float:
+    stack = [data]
+    wanted = {str(key).lower() for key in keys}
+    while stack:
+        value = stack.pop()
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if str(key).lower() not in wanted:
+                    continue
+                try:
+                    number = float(item or 0.0)
+                except Exception:
+                    number = 0.0
+                if number > 0:
+                    return number
+            stack.extend(value.values())
+        elif isinstance(value, list):
+            stack.extend(value)
+    return 0.0
+
+
+def _quote_for_security(data: Any, security_id: str, allow_fallback: bool = True) -> Any:
+    sid = str(security_id)
+    stack = [data]
+    fallback = None
+    while stack:
+        value = stack.pop()
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if str(key) == sid:
+                    return item
+            raw_sid = (
+                value.get("security_id")
+                or value.get("securityId")
+                or value.get("SecurityId")
+                or value.get("SECURITY_ID")
+            )
+            if raw_sid is not None and str(raw_sid) == sid:
+                return value
+            if allow_fallback and fallback is None and any(
+                str(key).lower() in {"last_price", "lastprice", "ltp", "ohlc"}
+                for key in value.keys()
+            ):
+                fallback = value
+            stack.extend(value.values())
+        elif isinstance(value, list):
+            stack.extend(value)
+    return fallback or {}
+
+
+def _sector_quote_values_from_response(response: Any, security_id: str) -> Dict[str, float]:
+    data = response_data(response)
+    quote = _quote_for_security(data, str(security_id), allow_fallback=False)
+    ltp = _nested_number(
+        quote,
+        ("last_price", "lastPrice", "last_traded_price", "lastTradedPrice", "ltp", "LTP"),
+    )
+    prev_close = 0.0
+    if isinstance(quote, dict) and isinstance(quote.get("ohlc"), dict):
+        prev_close = _nested_number(quote.get("ohlc"), ("close", "Close"))
+    if prev_close <= 0:
+        prev_close = _nested_number(
+            quote,
+            ("prev_close", "previous_close", "previousClose", "prevClose", "close", "Close"),
+        )
+    pct = ((ltp - prev_close) / prev_close) * 100.0 if ltp > 0 and prev_close > 0 else 0.0
+    return {"ltp": ltp, "prev_close": prev_close, "pct": pct}
+
+
 def _short_repr(value: Any, limit: int = 500) -> str:
     text = repr(value)
     if len(text) <= limit:
@@ -1725,6 +1794,10 @@ class TradeEngine:
                         continue
                     ranked = self.get_sector_rank()
                     if not ranked:
+                        refreshed = await self._refresh_dhan_sector_rank()
+                        if refreshed:
+                            ranked = self.get_sector_rank()
+                    if not ranked:
                         results.append({"symbol": sym, "status": "SKIPPED", "reason": "SECTOR_RANK_NOT_READY"})
                         continue
                     top_secs = [sec for sec, _ in ranked[: max(1, int(cfg.top_n_sector or 1))]]
@@ -2861,6 +2934,48 @@ class TradeEngine:
         self.sector_index_updated_ts[sector] = time.time()
         if cached_prev > 0:
             self.sector_index_pct[sector] = ((float(ltp) - cached_prev) / cached_prev) * 100.0
+
+    async def _refresh_dhan_sector_rank(self) -> bool:
+        if self.broker != "DHAN":
+            return False
+        if not await self._ensure_dhan_ready() or not self.dhan:
+            return False
+        grouped: Dict[str, List[int]] = {}
+        for item in SECTOR_INDEX_INSTRUMENTS.values():
+            segment = str(item.get("exchange_segment") or "IDX_I")
+            try:
+                grouped.setdefault(segment, []).append(int(item["security_id"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        if not grouped:
+            return False
+        try:
+            response = await self.market_data_worker.submit(self.dhan.ohlc_data, grouped)
+        except Exception as exc:
+            log.warning("DHAN_SECTOR_RANK_REFRESH_FAIL | user=%s err=%s", self.user_id, exc)
+            return False
+
+        ok_count = 0
+        for sector, item in SECTOR_INDEX_INSTRUMENTS.items():
+            security_id = str(item.get("security_id") or "")
+            if not security_id:
+                continue
+            values = _sector_quote_values_from_response(response, security_id)
+            ltp = float(values.get("ltp") or 0.0)
+            prev_close = float(values.get("prev_close") or 0.0)
+            if ltp <= 0 or prev_close <= 0:
+                continue
+            self.update_sector_index_tick(sector, ltp, prev_close=prev_close)
+            ok_count += 1
+        if ok_count <= 0:
+            log.warning(
+                "DHAN_SECTOR_RANK_REFRESH_EMPTY | user=%s response=%s",
+                self.user_id,
+                _short_repr(response),
+            )
+            return False
+        log.info("DHAN_SECTOR_RANK_REFRESH_OK | user=%s sectors=%s", self.user_id, ok_count)
+        return True
 
     def get_sector_rank(self) -> List[tuple]:
         ranked_map: Dict[str, float] = {}

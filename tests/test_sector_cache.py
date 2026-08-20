@@ -1,11 +1,12 @@
 import os
 import unittest
+from unittest.mock import AsyncMock
 
 os.environ.setdefault("APP_TESTING", "1")
 
 from app.main import _sector_quote_values
 from app.memory_store import InMemoryStore
-from app.trade_engine import TradeEngine
+from app.trade_engine import OrderExecution, TradeEngine
 
 
 class SectorCacheTests(unittest.IsolatedAsyncioTestCase):
@@ -83,6 +84,64 @@ class SectorCacheTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result[0]["status"], "SKIPPED")
         self.assertEqual(result[0]["reason"], "SECTOR_RANK_NOT_READY")
+
+    async def test_dhan_sector_filter_refreshes_rank_when_cache_missing(self) -> None:
+        class FakeDhan:
+            def ohlc_data(self, _payload):
+                return {}
+
+        store = InMemoryStore()
+        await store.save_alert_config(
+            1,
+            {
+                "alert_name": "SECTOR_TEST",
+                "enabled": True,
+                "sector_filter_on": True,
+                "top_n_sector": 1,
+                "entry_start_time": "00:00",
+                "entry_end_time": "23:59",
+                "direction": "LONG",
+                "product": "MIS",
+                "qty_mode": "QTY",
+                "qty": 1,
+            },
+        )
+        engine = TradeEngine(user_id=1, store=store)
+        engine.broker = "DHAN"
+        engine.dhan_client_id = "client"
+        engine.dhan_access_token = "token"
+        engine.dhan = FakeDhan()
+        engine.market_data_worker.submit = AsyncMock(
+            return_value={
+                "status": "success",
+                "data": {
+                    "IDX_I": {
+                        "31": {
+                            "last_price": 105.0,
+                            "ohlc": {"close": 100.0},
+                        }
+                    }
+                },
+            }
+        )
+        engine._fetch_ltp = AsyncMock(return_value=100.0)
+        engine._place_order_with_execution = AsyncMock(
+            return_value=OrderExecution(
+                order_id="OID",
+                symbol="SAIL",
+                side="BUY",
+                qty=1,
+                status="COMPLETE",
+                avg_price=100.0,
+                filled_qty=1,
+            )
+        )
+
+        result = await engine.on_chartink_alert("SECTOR_TEST", ["SAIL"])
+
+        self.assertEqual(result[0]["status"], "ENTERED")
+        self.assertIn(result[0]["reason"], {"ORDER_OK", "ORDER_EXECUTED"})
+        engine.market_data_worker.submit.assert_awaited_once()
 
 
 if __name__ == "__main__":
