@@ -1,7 +1,7 @@
 import asyncio
 import unittest
 from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 from app.custom_strategy import (
     evaluate_gmma_gold_cross_strategy,
@@ -732,7 +732,7 @@ class TradeEngineIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result[0]["status"], "ENTERED")
         self.assertEqual(result[0]["qty"], 1)
-        engine._place_order.assert_awaited_once_with("MRF", "BUY", 1, "MIS")
+        engine._place_order.assert_awaited_once_with("MRF", "BUY", 1, "MIS", ANY)
         self.assertEqual(engine.positions["MRF"].qty, 1)
 
     async def test_classic_pyramiding_adds_base_quantity_and_exits_all(self) -> None:

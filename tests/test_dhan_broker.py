@@ -163,6 +163,71 @@ class DhanTradeEngineTests(unittest.IsolatedAsyncioTestCase):
         if engine._pnl_exit_task:
             engine._pnl_exit_task.cancel()
 
+    async def test_dhan_buy_uses_sell_depth_for_aggressive_limit(self) -> None:
+        store = InMemoryStore()
+        await store.save_broker(1, "DHAN")
+        await store.save_dhan_credentials(1, "client", "token")
+        engine = TradeEngine(1, store)
+        await engine.configure_broker()
+        engine.dhan = MagicMock(
+            NSE="NSE_EQ",
+            BUY="BUY",
+            SELL="SELL",
+            MARKET="MARKET",
+            LIMIT="LIMIT",
+            INTRA="INTRADAY",
+            CNC="CNC",
+        )
+        engine.dhan.place_order = MagicMock()
+        engine.dhan.quote_data = MagicMock()
+
+        placed_kwargs = {}
+
+        async def fake_order_submit(fn, *args, **kwargs):
+            self.assertIs(fn, engine.dhan.place_order)
+            placed_kwargs.update(kwargs)
+            return {"status": "success", "data": {"orderId": "DHAN-LIMIT"}}
+
+        async def fake_market_submit(fn, *args, **kwargs):
+            self.assertIs(fn, engine.dhan.quote_data)
+            return {
+                "data": {
+                    "NSE_EQ": {
+                        "3045": {
+                            "last_price": 100.0,
+                            "depth": {
+                                "sell": [
+                                    {"price": 100.5, "quantity": 5, "orders": 1},
+                                    {"price": 101.0, "quantity": 10, "orders": 2},
+                                ],
+                                "buy": [
+                                    {"price": 99.9, "quantity": 20, "orders": 3},
+                                ],
+                            },
+                        }
+                    }
+                }
+            }
+
+        engine.order_worker.submit = fake_order_submit
+        engine.market_data_worker.submit = fake_market_submit
+
+        with patch("app.trade_engine.DHAN_INSTRUMENTS.security_id", AsyncMock(return_value="3045")):
+            order_id = await engine._place_order(
+                "SBIN",
+                "BUY",
+                8,
+                "MIS",
+                {"order_limit_buffer_pct": 0.10, "order_limit_extra_ticks": 1},
+            )
+
+        self.assertEqual(order_id, "DHAN-LIMIT")
+        self.assertEqual(placed_kwargs["order_type"], "LIMIT")
+        self.assertEqual(placed_kwargs["price"], 101.2)
+        engine.order_worker.task.cancel()
+        if engine._pnl_exit_task:
+            engine._pnl_exit_task.cancel()
+
     async def test_dhan_pending_order_is_cancelled_and_retried_until_executed(self) -> None:
         store = InMemoryStore()
         await store.save_broker(1, "DHAN")
@@ -331,6 +396,113 @@ class DhanTradeEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(execution.filled_qty, 10)
         self.assertEqual(execution.remaining_qty, 0)
         self.assertAlmostEqual(execution.avg_price, 101.2)
+        engine.order_worker.task.cancel()
+        if engine._pnl_exit_task:
+            engine._pnl_exit_task.cancel()
+
+    async def test_dhan_price_rejection_retries_with_fresh_depth(self) -> None:
+        store = InMemoryStore()
+        await store.save_broker(1, "DHAN")
+        await store.save_dhan_credentials(1, "client", "token")
+        engine = TradeEngine(1, store)
+        await engine.configure_broker()
+        engine.dhan = MagicMock(
+            NSE="NSE_EQ",
+            BUY="BUY",
+            SELL="SELL",
+            MARKET="MARKET",
+            LIMIT="LIMIT",
+            INTRA="INTRADAY",
+            CNC="CNC",
+        )
+        engine.dhan.place_order = MagicMock()
+        engine.dhan.cancel_order = MagicMock()
+        engine.dhan.get_order_by_id = MagicMock()
+        engine.dhan.get_order_list = MagicMock()
+        engine.dhan.get_trade_book = MagicMock()
+        engine.dhan.get_positions = MagicMock()
+        engine.dhan.quote_data = MagicMock()
+
+        placed_prices: list[float] = []
+        quote_refs = [100.0, 101.0]
+
+        async def fake_order_submit(fn, *args, **kwargs):
+            if fn is engine.dhan.place_order:
+                placed_prices.append(float(kwargs["price"]))
+                order_id = "DHAN-REJECTED" if len(placed_prices) == 1 else "DHAN-FILLED"
+                return {"status": "success", "data": {"orderId": order_id}}
+            if fn is engine.dhan.cancel_order:
+                return {"status": "success"}
+            raise AssertionError(f"unexpected order worker fn {fn}")
+
+        async def fake_market_submit(fn, *args, **kwargs):
+            if fn is engine.dhan.quote_data:
+                ref = quote_refs[min(len(placed_prices), len(quote_refs) - 1)]
+                return {
+                    "data": {
+                        "NSE_EQ": {
+                            "3045": {
+                                "last_price": ref,
+                                "depth": {
+                                    "sell": [{"price": ref, "quantity": 100, "orders": 3}],
+                                    "buy": [{"price": ref - 0.1, "quantity": 100, "orders": 4}],
+                                },
+                            }
+                        }
+                    }
+                }
+            if fn is engine.dhan.get_positions:
+                return []
+            if fn is engine.dhan.get_order_list:
+                return {"data": []}
+            if fn is engine.dhan.get_trade_book:
+                return {"data": []}
+            if fn is engine.dhan.get_order_by_id:
+                order_id = str(args[0])
+                if order_id == "DHAN-REJECTED":
+                    return {
+                        "data": {
+                            "orderId": order_id,
+                            "orderStatus": "REJECTED",
+                            "quantity": 10,
+                            "remainingQuantity": 10,
+                            "omsErrorDescription": "price protection range breached",
+                        }
+                    }
+                return {
+                    "data": {
+                        "orderId": order_id,
+                        "orderStatus": "TRADED",
+                        "quantity": 10,
+                        "filledQuantity": 10,
+                        "remainingQuantity": 0,
+                        "averagePrice": 101.25,
+                        "tradingSymbol": "SBIN",
+                    }
+                }
+            raise AssertionError(f"unexpected market worker fn {fn}")
+
+        engine.order_worker.submit = fake_order_submit
+        engine.market_data_worker.submit = fake_market_submit
+
+        with patch("app.trade_engine.DHAN_INSTRUMENTS.security_id", AsyncMock(return_value="3045")):
+            execution = await engine._place_order_with_execution(
+                "SBIN",
+                "BUY",
+                10,
+                "MIS",
+                {
+                    "order_confirm_timeout_sec": 0.2,
+                    "order_pending_retry_count": 1,
+                    "order_limit_buffer_pct": 0.10,
+                    "order_limit_extra_ticks": 1,
+                },
+            )
+
+        self.assertEqual(execution.status, "COMPLETE")
+        self.assertEqual(execution.attempts, 2)
+        self.assertEqual(len(placed_prices), 2)
+        self.assertGreater(placed_prices[1], placed_prices[0])
         engine.order_worker.task.cancel()
         if engine._pnl_exit_task:
             engine._pnl_exit_task.cancel()

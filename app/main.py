@@ -1543,9 +1543,10 @@ async def save_alert_config(payload: Dict[str, Any]) -> Dict[str, Any]:
     try:
         order_timeout = float(payload.get("order_confirm_timeout_sec") or payload.get("execution_confirm_timeout_sec") or 1.5)
         order_retries = int(payload.get("order_pending_retry_count") or payload.get("execution_retry_count") or 1)
+        order_buffer = float(payload.get("order_limit_buffer_pct") or payload.get("dhan_limit_buffer_pct") or payload.get("execution_protection_pct") or 0.15)
     except Exception:
         return {"error": "ORDER_EXECUTION_SETTINGS_INVALID"}
-    if not (0.2 <= order_timeout <= 10.0 and 0 <= order_retries <= 5):
+    if not (0.2 <= order_timeout <= 10.0 and 0 <= order_retries <= 5 and 0.0 <= order_buffer <= 5.0):
         return {"error": "ORDER_EXECUTION_SETTINGS_INVALID"}
     try:
         pyramid_step = float(payload.get("pyramid_step_pct") or 0.8)
@@ -1604,6 +1605,7 @@ async def save_alert_config(payload: Dict[str, Any]) -> Dict[str, Any]:
     payload2["alert_name"] = alert_name
     payload2["alert_name_raw"] = str(raw_name)
     payload2["strategy_mode"] = strategy_mode
+    payload2["order_limit_buffer_pct"] = order_buffer
 
     await store.save_alert_config(user_id, payload2)
     

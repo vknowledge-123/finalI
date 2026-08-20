@@ -1533,7 +1533,7 @@
               <h4 class="text-xs font-bold text-amber-300">Execution Protection</h4>
               <span class="text-[9px] text-slate-500">For broker market-protection limit orders</span>
             </div>
-            <div class="grid grid-cols-2 gap-2">
+            <div class="grid grid-cols-3 gap-2">
               <div>
                 <label class="block text-[10px] text-slate-400 uppercase mb-1">Confirm Timeout Sec</label>
                 <input id="cfg_order_timeout" type="number" min="0.2" max="10" step="0.1" class="input-field" value="1.5">
@@ -1542,8 +1542,12 @@
                 <label class="block text-[10px] text-slate-400 uppercase mb-1">Pending Retry Count</label>
                 <input id="cfg_order_retries" type="number" min="0" max="5" step="1" class="input-field" value="1">
               </div>
+              <div>
+                <label class="block text-[10px] text-slate-400 uppercase mb-1">Limit Buffer %</label>
+                <input id="cfg_order_buffer" type="number" min="0" max="5" step="0.05" class="input-field" value="0.15">
+              </div>
             </div>
-            <p class="text-[10px] text-slate-500 mt-2">Dhan orders are confirmed from order updates/order book. If still pending, the app cancels and retries before marking entry live.</p>
+            <p class="text-[10px] text-slate-500 mt-2">Dhan orders use bid/ask depth to place aggressive limit orders, then confirm from order updates/order book. If still pending, the app cancels and retries before marking entry live.</p>
           </div>
 
           <div class="col-span-2 border-t border-fuchsia-500/20 pt-3 mt-1">
@@ -2421,6 +2425,7 @@
         "cfg_entry_end": c.entry_end_time || "15:15",
         "cfg_order_timeout": c.order_confirm_timeout_sec ?? c.execution_confirm_timeout_sec ?? 1.5,
         "cfg_order_retries": c.order_pending_retry_count ?? c.execution_retry_count ?? 1,
+        "cfg_order_buffer": c.order_limit_buffer_pct ?? c.dhan_limit_buffer_pct ?? c.execution_protection_pct ?? 0.15,
         "cfg_pyramid_on": String(c.pyramid_enabled ?? false),
         "cfg_pyramid_step": c.pyramid_step_pct ?? 0.8,
         "cfg_pyramid_max": c.pyramid_max_adds ?? 3,
@@ -2565,6 +2570,7 @@
         strategy_timeframe_minutes: parseInt(document.getElementById("cfg_timeframe").value || 5),
         order_confirm_timeout_sec: parseFloat(document.getElementById("cfg_order_timeout").value || 1.5),
         order_pending_retry_count: parseInt(document.getElementById("cfg_order_retries").value || 1),
+        order_limit_buffer_pct: parseFloat(document.getElementById("cfg_order_buffer").value || 0.15),
         pyramid_enabled: document.getElementById("cfg_pyramid_on").value === "true",
         pyramid_step_pct: parseFloat(document.getElementById("cfg_pyramid_step").value || 0.8),
         pyramid_max_adds: parseInt(document.getElementById("cfg_pyramid_max").value || 3),

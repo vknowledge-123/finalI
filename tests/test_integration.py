@@ -36,6 +36,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn('id="cfg_strategy_mode"', r.text)
         self.assertIn('id="cfg_order_timeout"', r.text)
         self.assertIn('id="cfg_order_retries"', r.text)
+        self.assertIn('id="cfg_order_buffer"', r.text)
         self.assertIn('id="cfg_pyramid_on"', r.text)
         self.assertIn('id="cfg_pyramid_step"', r.text)
         self.assertIn('id="cfg_pyramid_max"', r.text)

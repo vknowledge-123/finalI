@@ -54,6 +54,9 @@ log = logging.getLogger("trade_engine")
 Side = Literal["BUY", "SELL"]
 Product = Literal["MIS", "CNC"]
 QtyMode = Literal["QTY", "CAPITAL"]
+DHAN_PRICE_TICK = 0.05
+DHAN_DEFAULT_LIMIT_BUFFER_PCT = 0.15
+DHAN_DEFAULT_LIMIT_EXTRA_TICKS = 1
 
 
 # =========================
@@ -288,6 +291,153 @@ def _extract_ltp_from_response(response: Any) -> float:
         elif isinstance(value, list):
             stack.extend(value)
     return 0.0
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)) or default)
+    except Exception:
+        return default
+
+
+def _cfg_float(cfg: Optional[Dict[str, Any]], keys: Tuple[str, ...], default: float) -> float:
+    cfg = cfg or {}
+    for key in keys:
+        if key not in cfg:
+            continue
+        try:
+            return float(cfg.get(key) or 0.0)
+        except Exception:
+            continue
+    return default
+
+
+def _round_dhan_price(price: float, side: Side, tick: float = DHAN_PRICE_TICK) -> float:
+    try:
+        tick = float(tick or DHAN_PRICE_TICK)
+    except Exception:
+        tick = DHAN_PRICE_TICK
+    tick = tick if tick > 0 else DHAN_PRICE_TICK
+    if price <= 0:
+        return 0.0
+    steps = price / tick
+    if side == "BUY":
+        rounded = math.ceil(steps - 1e-9) * tick
+    else:
+        rounded = math.floor(steps + 1e-9) * tick
+    return round(max(0.0, rounded), 2)
+
+
+def _depth_level_price(level: Any) -> Tuple[float, int]:
+    if not isinstance(level, dict):
+        return 0.0, 0
+    price = 0.0
+    qty = 0
+    for key in ("price", "Price", "bid_price", "ask_price", "bidPrice", "askPrice"):
+        if key in level:
+            try:
+                price = float(level.get(key) or 0.0)
+            except Exception:
+                price = 0.0
+            break
+    for key in ("quantity", "qty", "Quantity", "bid_quantity", "ask_quantity", "bidQuantity", "askQuantity"):
+        if key in level:
+            try:
+                qty = int(float(level.get(key) or 0))
+            except Exception:
+                qty = 0
+            break
+    return price, qty
+
+
+def _depth_execution_price(response: Any, side: Side, qty: int) -> float:
+    """Return the depth price that can satisfy qty: ask ladder for BUY, bid ladder for SELL."""
+    data = response_data(response)
+    wanted_depth_keys = ("sell", "ask", "asks") if side == "BUY" else ("buy", "bid", "bids")
+    stack = [data]
+    best_candidate = 0.0
+    target_qty = max(1, int(qty or 1))
+    while stack:
+        value = stack.pop()
+        if isinstance(value, dict):
+            depth = value.get("depth") or value.get("Depth") or value.get("market_depth") or value.get("marketDepth")
+            if isinstance(depth, dict):
+                levels = None
+                for key in wanted_depth_keys:
+                    raw_levels = depth.get(key)
+                    if isinstance(raw_levels, list):
+                        levels = raw_levels
+                        break
+                if levels:
+                    cumulative = 0
+                    last_price = 0.0
+                    for level in levels:
+                        price, level_qty = _depth_level_price(level)
+                        if price <= 0:
+                            continue
+                        last_price = price
+                        if level_qty > 0:
+                            cumulative += level_qty
+                            if cumulative >= target_qty:
+                                return price
+                    if last_price > 0 and best_candidate <= 0:
+                        best_candidate = last_price
+            stack.extend(value.values())
+        elif isinstance(value, list):
+            stack.extend(value)
+    return best_candidate
+
+
+def _order_rejection_reason(snapshot: Dict[str, Any]) -> str:
+    raw = snapshot.get("raw") if isinstance(snapshot, dict) else {}
+    reason = _order_field(
+        raw if isinstance(raw, dict) else {},
+        "omsErrorDescription",
+        "oms_error_description",
+        "rejectionReason",
+        "rejection_reason",
+        "errorMessage",
+        "error_message",
+        "message",
+        "remarks",
+    )
+    return str(reason or "").strip()
+
+
+def _is_retryable_order_rejection(reason: str) -> bool:
+    text = str(reason or "").lower()
+    if "market" in text and "protection" in text:
+        return True
+    fatal_words = (
+        "insufficient",
+        "fund",
+        "margin",
+        "security",
+        "scrip",
+        "instrument",
+        "product",
+        "segment",
+        "blocked",
+        "freeze",
+        "circuit",
+        "edis",
+        "holding",
+        "rms",
+    )
+    if any(word in text for word in fatal_words):
+        return False
+    retry_words = (
+        "price",
+        "protection",
+        "market",
+        "limit",
+        "range",
+        "slippage",
+        "pending",
+        "timeout",
+        "temporary",
+    )
+    return not text or any(word in text for word in retry_words)
 
 
 def _nested_number(data: Any, keys: Tuple[str, ...]) -> float:
@@ -958,7 +1108,79 @@ class TradeEngine:
             return normalize_dhan_positions(response)
         return await self._kite_positions()
 
-    async def _place_order(self, symbol: str, side: Side, qty: int, product: Product) -> Any:
+    def _dhan_limit_settings(self, cfg: Optional[Dict[str, Any]] = None) -> Tuple[float, int]:
+        default_buffer = _env_float("DHAN_LIMIT_BUFFER_PCT", DHAN_DEFAULT_LIMIT_BUFFER_PCT)
+        default_ticks = int(_env_float("DHAN_LIMIT_EXTRA_TICKS", float(DHAN_DEFAULT_LIMIT_EXTRA_TICKS)))
+        buffer_pct = _cfg_float(
+            cfg,
+            ("order_limit_buffer_pct", "dhan_limit_buffer_pct", "execution_protection_pct"),
+            default_buffer,
+        )
+        extra_ticks = int(_cfg_float(
+            cfg,
+            ("order_limit_extra_ticks", "dhan_limit_extra_ticks", "execution_protection_ticks"),
+            float(default_ticks),
+        ))
+        return max(0.0, min(buffer_pct, 5.0)), max(0, min(extra_ticks, 20))
+
+    async def _dhan_aggressive_limit_price(
+        self,
+        symbol: str,
+        security_id: str,
+        exchange_segment: str,
+        side: Side,
+        qty: int,
+        cfg: Optional[Dict[str, Any]] = None,
+        fallback_ltp: float = 0.0,
+    ) -> Tuple[float, str]:
+        if not self.dhan:
+            return 0.0, "NO_DHAN"
+        reference = 0.0
+        source = ""
+        payload = {exchange_segment: [int(security_id)]}
+        quote_fn = getattr(self.dhan, "quote_data", None)
+        if callable(quote_fn):
+            try:
+                quote = await self.market_data_worker.submit(quote_fn, payload)
+                reference = _depth_execution_price(quote, side, qty)
+                if reference > 0:
+                    source = "DEPTH"
+                else:
+                    reference = _extract_ltp_from_response(quote)
+                    if reference > 0:
+                        source = "QUOTE_LTP"
+            except Exception as e:
+                log.debug(
+                    "DHAN_DEPTH_FETCH_FAIL | user=%s symbol=%s security_id=%s segment=%s err=%s",
+                    self.user_id,
+                    symbol,
+                    security_id,
+                    exchange_segment,
+                    e,
+                )
+        if reference <= 0 and fallback_ltp > 0:
+            reference = float(fallback_ltp)
+            source = "FALLBACK_LTP"
+        if reference <= 0:
+            try:
+                reference = await self._fetch_ltp(symbol)
+                if reference > 0:
+                    source = "FETCH_LTP"
+            except Exception:
+                reference = 0.0
+        if reference <= 0:
+            return 0.0, "NO_PRICE"
+
+        buffer_pct, extra_ticks = self._dhan_limit_settings(cfg)
+        tick = DHAN_PRICE_TICK
+        if side == "BUY":
+            raw_price = reference * (1.0 + buffer_pct / 100.0) + (extra_ticks * tick)
+        else:
+            raw_price = reference * (1.0 - buffer_pct / 100.0) - (extra_ticks * tick)
+        limit_price = _round_dhan_price(raw_price, side, tick)
+        return limit_price, f"{source}:ref={reference:.2f}:buffer={buffer_pct:.3f}:ticks={extra_ticks}"
+
+    async def _place_order(self, symbol: str, side: Side, qty: int, product: Product, cfg: Optional[Dict[str, Any]] = None) -> Any:
         if self.broker == "DHAN":
             if not await self._ensure_dhan_ready() or not self.dhan:
                 raise RuntimeError("DHAN_NOT_CONNECTED")
@@ -986,15 +1208,49 @@ class TradeEngine:
                     option_ltp = 0.0
             if not security_id:
                 raise RuntimeError("DHAN_SECURITY_ID_MISSING")
+            limit_price, price_source = await self._dhan_aggressive_limit_price(
+                order_symbol,
+                str(security_id),
+                exchange_segment,
+                side,
+                int(qty),
+                cfg,
+                option_ltp if "option_ltp" in locals() else 0.0,
+            )
+            if limit_price > 0:
+                order_type = getattr(self.dhan, "LIMIT", "LIMIT")
+                order_price = limit_price
+                log.info(
+                    "DHAN_AGGRESSIVE_LIMIT | user=%s symbol=%s security_id=%s side=%s qty=%s price=%.2f source=%s",
+                    self.user_id,
+                    order_symbol,
+                    security_id,
+                    side,
+                    qty,
+                    order_price,
+                    price_source,
+                )
+            else:
+                order_type = self.dhan.MARKET
+                order_price = 0
+                log.warning(
+                    "DHAN_DEPTH_PRICE_UNAVAILABLE | user=%s symbol=%s security_id=%s side=%s qty=%s fallback=MARKET reason=%s",
+                    self.user_id,
+                    order_symbol,
+                    security_id,
+                    side,
+                    qty,
+                    price_source,
+                )
             response = await self.order_worker.submit(
                 self.dhan.place_order,
                 security_id=str(security_id),
                 exchange_segment=exchange_segment,
                 transaction_type=self.dhan.BUY if side == "BUY" else self.dhan.SELL,
                 quantity=int(qty),
-                order_type=self.dhan.MARKET,
+                order_type=order_type,
                 product_type=self.dhan.CNC if product == "CNC" else self.dhan.INTRA,
-                price=0,
+                price=order_price,
             )
             order_id = order_id_from_response(response)
             if order_symbol != norm_symbol(symbol):
@@ -1274,7 +1530,7 @@ class TradeEngine:
         while attempts <= pending_retries and remaining_to_place > 0:
             attempts += 1
             attempt_qty = int(remaining_to_place)
-            placed = await self._place_order(symbol, side, attempt_qty, product)
+            placed = await self._place_order(symbol, side, attempt_qty, product, cfg)
             exec_symbol = norm_symbol(symbol)
             exec_side: Side = side
             exec_ltp = 0.0
@@ -1357,6 +1613,25 @@ class TradeEngine:
                 )
 
             if status in {"REJECTED", "CANCELLED"}:
+                reason = _order_rejection_reason(snapshot)
+                if (
+                    status == "REJECTED"
+                    and attempts <= pending_retries
+                    and _is_retryable_order_rejection(reason)
+                ):
+                    log.warning(
+                        "ORDER_REJECTED_RETRY | user=%s broker=%s symbol=%s side=%s qty=%s order_id=%s reason=%s attempt=%s/%s",
+                        self.user_id,
+                        self.broker,
+                        symbol,
+                        side,
+                        attempt_qty,
+                        order_id,
+                        reason or "UNKNOWN",
+                        attempts,
+                        pending_retries + 1,
+                    )
+                    continue
                 if total_filled > 0:
                     return OrderExecution(
                         order_id=last_filled_order_id or order_id,
@@ -1370,7 +1645,8 @@ class TradeEngine:
                         attempts=attempts,
                         ltp=exec_ltp,
                     )
-                raise RuntimeError(f"ORDER_{status}:{order_id}")
+                detail = f":{reason}" if reason else ""
+                raise RuntimeError(f"ORDER_{status}:{order_id}{detail}")
 
             cancelled = await self._cancel_order_if_pending(order_id)
             log.warning(
