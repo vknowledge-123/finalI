@@ -2064,8 +2064,8 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ user_id: USER_ID })
         });
-        const d = await r.json();
-        if (!d.ok) throw new Error(d.error || "Sector cache failed");
+        const d = await readJsonResponse(r);
+        if (!d.ok) throw new Error(d.detail || d.error || "Sector cache failed");
         renderSectorCacheBadge(d);
         await fetchTopSectors();
         toast(`Cached ${d.ok_count}/${d.total} Dhan sectors`);

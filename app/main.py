@@ -1909,19 +1909,23 @@ async def get_sector_cache_api(user_id: int = 1) -> Dict[str, Any]:
 
 @app.post("/api/sectors/cache-dhan")
 async def cache_dhan_sector_data_api(payload: Dict[str, Any]) -> Dict[str, Any]:
-    user_id = int(payload.get("user_id", 1))
-    result = await fetch_and_cache_dhan_sector_data(user_id)
-    if result.get("ok"):
-        ws_mgr.broadcast_nowait(
-            user_id,
-            {
-                "type": "sector_cache",
-                "ok_count": result.get("ok_count", 0),
-                "total": result.get("total", 0),
-                "cached_at": result.get("cached_at", ""),
-            },
-        )
-    return result
+    try:
+        user_id = int(payload.get("user_id", 1))
+        result = await fetch_and_cache_dhan_sector_data(user_id)
+        if result.get("ok"):
+            ws_mgr.broadcast_nowait(
+                user_id,
+                {
+                    "type": "sector_cache",
+                    "ok_count": result.get("ok_count", 0),
+                    "total": result.get("total", 0),
+                    "cached_at": result.get("cached_at", ""),
+                },
+            )
+        return result
+    except Exception as exc:
+        log.exception("Dhan sector cache API failed")
+        return {"ok": False, "error": "DHAN_SECTOR_CACHE_FAILED", "detail": str(exc)}
 
 
 # -----------------------------
