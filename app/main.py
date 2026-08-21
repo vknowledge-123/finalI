@@ -903,7 +903,8 @@ async def start_dhan_feed(user_id: int) -> None:
                     },
                 )
                 if pos:
-                    await store.upsert_position(user_id, symbol, pos.to_public())
+                    pos_symbol = _sym_safe(pos.symbol or symbol)
+                    await store.upsert_position(user_id, pos_symbol, pos.to_public())
                     ws_mgr.broadcast_nowait(user_id, {"type": "pos", "position": pos.to_public()})
             except Exception as exc:
                 print("[DHAN] tick handle error:", exc)
@@ -1063,12 +1064,13 @@ async def start_kite_ticker(user_id: int) -> None:
 
                         # Throttle Redis writes for positions
                         if pos:
-                            key = (user_id, sym)
+                            pos_symbol = _sym_safe(pos.symbol or sym)
+                            key = (user_id, pos_symbol)
                             now = time.time()
                             last = _LAST_POS_SAVE.get(key, 0.0)
                             if now - last >= _POS_SAVE_THROTTLE_SEC:
                                 _LAST_POS_SAVE[key] = now
-                                asyncio.create_task(store.upsert_position(user_id, sym, pos.to_public()))
+                                asyncio.create_task(store.upsert_position(user_id, pos_symbol, pos.to_public()))
                                 ws_mgr.broadcast_nowait(user_id, {"type": "pos", "position": pos.to_public()})
 
                     except Exception as e:

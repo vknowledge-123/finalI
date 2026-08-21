@@ -817,6 +817,71 @@ class TradeEngineIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(position.status, "EXITING")
         self.assertEqual(position.exit_reason, "TARGET")
 
+    async def test_live_tick_hydrates_redis_position_and_exits_same_tick(self) -> None:
+        store = InMemoryStore()
+        position = Position(
+            trade_id="abrel-target",
+            user_id=1,
+            symbol="ABREL",
+            alert_name="classic",
+            side="BUY",
+            product="MIS",
+            qty=1,
+            initial_qty=1,
+            entry_price=1402.0,
+            target_price=1423.03,
+            sl_price=1387.98,
+            tsl_pct=0.6,
+            highest=1402.0,
+            trail_price=1393.59,
+            status="OPEN",
+        )
+        await store.upsert_position(1, "ABREL", position.to_public())
+        await store.mark_open(1, "ABREL", "abrel-target")
+
+        engine = TradeEngine(1, store)
+        engine._exit_position = AsyncMock()
+
+        await engine.on_tick("NSE:ABREL-EQ", 1425.40, 1400, 1425.40, 1400)
+        await asyncio.sleep(0)
+
+        engine._exit_position.assert_awaited_once_with("ABREL", "TARGET")
+        self.assertIn("ABREL", engine.positions)
+        self.assertEqual(engine.positions["ABREL"].status, "EXITING")
+        self.assertEqual(engine.positions["ABREL"].exit_reason, "TARGET")
+
+    async def test_live_tick_hydrates_redis_position_and_exits_on_trailing_sl(self) -> None:
+        store = InMemoryStore()
+        position = Position(
+            trade_id="abrel-tsl",
+            user_id=1,
+            symbol="ABREL",
+            alert_name="classic",
+            side="BUY",
+            product="MIS",
+            qty=1,
+            initial_qty=1,
+            entry_price=1402.0,
+            target_price=1500.0,
+            sl_price=1387.98,
+            tsl_pct=0.6,
+            highest=1420.0,
+            trail_price=1411.48,
+            status="OPEN",
+        )
+        await store.upsert_position(1, "ABREL", position.to_public())
+        await store.mark_open(1, "ABREL", "abrel-tsl")
+
+        engine = TradeEngine(1, store)
+        engine._exit_position = AsyncMock()
+
+        await engine.on_tick("ABREL", 1411.0, 1400, 1420.0, 1411.0)
+        await asyncio.sleep(0)
+
+        engine._exit_position.assert_awaited_once_with("ABREL", "TRAILING_SL")
+        self.assertEqual(engine.positions["ABREL"].status, "EXITING")
+        self.assertEqual(engine.positions["ABREL"].exit_reason, "TRAILING_SL")
+
     async def test_classic_buy_tsl_ratches_up_and_never_reduces(self) -> None:
         store = InMemoryStore()
         engine = TradeEngine(1, store)

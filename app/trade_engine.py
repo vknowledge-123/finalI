@@ -942,6 +942,8 @@ class TradeEngine:
         # monitoring log controls
         self._mon_last_log: Dict[str, float] = {}
         self.monitor_log_interval_sec: float = 10.0   # per symbol
+        self._position_hydrate_last_check: Dict[str, float] = {}
+        self.position_hydrate_miss_interval_sec: float = 1.0
 
         # tick visibility (first tick log)
         self._first_tick_logged: Dict[str, bool] = {}
@@ -1101,6 +1103,62 @@ class TradeEngine:
                 log.debug("REHYDRATE_ROW_FAIL | user=%s err=%s row=%s", self.user_id, e, r)
 
         return restored
+
+    async def _hydrate_open_position_from_store(self, symbol: str) -> Optional[Position]:
+        sym = norm_symbol(symbol)
+        if not sym:
+            return None
+
+        now = time.time()
+        last = float(self._position_hydrate_last_check.get(sym, 0.0) or 0.0)
+        if now - last < self.position_hydrate_miss_interval_sec:
+            return None
+        self._position_hydrate_last_check[sym] = now
+
+        try:
+            open_trade_id = await self.store.get_open(self.user_id, sym)
+        except Exception as e:
+            log.debug("POSITION_LAZY_HYDRATE_OPEN_CHECK_FAIL | user=%s symbol=%s err=%s", self.user_id, sym, e)
+            open_trade_id = ""
+        if not open_trade_id:
+            return None
+
+        try:
+            rows = await self.store.list_positions(self.user_id)
+        except Exception as e:
+            log.debug("POSITION_LAZY_HYDRATE_FAIL | user=%s symbol=%s err=%s", self.user_id, sym, e)
+            return None
+
+        for row in rows or []:
+            try:
+                row_sym = norm_symbol(row.get("symbol", ""))
+                if row_sym != sym:
+                    continue
+                status = str(row.get("status") or "").upper()
+                if status not in ("OPEN", "EXIT_CONDITIONS_MET", "EXITING"):
+                    return None
+
+                data = {}
+                for key, field_info in Position.__dataclass_fields__.items():  # type: ignore[attr-defined]
+                    data[key] = row.get(key, field_info.default)
+                data["user_id"] = int(self.user_id)
+                data["symbol"] = sym
+
+                pos = Position(**data)
+                self.positions[sym] = pos
+                log.info(
+                    "POSITION_LAZY_HYDRATED | user=%s symbol=%s status=%s qty=%s",
+                    self.user_id,
+                    sym,
+                    pos.status,
+                    pos.qty,
+                )
+                return pos
+            except Exception as e:
+                log.debug("POSITION_LAZY_HYDRATE_ROW_FAIL | user=%s symbol=%s err=%s row=%s", self.user_id, sym, e, row)
+                return None
+
+        return None
 
     # ---------------- broker helpers ----------------
     async def _ensure_kite_ready(self) -> bool:
@@ -2892,8 +2950,11 @@ class TradeEngine:
                     log.info("="*80 + "\n")
 
         pos = self.positions.get(symbol)
+        if not pos:
+            pos = await self._hydrate_open_position_from_store(symbol)
         if not pos or pos.status != "OPEN":
             return None
+        symbol = norm_symbol(pos.symbol) or symbol
 
         # update LTP and pnl safely (avoid entry=0 wrong pnl)
         pos.ltp = float(ltp)
