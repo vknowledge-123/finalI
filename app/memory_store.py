@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from .models import OTP, Session, User
+from .models import OTP, Session, User, utc_now
 from .redis_store import norm_alert_name, norm_symbol
 
 
@@ -23,10 +23,13 @@ class InMemoryStore:
         self._access_tokens: Dict[int, str] = {}
         self._brokers: Dict[int, str] = {}
         self._dhan_credentials: Dict[int, Dict[str, str]] = {}
+        self._dhan_api_credentials: Dict[int, Dict[str, str]] = {}
+        self._dhan_auth_state: Dict[int, Dict[str, Any]] = {}
         self._kill: Dict[int, bool] = {}
         self._alert_configs: Dict[int, Dict[str, Dict[str, Any]]] = {}
         self._alerts: Dict[int, List[Dict[str, Any]]] = {}
         self._positions: Dict[int, Dict[str, Dict[str, Any]]] = {}
+        self._cnc_carry_positions: Dict[int, Dict[str, Dict[str, Any]]] = {}
         self._pnl_exit_cfg: Dict[int, Dict[str, Any]] = {}
         self._sector_cache: Dict[int, Dict[str, Any]] = {}
         self._locks: Dict[str, float] = {}
@@ -82,15 +85,42 @@ class InMemoryStore:
         return self._brokers.get(int(user_id), "ZERODHA")
 
     async def save_dhan_credentials(
-        self, user_id: int, client_id: str, access_token: str
+        self,
+        user_id: int,
+        client_id: str,
+        access_token: str,
+        token_expiry: str = "",
+        auth_mode: str = "MANUAL",
     ) -> None:
         self._dhan_credentials[int(user_id)] = {
             "client_id": str(client_id or ""),
             "access_token": str(access_token or ""),
+            "token_expiry": str(token_expiry or ""),
+            "auth_mode": str(auth_mode or "MANUAL").upper(),
         }
 
     async def load_dhan_credentials(self, user_id: int) -> Dict[str, str]:
         return dict(self._dhan_credentials.get(int(user_id), {}))
+
+    async def save_dhan_api_credentials(
+        self, user_id: int, client_id: str, api_key: str, api_secret: str
+    ) -> None:
+        self._dhan_api_credentials[int(user_id)] = {
+            "client_id": str(client_id or ""),
+            "api_key": str(api_key or ""),
+            "api_secret": str(api_secret or ""),
+        }
+
+    async def load_dhan_api_credentials(self, user_id: int) -> Dict[str, str]:
+        return dict(self._dhan_api_credentials.get(int(user_id), {}))
+
+    async def save_dhan_auth_state(self, user_id: int, state: Dict[str, Any]) -> None:
+        payload = dict(state or {})
+        payload["user_id"] = int(user_id)
+        self._dhan_auth_state[int(user_id)] = payload
+
+    async def load_dhan_auth_state(self, user_id: int) -> Dict[str, Any]:
+        return dict(self._dhan_auth_state.get(int(user_id), {}))
 
     # -------------------------
     # Kill switch
@@ -225,6 +255,48 @@ class InMemoryStore:
     async def delete_position(self, user_id: int, symbol: str) -> None:
         self._positions.get(int(user_id), {}).pop(norm_symbol(symbol), None)
 
+    async def save_cnc_carry_position(self, user_id: int, symbol: str, position: Dict[str, Any]) -> None:
+        uid = int(user_id)
+        sym = norm_symbol(symbol)
+        if not sym:
+            return
+        payload = dict(position or {})
+        payload["symbol"] = sym
+        payload["product"] = "CNC"
+        self._cnc_carry_positions.setdefault(uid, {})[sym] = payload
+
+    async def delete_cnc_carry_position(self, user_id: int, symbol: str) -> None:
+        self._cnc_carry_positions.get(int(user_id), {}).pop(norm_symbol(symbol), None)
+
+    async def list_cnc_carry_positions(self, user_id: int) -> List[Dict[str, Any]]:
+        uid = int(user_id)
+        return list(self._cnc_carry_positions.get(uid, {}).values())
+
+    async def clear_daily_trading_state(self, user_id: int) -> Dict[str, int]:
+        uid = int(user_id)
+        deleted = 0
+        for bucket in (self._positions, self._alerts):
+            if uid in bucket:
+                bucket.pop(uid, None)
+                deleted += 1
+        for bucket in (self._kill, self._auto_sq_off_ran_ymd):
+            if uid in bucket:
+                bucket.pop(uid, None)
+                deleted += 1
+        open_keys = [key for key in self._open_trades if key.startswith(f"{uid}:")]
+        for key in open_keys:
+            self._open_trades.pop(key, None)
+            deleted += 1
+        lock_keys = [key for key in self._locks if key.startswith(f"{uid}:")]
+        for key in lock_keys:
+            self._locks.pop(key, None)
+            deleted += 1
+        trade_count_keys = [key for key in self._trade_counts if key.startswith(f"{uid}:")]
+        for key in trade_count_keys:
+            self._trade_counts.pop(key, None)
+            deleted += 1
+        return {"deleted_keys": deleted, "scanned_keys": len(open_keys) + len(lock_keys) + len(trade_count_keys)}
+
     def _guard_key(self, user_id: int, symbol: str, action: str = "") -> str:
         return f"{int(user_id)}:{norm_symbol(symbol)}:{action.strip().lower()}"
 
@@ -244,7 +316,7 @@ class InMemoryStore:
     async def allow_trade(self, user_id: int, alert_name: str, limit: int) -> bool:
         if int(limit) <= 0:
             return True
-        ymd = datetime.utcnow().strftime("%Y%m%d")
+        ymd = datetime.now(timezone.utc).strftime("%Y%m%d")
         key = f"{int(user_id)}:{ymd}:{norm_alert_name(alert_name)}"
         count = self._trade_counts.get(key, 0)
         if count >= int(limit):
@@ -278,12 +350,12 @@ class InMemoryStore:
 
     async def has_auto_sq_off_run(self, user_id: int) -> bool:
         uid = int(user_id)
-        ymd = datetime.utcnow().strftime("%Y%m%d")
+        ymd = datetime.now(timezone.utc).strftime("%Y%m%d")
         return self._auto_sq_off_ran_ymd.get(uid) == ymd
 
     async def mark_auto_sq_off_run(self, user_id: int) -> None:
         uid = int(user_id)
-        ymd = datetime.utcnow().strftime("%Y%m%d")
+        ymd = datetime.now(timezone.utc).strftime("%Y%m%d")
         self._auto_sq_off_ran_ymd[uid] = ymd
 
     async def list_all_user_ids(self) -> List[int]:
@@ -291,8 +363,10 @@ class InMemoryStore:
             set(self._credentials.keys())
             | set(self._access_tokens.keys())
             | set(self._dhan_credentials.keys())
+            | set(self._dhan_api_credentials.keys())
             | set(self._brokers.keys())
             | set(self._kill.keys())
+            | set(self._cnc_carry_positions.keys())
         )
         return sorted(uids)
 
@@ -339,7 +413,7 @@ class InMemoryStore:
             otp = OTP.from_dict(dict(raw))
         except Exception:
             return None
-        if datetime.utcnow() >= otp.expires_at:
+        if utc_now() >= otp.expires_at:
             self._otp_by_email.pop(email, None)
             return None
         return otp
@@ -373,7 +447,7 @@ class InMemoryStore:
             sess = Session.from_dict(dict(raw))
         except Exception:
             return None
-        if datetime.utcnow() >= sess.expires_at:
+        if utc_now() >= sess.expires_at:
             self._sessions_by_token.pop(token, None)
             return None
         return sess

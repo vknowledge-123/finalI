@@ -43,6 +43,7 @@ from .dhan_broker import (
     DHAN_INSTRUMENTS,
     dhan_client,
     normalize_dhan_candles,
+    normalize_dhan_holdings,
     normalize_dhan_positions,
     order_id_from_response,
     resample_intraday_candles,
@@ -650,7 +651,7 @@ class AlertConfig:
     capital: float = 20000.0
     qty: int = 1
 
-    # monitoring (MIS only)
+    # Live monitoring for both MIS and CNC carry positions.
     target_pct: float = 1.0
     stop_loss_pct: float = 0.7
     trailing_sl_pct: float = 0.5
@@ -1065,7 +1066,11 @@ class TradeEngine:
                         max_profit,
                         max_loss,
                     )
-                    await self.trigger_kill_switch(reason=f"PNL_EXIT:{trigger}:MTM={mtm:.2f}", squareoff_first=True)
+                    await self.trigger_kill_switch(
+                        reason=f"PNL_EXIT:{trigger}:MTM={mtm:.2f}",
+                        squareoff_first=True,
+                        products={"MIS"},
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -1101,6 +1106,127 @@ class TradeEngine:
                 restored.append(sym)
             except Exception as e:
                 log.debug("REHYDRATE_ROW_FAIL | user=%s err=%s row=%s", self.user_id, e, r)
+
+        try:
+            restored.extend(await self.rehydrate_cnc_carry_positions())
+        except Exception as e:
+            log.warning("CNC_CARRY_REHYDRATE_FAIL | user=%s err=%s", self.user_id, e)
+
+        return restored
+
+    async def _persist_position_state(self, pos: Position) -> None:
+        sym = norm_symbol(pos.symbol)
+        if not sym:
+            return
+        await self.store.upsert_position(self.user_id, sym, pos.to_public())
+        if pos.product == "CNC" and pos.status != "CLOSED" and int(pos.qty or 0) > 0:
+            save_fn = getattr(self.store, "save_cnc_carry_position", None)
+            if callable(save_fn):
+                await save_fn(self.user_id, sym, pos.to_public())
+        elif pos.product == "CNC":
+            delete_fn = getattr(self.store, "delete_cnc_carry_position", None)
+            if callable(delete_fn):
+                await delete_fn(self.user_id, sym)
+
+    async def _broker_holdings(self) -> List[Dict[str, Any]]:
+        if self.broker != "DHAN":
+            return []
+        if not await self._ensure_dhan_ready() or not self.dhan:
+            raise RuntimeError("DHAN_NOT_CONNECTED")
+        holdings_fn = getattr(self.dhan, "get_holdings", None)
+        if not callable(holdings_fn):
+            raise RuntimeError("DHAN_HOLDINGS_NOT_SUPPORTED")
+        response = await self.market_data_worker.submit(holdings_fn)
+        return normalize_dhan_holdings(response)
+
+    async def rehydrate_cnc_carry_positions(self) -> List[str]:
+        list_fn = getattr(self.store, "list_cnc_carry_positions", None)
+        if not callable(list_fn):
+            return []
+        carry_rows = await list_fn(self.user_id)
+        if not carry_rows:
+            return []
+
+        holdings_by_symbol: Dict[str, Dict[str, Any]] = {}
+        holdings_loaded = False
+        try:
+            holdings = await self._broker_holdings()
+            holdings_by_symbol = {norm_symbol(row.get("tradingsymbol", "")): row for row in holdings}
+            holdings_loaded = True
+        except Exception as e:
+            log.warning("CNC_HOLDINGS_FETCH_FAIL | user=%s err=%s", self.user_id, e)
+            if self.broker == "DHAN":
+                return []
+
+        restored: List[str] = []
+        for row in carry_rows or []:
+            try:
+                sym = norm_symbol(row.get("symbol", ""))
+                if not sym:
+                    continue
+                holding = holdings_by_symbol.get(sym) if holdings_by_symbol else None
+                if holdings_loaded and not holding:
+                    delete_fn = getattr(self.store, "delete_cnc_carry_position", None)
+                    if callable(delete_fn):
+                        await delete_fn(self.user_id, sym)
+                    await self.store.clear_open(self.user_id, sym)
+                    continue
+
+                qty = int((holding or {}).get("quantity") or row.get("qty") or 0)
+                if qty <= 0:
+                    continue
+                avg = float((holding or {}).get("average_price") or 0.0)
+
+                data = {}
+                for key, field_info in Position.__dataclass_fields__.items():  # type: ignore[attr-defined]
+                    data[key] = row.get(key, field_info.default)
+                data["user_id"] = int(self.user_id)
+                data["symbol"] = sym
+                data["product"] = "CNC"
+                data["qty"] = qty
+                data["status"] = "OPEN"
+                if avg > 0:
+                    data["entry_price"] = avg
+                if not data.get("trade_id"):
+                    data["trade_id"] = f"cnc-{sym}-{int(time.time())}"
+
+                pos = Position(**data)
+                if pos.entry_price > 0:
+                    if pos.cfg_target_pct > 0 and pos.target_price <= 0:
+                        pos.target_price = (
+                            pos.entry_price * (1.0 + pos.cfg_target_pct / 100.0)
+                            if pos.side == "BUY"
+                            else pos.entry_price * (1.0 - pos.cfg_target_pct / 100.0)
+                        )
+                    if pos.cfg_sl_pct > 0 and pos.sl_price <= 0:
+                        pos.sl_price = (
+                            pos.entry_price * (1.0 - pos.cfg_sl_pct / 100.0)
+                            if pos.side == "BUY"
+                            else pos.entry_price * (1.0 + pos.cfg_sl_pct / 100.0)
+                        )
+                if pos.side == "BUY" and pos.highest <= 0:
+                    pos.highest = pos.entry_price
+                if pos.side == "SELL" and pos.lowest <= 0:
+                    pos.lowest = pos.entry_price
+                if pos.tsl_pct > 0 and pos.trail_price <= 0:
+                    _ratchet_classic_tsl(pos, _classic_tsl_line(pos))
+
+                self.positions[sym] = pos
+                await self._persist_position_state(pos)
+                await self.store.mark_open(self.user_id, sym, pos.trade_id, ttl_sec=60 * 60 * 24 * 14)
+                restored.append(sym)
+                log.info(
+                    "CNC_CARRY_REHYDRATED | user=%s symbol=%s qty=%s entry=%.2f target=%.2f sl=%.2f tsl=%.2f",
+                    self.user_id,
+                    sym,
+                    pos.qty,
+                    float(pos.entry_price),
+                    float(pos.target_price),
+                    float(pos.sl_price),
+                    float(pos.trail_price or 0.0),
+                )
+            except Exception as e:
+                log.debug("CNC_CARRY_ROW_REHYDRATE_FAIL | user=%s err=%s row=%s", self.user_id, e, row)
 
         return restored
 
@@ -2420,8 +2546,9 @@ class TradeEngine:
                 if custom_signal:
                     self._custom_last_signal[(alert_key, sym)] = custom_signal.candle_time
                 try:
-                    await self.store.upsert_position(self.user_id, execution_symbol, pos.to_public())
-                    await self.store.mark_open(self.user_id, execution_symbol, pos.trade_id)
+                    await self._persist_position_state(pos)
+                    open_ttl = 60 * 60 * 24 * 14 if pos.product == "CNC" else 60 * 60 * 8
+                    await self.store.mark_open(self.user_id, execution_symbol, pos.trade_id, ttl_sec=open_ttl)
                 except Exception:
                     pass
 
@@ -2509,7 +2636,7 @@ class TradeEngine:
                     pos.status = "OPEN"
                     pos.pending_reason = ""
                     pos.updated_ts = time.time()
-                    await self.store.upsert_position(self.user_id, symbol, pos.to_public())
+                    await self._persist_position_state(pos)
                 elif status == "PARTIAL":
                     filled = int(snapshot.get("filled_quantity") or 0)
                     remaining = int(snapshot.get("remaining_quantity") or 0)
@@ -2520,13 +2647,13 @@ class TradeEngine:
                         pos.status = "PENDING_ENTRY"
                         pos.pending_reason = "ENTRY_PARTIAL_PENDING"
                     pos.updated_ts = time.time()
-                    await self.store.upsert_position(self.user_id, symbol, pos.to_public())
+                    await self._persist_position_state(pos)
                 elif status in ("REJECTED", "CANCELLED"):
                     pos.status = "ERROR"
                     pos.exit_reason = f"ENTRY_{status}"
                     pos.pending_reason = ""
                     pos.updated_ts = time.time()
-                    await self.store.upsert_position(self.user_id, symbol, pos.to_public())
+                    await self._persist_position_state(pos)
                 return
 
             # Exit order updates
@@ -2535,22 +2662,34 @@ class TradeEngine:
                 pos.exit_filled_qty = int(snapshot.get("filled_quantity") or pos.exit_filled_qty or 0)
                 pos.exit_remaining_qty = int(snapshot.get("remaining_quantity") or pos.exit_remaining_qty or 0)
                 if status == "COMPLETE":
+                    pos.qty = 0
+                    pos.exit_remaining_qty = 0
                     pos.status = "CLOSED"
                     pos.pending_reason = ""
                     pos.updated_ts = time.time()
-                    await self.store.upsert_position(self.user_id, symbol, pos.to_public())
+                    await self._persist_position_state(pos)
+                    await self.store.clear_open(self.user_id, symbol)
+                    self.positions.pop(symbol, None)
                 elif status == "PARTIAL":
                     filled = int(snapshot.get("filled_quantity") or 0)
                     remaining = int(snapshot.get("remaining_quantity") or 0)
-                    pos.status = "OPEN" if remaining > 0 else pos.status
+                    if remaining > 0:
+                        pos.qty = remaining
+                        pos.status = "OPEN"
+                    else:
+                        pos.qty = 0
+                        pos.status = "CLOSED"
                     pos.pending_reason = f"EXIT_PARTIAL_FILL:{filled}/{filled + max(0, remaining)}"
                     pos.updated_ts = time.time()
-                    await self.store.upsert_position(self.user_id, symbol, pos.to_public())
+                    await self._persist_position_state(pos)
+                    if pos.status == "CLOSED":
+                        await self.store.clear_open(self.user_id, symbol)
+                        self.positions.pop(symbol, None)
                 elif status in ("REJECTED", "CANCELLED"):
                     pos.status = "ERROR"
                     pos.exit_reason = f"EXIT_{status}"
                     pos.updated_ts = time.time()
-                    await self.store.upsert_position(self.user_id, symbol, pos.to_public())
+                    await self._persist_position_state(pos)
         except Exception as e:
             log.debug("ORDER_UPDATE_FAIL | user=%s err=%s data=%s", self.user_id, e, data)
 
@@ -2588,7 +2727,7 @@ class TradeEngine:
             if exit_qty <= 0:
                 setattr(pos, booked_field, True)
                 pos.updated_ts = time.time()
-                await self.store.upsert_position(self.user_id, symbol, pos.to_public())
+                await self._persist_position_state(pos)
                 return True
 
             exit_side: Side = "SELL" if pos.side == "BUY" else "BUY"
@@ -2642,7 +2781,7 @@ class TradeEngine:
                 pos.status = "CLOSED"
                 pos.exit_reason = f"CUSTOM_{target}"
                 pos.exit_order_id = str(oid)
-                await self.store.delete_position(self.user_id, symbol)
+                await self._persist_position_state(pos)
                 await self.store.clear_open(self.user_id, symbol)
                 self.positions.pop(symbol, None)
                 if pos.alert_time:
@@ -2658,7 +2797,7 @@ class TradeEngine:
                     self.broadcast_cb(self.user_id, {"type": "pos_refresh"})
             else:
                 pos.status = "OPEN"
-                await self.store.upsert_position(self.user_id, symbol, pos.to_public())
+                await self._persist_position_state(pos)
                 if self.broadcast_cb:
                     self.broadcast_cb(self.user_id, {"type": "pos_refresh"})
             return True
@@ -2667,7 +2806,7 @@ class TradeEngine:
             pos.exit_reason = f"{target}_PARTIAL_ORDER_FAIL:{e}"
             pos.updated_ts = time.time()
             try:
-                await self.store.upsert_position(self.user_id, symbol, pos.to_public())
+                await self._persist_position_state(pos)
             except Exception:
                 pass
             if not _is_broker_validation_error(e):
@@ -2783,7 +2922,7 @@ class TradeEngine:
                 if not pos.tp3_booked:
                     pos.tp3_exit_qty = q3
 
-            await self.store.upsert_position(self.user_id, symbol, pos.to_public())
+            await self._persist_position_state(pos)
             log.info(
                 "PYRAMID_ADD_OK | user=%s symbol=%s side=%s requested_qty=%s filled_qty=%s total_qty=%s fill=%.2f avg=%.2f count=%s/%s order_id=%s",
                 self.user_id,
@@ -2805,7 +2944,7 @@ class TradeEngine:
             pos.pyramid_last_error = str(e)
             pos.updated_ts = time.time()
             try:
-                await self.store.upsert_position(self.user_id, symbol, pos.to_public())
+                await self._persist_position_state(pos)
             except Exception:
                 pass
             log.warning("PYRAMID_ADD_FAIL | user=%s symbol=%s err=%s", self.user_id, symbol, e)
@@ -2966,10 +3105,6 @@ class TradeEngine:
         else:
             pos.pnl = 0.0
 
-        # CNC: no auto exit monitoring (keep as per your design)
-        if pos.product == "CNC":
-            return pos
-
         # reconcile entry_price once if missing (REST)
         if pos.entry_price <= 0 and not self._recon_inflight.get(symbol):
             self._recon_inflight[symbol] = True
@@ -3009,7 +3144,7 @@ class TradeEngine:
                         )
 
                         try:
-                            await self.store.upsert_position(self.user_id, symbol, pos.to_public())
+                            await self._persist_position_state(pos)
                         except Exception:
                             pass
                 finally:
@@ -3089,14 +3224,14 @@ class TradeEngine:
                     pos.exit_reason = reason
                     pos.updated_ts = time.time()
                     try:
-                        await self.store.upsert_position(self.user_id, symbol, pos.to_public())
+                        await self._persist_position_state(pos)
                     except Exception:
                         pass
                 if not self._exit_inflight.get(symbol):
                     self._exit_inflight[symbol] = True
                     pos.status = "EXITING"
                     try:
-                        await self.store.upsert_position(self.user_id, symbol, pos.to_public())
+                        await self._persist_position_state(pos)
                     except Exception:
                         pass
                     asyncio.create_task(self._exit_position(symbol, reason), name=f"exit_{symbol}")
@@ -3107,7 +3242,7 @@ class TradeEngine:
                 or pos.trail_price != previous_trail
             ):
                 try:
-                    await self.store.upsert_position(self.user_id, symbol, pos.to_public())
+                    await self._persist_position_state(pos)
                 except Exception:
                     pass
             return pos
@@ -3119,9 +3254,11 @@ class TradeEngine:
             pos.lowest = min(pos.lowest, ltp) if pos.lowest else float(ltp)
 
         # tsl line for BUY/SELL
+        previous_classic_trail = float(pos.trail_price or 0.0)
         tsl_line = 0.0
         if pos.tsl_pct > 0:
             tsl_line = _ratchet_classic_tsl(pos, _classic_tsl_line(pos))
+        classic_trail_changed = float(pos.trail_price or 0.0) != previous_classic_trail
 
         # distances (signed)
         tgt_dist = 0.0
@@ -3170,6 +3307,11 @@ class TradeEngine:
 
             if not reason:
                 # Suppress continuous monitor logs; only log on exit triggers.
+                if classic_trail_changed:
+                    try:
+                        await self._persist_position_state(pos)
+                    except Exception:
+                        pass
                 return pos
 
             log.info(
@@ -3213,7 +3355,7 @@ class TradeEngine:
                 
                 # Save to Redis so dashboard shows the status
                 try:
-                    await self.store.upsert_position(self.user_id, symbol, pos.to_public())
+                    await self._persist_position_state(pos)
                 except Exception as e:
                     log.debug("REDIS_UPDATE_FAIL | symbol=%s err=%s", symbol, e)
                 
@@ -3233,12 +3375,18 @@ class TradeEngine:
                 # Set status to EXITING before placing exit order
                 pos.status = "EXITING"
                 try:
-                    await self.store.upsert_position(self.user_id, symbol, pos.to_public())
+                    await self._persist_position_state(pos)
                 except Exception:
                     pass
                 asyncio.create_task(self._exit_position(symbol, reason), name=f"exit_{symbol}")
             else:
                 log.debug("⏳ EXIT_DEBOUNCE | user=%s symbol=%s reason=%s", self.user_id, symbol, reason)
+
+        if not reason and classic_trail_changed:
+            try:
+                await self._persist_position_state(pos)
+            except Exception:
+                pass
 
         return pos
 
@@ -3581,7 +3729,7 @@ class TradeEngine:
                 pos.exit_reason = str(reason)
                 pos.updated_ts = time.time()
                 try:
-                    await self.store.upsert_position(self.user_id, symbol, pos.to_public())
+                    await self._persist_position_state(pos)
                 except Exception as e:
                     log.debug("📝 EXIT_UPSERT_FAIL | user=%s symbol=%s err=%s", self.user_id, symbol, e)
 
@@ -3620,7 +3768,7 @@ class TradeEngine:
                         pos.status = "OPEN"
                         pos.pending_reason = f"PARTIAL_EXIT_FILLED:{filled_exit_qty}/{requested_exit_qty}"
                         pos.exit_reason = f"{reason}:PARTIAL_EXIT"
-                        await self.store.upsert_position(self.user_id, symbol, pos.to_public())
+                        await self._persist_position_state(pos)
                         log.warning(
                             "EXIT_ORDER_PARTIAL | user=%s symbol=%s reason=%s filled_qty=%s requested_qty=%s order_id=%s",
                             self.user_id,
@@ -3648,7 +3796,7 @@ class TradeEngine:
                     # Keep CLOSED snapshot in Redis for dashboard/history, but
                     # remove it from live in-memory monitoring.
                     try:
-                        await self.store.upsert_position(self.user_id, symbol, pos.to_public())
+                        await self._persist_position_state(pos)
                         if symbol in self.positions:
                             del self.positions[symbol]
                         log.info("🗑️ POSITION_DELETED | %s (CLOSED)", symbol)
@@ -3696,7 +3844,7 @@ class TradeEngine:
                             log.error("KILL_SWITCH_ENABLE_FAIL | user=%s err=%s", self.user_id, e3)
 
                     try:
-                        await self.store.upsert_position(self.user_id, symbol, pos.to_public())
+                        await self._persist_position_state(pos)
                     except Exception as e2:
                         log.debug("📝 EXIT_UPSERT_FAIL3 | user=%s symbol=%s err=%s", self.user_id, symbol, e2)
 
@@ -3720,14 +3868,23 @@ class TradeEngine:
             self._exit_signal_sent[symbol] = False
             log.debug("🏁 EXIT_DONE | user=%s symbol=%s", self.user_id, symbol)
 
-    async def exit_all_open_positions(self, reason: str = "AUTO_SQ_OFF") -> int:
+    async def exit_all_open_positions(
+        self,
+        reason: str = "AUTO_SQ_OFF",
+        products: Optional[Set[str]] = None,
+    ) -> int:
         """
         Trigger exit for ALL open positions (e.g. at 3:15 PM).
         Returns number of positions triggered.
         """
         count = 0
+        allowed_products = {str(product).upper() for product in (products or set()) if str(product).strip()}
         # Snapshot keys to avoid runtime dict change errors if async
-        symbols = [s for s, p in self.positions.items() if p.status == "OPEN"]
+        symbols = [
+            s
+            for s, p in self.positions.items()
+            if p.status == "OPEN" and (not allowed_products or str(p.product).upper() in allowed_products)
+        ]
         
         if not symbols:
             log.warning("⏰ EXIT_ALL_SKIP | user=%s reason=%s | No OPEN positions found in memory. Total tracked=%s", 
@@ -3743,7 +3900,11 @@ class TradeEngine:
         
         return count
 
-    async def squareoff_all_positions(self, reason: str = "MANUAL_EXIT_ALL") -> Dict[str, Any]:
+    async def squareoff_all_positions(
+        self,
+        reason: str = "MANUAL_EXIT_ALL",
+        products: Optional[Set[str]] = None,
+    ) -> Dict[str, Any]:
         """
         Best-effort square-off of *all* known open positions.
 
@@ -3753,11 +3914,13 @@ class TradeEngine:
           3) Zerodha positions() REST fallback (if connected)
         """
         symbols: Set[str] = set()
+        allowed_products = {str(product).upper() for product in (products or set()) if str(product).strip()}
 
         # 1) Memory
         try:
             for s, p in (self.positions or {}).items():
-                if getattr(p, "status", "") == "OPEN":
+                product = str(getattr(p, "product", "") or "").upper()
+                if getattr(p, "status", "") == "OPEN" and (not allowed_products or product in allowed_products):
                     symbols.add(norm_symbol(s))
         except Exception:
             pass
@@ -3769,7 +3932,13 @@ class TradeEngine:
                 sym = norm_symbol(str(r.get("symbol") or ""))
                 qty = int(r.get("qty") or 0)
                 status = str(r.get("status") or "").upper()
-                if sym and qty != 0 and status in {"OPEN", "EXITING", "EXIT_CONDITIONS_MET"}:
+                product = str(r.get("product") or "").upper()
+                if (
+                    sym
+                    and qty != 0
+                    and status in {"OPEN", "EXITING", "EXIT_CONDITIONS_MET"}
+                    and (not allowed_products or product in allowed_products)
+                ):
                     symbols.add(sym)
         except Exception:
             pass
@@ -3787,7 +3956,8 @@ class TradeEngine:
                 for r in rows:
                     sym = norm_symbol(str(r.get("tradingsymbol") or ""))
                     qty = int(r.get("quantity") or 0)
-                    if sym and qty != 0:
+                    product = str(r.get("product") or "").upper()
+                    if sym and qty != 0 and (not allowed_products or product in allowed_products):
                         symbols.add(sym)
         except Exception:
             pass
@@ -3810,7 +3980,12 @@ class TradeEngine:
         except Exception:
             pass
 
-    async def trigger_kill_switch(self, reason: str, squareoff_first: bool = True) -> Dict[str, Any]:
+    async def trigger_kill_switch(
+        self,
+        reason: str,
+        squareoff_first: bool = True,
+        products: Optional[Set[str]] = None,
+    ) -> Dict[str, Any]:
         """
         Panic action: square-off exposure (best-effort), then enable kill switch.
         """
@@ -3821,7 +3996,7 @@ class TradeEngine:
             sq: Optional[Dict[str, Any]] = None
             if squareoff_first:
                 try:
-                    sq = await self.squareoff_all_positions(reason=f"KILL_SWITCH:{reason}")
+                    sq = await self.squareoff_all_positions(reason=f"KILL_SWITCH:{reason}", products=products)
                 except Exception as e:
                     sq = {"ok": False, "error": str(e), "count": 0, "results": []}
 

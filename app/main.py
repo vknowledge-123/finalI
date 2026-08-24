@@ -10,6 +10,7 @@ import subprocess
 import sys
 
 from typing import Any, Dict, List, Optional, Set, Tuple
+import httpx
 from fastapi import HTTPException
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, Query, Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -149,6 +150,7 @@ if _SUPPRESS_MW:
 # Config
 # -----------------------------
 REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
+DHAN_AUTH_BASE_URL = (os.getenv("DHAN_AUTH_BASE_URL") or "https://auth.dhan.co").rstrip("/")
 ENABLE_SERVICE_RESTART = (os.getenv("ENABLE_SERVICE_RESTART") or "").strip().lower() in {"1", "true", "yes", "on"}
 SERVICE_RESTART_TOKEN = (os.getenv("SERVICE_RESTART_TOKEN") or "").strip()
 TRADING_SYSTEMD_UNIT = (os.getenv("TRADING_SYSTEMD_UNIT") or "trading").strip()
@@ -244,6 +246,8 @@ auth_service = None
 # Engines per user
 ENGINE: Dict[int, TradeEngine] = {}
 SERVICE_RUNTIME: Optional[ServiceRuntime] = None
+DAILY_DASHBOARD_CLEANUP_TASK: Optional[asyncio.Task] = None
+_LAST_DASHBOARD_CLEANUP_YMD: str = ""
 
 # -----------------------------
 # KiteTicker globals (single ticker)
@@ -315,6 +319,121 @@ def _dhan_response_ok(response: Any) -> bool:
         return False
     status = str(response.get("status") or "").strip().lower()
     return status not in {"failure", "failed", "error"}
+
+
+def _dhan_auth_error(response: Any) -> str:
+    if isinstance(response, dict):
+        for key in ("errorMessage", "error_message", "message", "remarks", "detail", "error"):
+            value = response.get(key)
+            if value:
+                return str(value)
+        if response.get("errorCode"):
+            return str(response.get("errorCode"))
+    return "DHAN_AUTH_REQUEST_FAILED"
+
+
+def _dhan_auth_login_url(consent_app_id: str) -> str:
+    return f"{DHAN_AUTH_BASE_URL}/login/consentApp-login?consentAppId={consent_app_id}"
+
+
+async def _dhan_generate_consent(client_id: str, api_key: str, api_secret: str) -> Dict[str, Any]:
+    async with httpx.AsyncClient(timeout=20.0, follow_redirects=False) as client:
+        response = await client.post(
+            f"{DHAN_AUTH_BASE_URL}/app/generate-consent",
+            params={"client_id": client_id},
+            headers={"app_id": api_key, "app_secret": api_secret},
+        )
+    try:
+        data = response.json()
+    except Exception:
+        data = {"message": response.text[:500]}
+    if response.status_code >= 400 or not _dhan_response_ok(data):
+        raise RuntimeError(_dhan_auth_error(data))
+    consent_app_id = str(data.get("consentAppId") or "").strip()
+    if not consent_app_id:
+        raise RuntimeError("DHAN_CONSENT_APP_ID_MISSING")
+    return {
+        "consentAppId": consent_app_id,
+        "consentAppStatus": str(data.get("consentAppStatus") or ""),
+        "login_url": _dhan_auth_login_url(consent_app_id),
+        "raw": data,
+    }
+
+
+async def _dhan_consume_app_consent(token_id: str, api_key: str, api_secret: str) -> Dict[str, Any]:
+    async with httpx.AsyncClient(timeout=20.0, follow_redirects=False) as client:
+        response = await client.get(
+            f"{DHAN_AUTH_BASE_URL}/app/consumeApp-consent",
+            params={"tokenId": token_id},
+            headers={"app_id": api_key, "app_secret": api_secret},
+        )
+    try:
+        data = response.json()
+    except Exception:
+        data = {"message": response.text[:500]}
+    if response.status_code >= 400 or not _dhan_response_ok(data):
+        raise RuntimeError(_dhan_auth_error(data))
+    access_token = str(data.get("accessToken") or data.get("access_token") or "").strip()
+    client_id = str(data.get("dhanClientId") or data.get("clientId") or "").strip()
+    if not client_id or not access_token:
+        raise RuntimeError("DHAN_ACCESS_TOKEN_MISSING")
+    return {
+        "client_id": client_id,
+        "access_token": access_token,
+        "expiry_time": str(data.get("expiryTime") or data.get("expiry_time") or ""),
+        "client_name": str(data.get("dhanClientName") or ""),
+        "ucc": str(data.get("dhanClientUcc") or ""),
+        "poa": bool(data.get("givenPowerOfAttorney", False)),
+        "raw": data,
+    }
+
+
+async def _activate_dhan_token(
+    user_id: int,
+    client_id: str,
+    access_token: str,
+    token_expiry: str = "",
+    auth_mode: str = "API_KEY",
+) -> Dict[str, Any]:
+    await store.save_dhan_credentials(
+        user_id,
+        client_id,
+        access_token,
+        token_expiry=token_expiry,
+        auth_mode=auth_mode,
+    )
+    await store.save_broker(user_id, "DHAN")
+    _SESSION_CACHE.pop(user_id, None)
+    SYMBOL_TOKEN.clear()
+    TOKEN_TO_SYMBOL.clear()
+    SUB_TOKENS.clear()
+
+    eng = await ensure_engine(user_id)
+    await eng.configure_broker()
+
+    warning = ""
+    if not _is_test_mode():
+        try:
+            await _stop_kite_ticker()
+            await build_symbol_token_map_from_dhan(user_id)
+            await subscribe_symbols_for_user(user_id, list(STOCK_INDEX_MAPPING.keys()))
+            await subscribe_dhan_sector_indices_for_user(user_id)
+            await start_dhan_feed(user_id)
+        except Exception:
+            warning = "DHAN_FEED_START_FAILED"
+            log.exception("Dhan token activated but feed startup failed | user=%s", user_id)
+
+    result: Dict[str, Any] = {
+        "ok": True,
+        "broker": "DHAN",
+        "auth_mode": auth_mode,
+        "client_id": client_id,
+        "access_token_generated": bool(access_token),
+        "expiry_time": token_expiry,
+    }
+    if warning:
+        result["warning"] = warning
+    return result
 
 
 def _nested_number(data: Any, keys: Tuple[str, ...]) -> float:
@@ -477,6 +596,73 @@ async def ensure_service_runtime() -> ServiceRuntime:
         )
         await SERVICE_RUNTIME.start()
     return SERVICE_RUNTIME
+
+
+async def _clear_dashboard_trading_state_for_new_day() -> None:
+    """
+    Clear dashboard-visible trade/alert history once per IST date.
+    Alert configs, broker credentials, sessions, and sector cache are preserved.
+    """
+    global _LAST_DASHBOARD_CLEANUP_YMD
+    if store is None:
+        return
+    ymd = now_ist_date()
+    if _LAST_DASHBOARD_CLEANUP_YMD == ymd:
+        return
+    try:
+        user_ids = await store.list_all_user_ids()
+    except Exception as exc:
+        log.warning("DAILY_DASHBOARD_CLEANUP_USER_LIST_FAIL | err=%s", exc)
+        user_ids = [1]
+    if not user_ids:
+        user_ids = [1]
+
+    for uid in user_ids:
+        try:
+            cleanup = await store.clear_daily_trading_state(int(uid))
+            engine = ENGINE.get(int(uid))
+            if engine is not None:
+                for pos in list(engine.positions.values()):
+                    if getattr(pos, "product", "") == "CNC" and getattr(pos, "status", "") in {
+                        "OPEN",
+                        "EXITING",
+                        "EXIT_CONDITIONS_MET",
+                    }:
+                        await engine._persist_position_state(pos)
+                        await store.mark_open(int(uid), pos.symbol, pos.trade_id, ttl_sec=60 * 60 * 24 * 14)
+            log.info(
+                "DAILY_DASHBOARD_CLEANUP_OK | user=%s ymd=%s deleted=%s scanned=%s",
+                uid,
+                ymd,
+                cleanup.get("deleted_keys", 0),
+                cleanup.get("scanned_keys", 0),
+            )
+        except Exception as exc:
+            log.exception("DAILY_DASHBOARD_CLEANUP_FAIL | user=%s ymd=%s err=%s", uid, ymd, exc)
+    _LAST_DASHBOARD_CLEANUP_YMD = ymd
+
+
+async def schedule_daily_dashboard_cleanup() -> None:
+    """
+    Keeps dashboard trade/history tables fresh for each new IST day.
+
+    Runs shortly after midnight IST while the app is alive. The deployment
+    timer can still run app/daily_cleanup.py as an external safety net.
+    """
+    while True:
+        try:
+            ist = pytz.timezone("Asia/Kolkata")
+            now = datetime.datetime.now(ist)
+            if now.hour == 0 and now.minute < 10:
+                await _clear_dashboard_trading_state_for_new_day()
+                await asyncio.sleep(10 * 60)
+            else:
+                await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.exception("DAILY_DASHBOARD_CLEANUP_LOOP_FAIL | err=%s", exc)
+            await asyncio.sleep(60)
 
 
 
@@ -1136,7 +1322,7 @@ async def schedule_auto_squareoff():
                             print(f"⏰ [AUTO_SQ_OFF] Triggering for user={uid} at {now}")
                             eng = await ensure_engine(uid)
                             # Passing reason AUTO_SQ_OFF_320 to differentiate
-                            cnt = await eng.exit_all_open_positions(reason="AUTO_SQ_OFF_320")
+                            cnt = await eng.exit_all_open_positions(reason="AUTO_SQ_OFF_320", products={"MIS"})
                             await store.mark_auto_sq_off_run(uid)
                             
                             # Notify UI
@@ -1155,7 +1341,7 @@ async def schedule_auto_squareoff():
 # -----------------------------
 @app.on_event("startup")
 async def startup():
-    global APP_LOOP, encryption_manager, store, auth_service, SERVICE_RUNTIME
+    global APP_LOOP, encryption_manager, store, auth_service, SERVICE_RUNTIME, DAILY_DASHBOARD_CLEANUP_TASK
     APP_LOOP = asyncio.get_running_loop()
     ws_mgr.set_loop(APP_LOOP)
 
@@ -1207,6 +1393,8 @@ async def startup():
     
     # Start Scheduler
     asyncio.create_task(schedule_auto_squareoff())
+    if DAILY_DASHBOARD_CLEANUP_TASK is None or DAILY_DASHBOARD_CLEANUP_TASK.done():
+        DAILY_DASHBOARD_CLEANUP_TASK = asyncio.create_task(schedule_daily_dashboard_cleanup())
 
     # Auto-start for all users found in Redis
     try:
@@ -1254,7 +1442,16 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
-    global SERVICE_RUNTIME
+    global SERVICE_RUNTIME, DAILY_DASHBOARD_CLEANUP_TASK
+    if DAILY_DASHBOARD_CLEANUP_TASK is not None:
+        DAILY_DASHBOARD_CLEANUP_TASK.cancel()
+        try:
+            await DAILY_DASHBOARD_CLEANUP_TASK
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+        DAILY_DASHBOARD_CLEANUP_TASK = None
     if SERVICE_RUNTIME is not None:
         try:
             await SERVICE_RUNTIME.stop()
@@ -1323,7 +1520,31 @@ async def save_credentials(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 @app.get("/api/broker-config")
 async def broker_config(user_id: int = 1) -> Dict[str, Any]:
-    return {"broker": await store.load_broker(int(user_id))}
+    uid = int(user_id)
+    broker = await store.load_broker(uid)
+    dhan_creds = await store.load_dhan_credentials(uid)
+    dhan_api_creds = {}
+    load_api_fn = getattr(store, "load_dhan_api_credentials", None)
+    if callable(load_api_fn):
+        dhan_api_creds = await load_api_fn(uid)
+    dhan_client_id = str(dhan_creds.get("client_id") or dhan_api_creds.get("client_id") or "")
+    auth_mode = str(dhan_creds.get("auth_mode") or ("API_KEY" if dhan_api_creds else "MANUAL") or "MANUAL").upper()
+    return {
+        "broker": broker,
+        "dhan": {
+            "auth_mode": auth_mode if auth_mode in {"MANUAL", "API_KEY"} else "MANUAL",
+            "client_id": dhan_client_id,
+            "has_access_token": bool(str(dhan_creds.get("access_token") or "").strip()),
+            "token_expiry": str(dhan_creds.get("token_expiry") or ""),
+            "has_api_credentials": bool(
+                str(dhan_api_creds.get("api_key") or "").strip()
+                and str(dhan_api_creds.get("api_secret") or "").strip()
+            ),
+            "redirect_url": f"{str(os.getenv('PUBLIC_BASE_URL') or '').rstrip('/')}/dhan/callback/{uid}"
+            if os.getenv("PUBLIC_BASE_URL")
+            else f"/dhan/callback/{uid}",
+        },
+    }
 
 
 @app.post("/api/broker-config")
@@ -1335,21 +1556,48 @@ async def save_broker_config(payload: Dict[str, Any]) -> Dict[str, Any]:
             return {"error": "UNSUPPORTED_BROKER"}
 
         if broker == "DHAN":
+            auth_mode = str(payload.get("auth_mode") or payload.get("dhan_auth_mode") or "MANUAL").strip().upper()
+            if auth_mode in {"API", "API_KEY_SECRET", "OAUTH"}:
+                auth_mode = "API_KEY"
+            if auth_mode not in {"MANUAL", "API_KEY"}:
+                return {"error": "DHAN_AUTH_MODE_INVALID"}
             client_id = str(payload.get("client_id") or "").strip()
-            access_token = str(payload.get("access_token") or "").strip()
-            if not client_id or not access_token:
-                return {"error": "DHAN_CLIENT_ID_ACCESS_TOKEN_REQUIRED"}
-            if not _is_test_mode():
-                try:
-                    response = await asyncio.to_thread(
-                        dhanhq(DhanContext(client_id, access_token)).get_fund_limits
+            if auth_mode == "API_KEY":
+                api_key = str(payload.get("api_key") or payload.get("app_id") or "").strip()
+                api_secret = str(payload.get("api_secret") or payload.get("app_secret") or "").strip()
+                if not client_id or not api_key or not api_secret:
+                    return {"error": "DHAN_CLIENT_ID_API_KEY_SECRET_REQUIRED"}
+                save_api_fn = getattr(store, "save_dhan_api_credentials", None)
+                if not callable(save_api_fn):
+                    return {"error": "DHAN_API_KEY_AUTH_NOT_SUPPORTED"}
+                await save_api_fn(user_id, client_id, api_key, api_secret)
+                access_token = str(payload.get("access_token") or "").strip()
+                token_expiry = str(payload.get("token_expiry") or payload.get("expiry_time") or "").strip()
+                if access_token:
+                    await store.save_dhan_credentials(
+                        user_id,
+                        client_id,
+                        access_token,
+                        token_expiry=token_expiry,
+                        auth_mode="API_KEY",
                     )
-                    if not _dhan_response_ok(response):
-                        return {"error": "DHAN_AUTHENTICATION_FAILED"}
-                except Exception as exc:
-                    log.warning("Dhan authentication failed | user=%s err=%s", user_id, exc)
-                    return {"error": "DHAN_AUTHENTICATION_FAILED", "detail": str(exc)}
-            await store.save_dhan_credentials(user_id, client_id, access_token)
+                else:
+                    await store.save_dhan_credentials(user_id, client_id, "", auth_mode="API_KEY")
+            else:
+                access_token = str(payload.get("access_token") or "").strip()
+                if not client_id or not access_token:
+                    return {"error": "DHAN_CLIENT_ID_ACCESS_TOKEN_REQUIRED"}
+                if not _is_test_mode():
+                    try:
+                        response = await asyncio.to_thread(
+                            dhanhq(DhanContext(client_id, access_token)).get_fund_limits
+                        )
+                        if not _dhan_response_ok(response):
+                            return {"error": "DHAN_AUTHENTICATION_FAILED"}
+                    except Exception as exc:
+                        log.warning("Dhan authentication failed | user=%s err=%s", user_id, exc)
+                        return {"error": "DHAN_AUTHENTICATION_FAILED", "detail": str(exc)}
+                await store.save_dhan_credentials(user_id, client_id, access_token, auth_mode="MANUAL")
 
         await store.save_broker(user_id, broker)
         _SESSION_CACHE.pop(user_id, None)
@@ -1360,7 +1608,9 @@ async def save_broker_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         await eng.configure_broker()
 
         warning = ""
-        if broker == "DHAN" and not _is_test_mode():
+        saved_dhan_creds = await store.load_dhan_credentials(user_id) if broker == "DHAN" else {}
+        has_dhan_access_token = bool(str(saved_dhan_creds.get("access_token") or "").strip())
+        if broker == "DHAN" and has_dhan_access_token and not _is_test_mode():
             try:
                 await _stop_kite_ticker()
                 await build_symbol_token_map_from_dhan(user_id)
@@ -1383,6 +1633,176 @@ async def save_broker_config(payload: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as exc:
         log.exception("Broker config save failed")
         return {"error": "BROKER_CONFIG_SAVE_FAILED", "detail": str(exc)}
+
+
+@app.post("/api/dhan/generate-consent")
+async def dhan_generate_consent_api(payload: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        user_id = int(payload.get("user_id", 1))
+        client_id = str(payload.get("client_id") or "").strip()
+        api_key = str(payload.get("api_key") or payload.get("app_id") or "").strip()
+        api_secret = str(payload.get("api_secret") or payload.get("app_secret") or "").strip()
+        if not client_id or not api_key or not api_secret:
+            creds = await store.load_dhan_api_credentials(user_id)
+            client_id = client_id or str(creds.get("client_id") or "").strip()
+            api_key = api_key or str(creds.get("api_key") or "").strip()
+            api_secret = api_secret or str(creds.get("api_secret") or "").strip()
+        if not client_id or not api_key or not api_secret:
+            return {"error": "DHAN_CLIENT_ID_API_KEY_SECRET_REQUIRED"}
+
+        await store.save_dhan_api_credentials(user_id, client_id, api_key, api_secret)
+        await store.save_broker(user_id, "DHAN")
+
+        if _is_test_mode():
+            consent = {
+                "consentAppId": "test-consent-app-id",
+                "consentAppStatus": "GENERATED",
+                "login_url": _dhan_auth_login_url("test-consent-app-id"),
+            }
+        else:
+            consent = await _dhan_generate_consent(client_id, api_key, api_secret)
+        save_state_fn = getattr(store, "save_dhan_auth_state", None)
+        if callable(save_state_fn):
+            await save_state_fn(
+                user_id,
+                {
+                    "client_id": client_id,
+                    "consentAppId": consent["consentAppId"],
+                    "created_at": now_ist().isoformat(),
+                    "auth_mode": "API_KEY",
+                },
+            )
+        return {
+            "ok": True,
+            "broker": "DHAN",
+            "auth_mode": "API_KEY",
+            "consentAppId": consent["consentAppId"],
+            "consentAppStatus": consent.get("consentAppStatus", ""),
+            "login_url": consent["login_url"],
+        }
+    except Exception as exc:
+        log.exception("Dhan consent generation failed")
+        return {"error": "DHAN_CONSENT_GENERATION_FAILED", "detail": str(exc)}
+
+
+@app.get("/connect/dhan")
+async def connect_dhan(user_id: int = 1):
+    user_id = int(user_id)
+    creds = await store.load_dhan_api_credentials(user_id)
+    client_id = str(creds.get("client_id") or "").strip()
+    api_key = str(creds.get("api_key") or "").strip()
+    api_secret = str(creds.get("api_secret") or "").strip()
+    if not client_id or not api_key or not api_secret:
+        return RedirectResponse(url=f"/dashboard?user_id={user_id}&error=dhan_api_creds_missing")
+
+    try:
+        if _is_test_mode():
+            consent = {
+                "consentAppId": "test-consent-app-id",
+                "login_url": _dhan_auth_login_url("test-consent-app-id"),
+            }
+        else:
+            consent = await _dhan_generate_consent(client_id, api_key, api_secret)
+        save_state_fn = getattr(store, "save_dhan_auth_state", None)
+        if callable(save_state_fn):
+            await save_state_fn(
+                user_id,
+                {
+                    "client_id": client_id,
+                    "consentAppId": consent["consentAppId"],
+                    "created_at": now_ist().isoformat(),
+                    "auth_mode": "API_KEY",
+                },
+            )
+        return RedirectResponse(url=consent["login_url"])
+    except Exception as exc:
+        log.warning("Dhan connect failed | user=%s err=%s", user_id, exc)
+        return RedirectResponse(url=f"/dashboard?user_id={user_id}&error=dhan_consent_failed")
+
+
+@app.get("/dhan/callback/{user_id}", response_class=HTMLResponse)
+@app.get("/dhan/callback", response_class=HTMLResponse)
+async def dhan_callback(request: Request, user_id: int = 1):
+    user_id = int(user_id or 1)
+    token_id = str(request.query_params.get("tokenId") or request.query_params.get("token_id") or "").strip()
+    if not token_id:
+        return HTMLResponse(
+            "<h2>Dhan authentication failed</h2><p>tokenId was missing in callback.</p>",
+            status_code=400,
+        )
+    creds = await store.load_dhan_api_credentials(user_id)
+    api_key = str(creds.get("api_key") or "").strip()
+    api_secret = str(creds.get("api_secret") or "").strip()
+    if not api_key or not api_secret:
+        return HTMLResponse(
+            "<h2>Dhan authentication failed</h2><p>Saved API key/secret not found. Save API credentials again.</p>",
+            status_code=400,
+        )
+    try:
+        token = await _dhan_consume_app_consent(token_id, api_key, api_secret)
+        result = await _activate_dhan_token(
+            user_id,
+            token["client_id"],
+            token["access_token"],
+            token_expiry=token.get("expiry_time", ""),
+            auth_mode="API_KEY",
+        )
+        warning = f"<p>Warning: {result.get('warning')}</p>" if result.get("warning") else ""
+        expiry = token.get("expiry_time") or "not provided"
+        return HTMLResponse(
+            f"""
+            <!doctype html>
+            <html><head><meta charset="utf-8"><meta http-equiv="refresh" content="2;url=/dashboard?user_id={user_id}"></head>
+            <body style="font-family:Arial,sans-serif;background:#0f172a;color:#e2e8f0;padding:32px">
+              <h2>Dhan authentication successful</h2>
+              <p>Access token generated and saved for client <strong>{token['client_id']}</strong>.</p>
+              <p>Expiry: <strong>{expiry}</strong></p>
+              {warning}
+              <p>Redirecting to dashboard...</p>
+            </body></html>
+            """,
+            status_code=200,
+        )
+    except Exception as exc:
+        log.exception("Dhan callback token consume failed | user=%s", user_id)
+        return HTMLResponse(
+            f"<h2>Dhan authentication failed</h2><p>{str(exc)}</p>",
+            status_code=400,
+        )
+
+
+@app.post("/api/dhan/consume-token")
+async def dhan_consume_token_api(payload: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        user_id = int(payload.get("user_id", 1))
+        token_id = str(payload.get("tokenId") or payload.get("token_id") or "").strip()
+        if not token_id:
+            return {"error": "DHAN_TOKEN_ID_REQUIRED"}
+        creds = await store.load_dhan_api_credentials(user_id)
+        api_key = str(creds.get("api_key") or "").strip()
+        api_secret = str(creds.get("api_secret") or "").strip()
+        if not api_key or not api_secret:
+            return {"error": "DHAN_API_CREDENTIALS_MISSING"}
+        if _is_test_mode():
+            token = {
+                "client_id": str(creds.get("client_id") or "test-client"),
+                "access_token": "test-generated-access-token",
+                "expiry_time": "2099-01-01T00:00:00",
+            }
+        else:
+            token = await _dhan_consume_app_consent(token_id, api_key, api_secret)
+        result = await _activate_dhan_token(
+            user_id,
+            token["client_id"],
+            token["access_token"],
+            token_expiry=token.get("expiry_time", ""),
+            auth_mode="API_KEY",
+        )
+        result["expiry_time"] = token.get("expiry_time", "")
+        return result
+    except Exception as exc:
+        log.exception("Dhan token consume API failed")
+        return {"error": "DHAN_TOKEN_CONSUME_FAILED", "detail": str(exc)}
 
 
 @app.get("/connect/zerodha")

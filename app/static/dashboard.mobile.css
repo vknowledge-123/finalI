@@ -182,19 +182,189 @@
     font-size: 11px !important;
   }
 
-  /* Make more table columns visible by slightly tightening cell padding/type */
-  body .table-container th,
-  body .table-container td {
-    padding: 0.14rem 0.28rem !important;
-    font-size: 9px !important;
-    line-height: 1.15 !important;
-    white-space: nowrap;
+  /* Main trade table becomes scan-friendly cards instead of a 14-column strip */
+  body .table-container {
+    border: 0 !important;
+    background: transparent !important;
+    backdrop-filter: none !important;
+    overflow: visible !important;
   }
 
-  /* Sticky table header should sit below the sticky navbar */
-  table thead {
+  body .table-container .overflow-x-auto {
+    overflow-x: visible !important;
+  }
+
+  body .table-container table,
+  body .table-container thead,
+  body .table-container tbody,
+  body .table-container tr,
+  body .table-container td {
+    display: block;
+    width: 100% !important;
+  }
+
+  body .table-container thead {
+    display: none;
+  }
+
+  body .table-container tbody {
+    display: contents;
+  }
+
+  body .table-container tr {
+    margin: 0 0 10px !important;
+    padding: 10px !important;
+    border: 1px solid rgba(255, 255, 255, 0.1) !important;
+    border-radius: 12px !important;
+    background: rgba(15, 23, 42, 0.76) !important;
+    box-shadow: 0 10px 26px rgba(0, 0, 0, 0.22);
+  }
+
+  body .table-container td {
+    display: grid;
+    grid-template-columns: minmax(74px, 0.45fr) minmax(0, 1fr);
+    align-items: center;
+    gap: 10px;
+    min-height: 28px;
+    padding: 0.34rem 0 !important;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06) !important;
+    font-size: 12px !important;
+    line-height: 1.25 !important;
+    white-space: normal !important;
+    text-align: right !important;
+  }
+
+  body .table-container td:last-child {
+    border-bottom: 0 !important;
+  }
+
+  body .table-container td::before {
+    content: attr(data-label);
+    color: #94a3b8;
+    font-size: 9px;
+    font-weight: 800;
+    letter-spacing: 0;
+    text-transform: uppercase;
+    text-align: left;
+  }
+
+  body .table-container td[data-label="Symbol"],
+  body .table-container td[data-label="Alert"] {
+    align-items: start;
+  }
+
+  body .table-container td[data-field="ltp"] {
+    font-size: 18px !important;
+    line-height: 1.05 !important;
+  }
+
+  body .table-container td[data-label="Status"] > div {
+    align-items: flex-end !important;
+  }
+
+  body .table-container td[data-label="Action"] button {
+    justify-self: end;
+    min-height: 32px;
+  }
+
+  body .table-container td[colspan] {
+    display: block;
+    text-align: center !important;
+  }
+
+  body .table-container td[colspan]::before {
+    content: "";
+    display: none;
+  }
+
+  /* Strategy configuration modal: one comfortable column on phones */
+  #cfgModal {
+    overflow: hidden !important;
+  }
+
+  #cfgModal > .relative {
+    min-height: 100dvh !important;
+    align-items: stretch !important;
+    padding: 8px !important;
+  }
+
+  #cfgModal .cfg-card {
+    display: flex;
+    flex-direction: column;
+    max-height: calc(100dvh - 16px) !important;
+    margin: 0 !important;
+    padding: 12px !important;
+    border-radius: 14px !important;
+    overflow: auto !important;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  #cfgModal .cfg-header {
     position: sticky;
-    top: 62px;
-    z-index: 20;
+    top: 0;
+    z-index: 30;
+    margin: -12px -12px 10px !important;
+    padding: 12px 44px 10px 12px;
+    background: rgba(15, 23, 42, 0.98);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  }
+
+  #cfgModal .cfg-card > button[onclick="closeCfg()"] {
+    position: absolute !important;
+    top: 10px !important;
+    right: 10px !important;
+    z-index: 45;
+    width: 34px;
+    height: 34px;
+    border-radius: 10px;
+    background: rgba(255, 255, 255, 0.08);
+  }
+
+  #cfgModal .grid,
+  #credModal .grid {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+
+  #cfgModal .col-span-2,
+  #cfgModal .md\:col-span-1,
+  #credModal .col-span-2,
+  #credModal .md\:col-span-1 {
+    grid-column: 1 / -1 !important;
+  }
+
+  #cfgModal .flex.items-center.justify-between {
+    align-items: flex-start !important;
+    gap: 8px !important;
+  }
+
+  #cfgModal .flex.items-center.justify-between > span {
+    display: none !important;
+  }
+
+  #cfgModal p.text-\[10px\],
+  #cfgModal p.text-\[9px\] {
+    line-height: 1.25 !important;
+  }
+
+  #cfgModal .input-field,
+  #credModal input,
+  #credModal select {
+    min-height: 42px;
+    font-size: 14px !important;
+  }
+
+  #cfgModal .cfg-actions {
+    position: sticky;
+    bottom: 0;
+    z-index: 35;
+    margin: 12px -12px -12px !important;
+    padding: 10px 12px 12px !important;
+    background: rgba(15, 23, 42, 0.98);
+    border-top: 1px solid rgba(255, 255, 255, 0.1);
+    flex-direction: column;
+  }
+
+  #cfgModal .cfg-actions .btn {
+    width: 100%;
   }
 }

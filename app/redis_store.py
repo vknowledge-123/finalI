@@ -108,6 +108,14 @@ def k_dhan_creds(user_id: int) -> str:
     return f"dhan:creds:{int(user_id)}"
 
 
+def k_dhan_api_creds(user_id: int) -> str:
+    return f"dhan:api_creds:{int(user_id)}"
+
+
+def k_dhan_auth_state(user_id: int) -> str:
+    return f"dhan:auth_state:{int(user_id)}"
+
+
 def k_creds_pattern() -> str:
     return "kite:creds:*"
 
@@ -126,6 +134,10 @@ def k_alert_cfg_legacy(user_id: int) -> str:
 
 def k_positions(user_id: int) -> str:
     return f"positions:{int(user_id)}"
+
+
+def k_cnc_carry_positions(user_id: int) -> str:
+    return f"positions:cnc_carry:{int(user_id)}"
 
 
 def k_trade_open(user_id: int, symbol: str) -> str:
@@ -432,7 +444,12 @@ class RedisStore:
         return selected if selected in {"ZERODHA", "DHAN"} else "ZERODHA"
 
     async def save_dhan_credentials(
-        self, user_id: int, client_id: str, access_token: str
+        self,
+        user_id: int,
+        client_id: str,
+        access_token: str,
+        token_expiry: str = "",
+        auth_mode: str = "MANUAL",
     ) -> None:
         client_id = str(client_id or "").strip()
         access_token = str(access_token or "").strip()
@@ -442,13 +459,20 @@ class RedisStore:
             )
         await self.redis.set(
             k_dhan_creds(user_id),
-            json.dumps({"client_id": client_id, "access_token": access_token}),
+            json.dumps(
+                {
+                    "client_id": client_id,
+                    "access_token": access_token,
+                    "token_expiry": str(token_expiry or "").strip(),
+                    "auth_mode": str(auth_mode or "MANUAL").strip().upper(),
+                }
+            ),
         )
 
     async def load_dhan_credentials(self, user_id: int) -> Dict[str, str]:
         raw = await self.redis.get(k_dhan_creds(user_id))
         if not raw:
-            return {"client_id": "", "access_token": ""}
+            return {"client_id": "", "access_token": "", "token_expiry": "", "auth_mode": ""}
         try:
             data = json.loads(raw)
             client_id = str(data.get("client_id") or "")
@@ -457,15 +481,69 @@ class RedisStore:
                 client_id, access_token = self.encryption.decrypt_credentials(
                     client_id, access_token
                 )
-            return {"client_id": client_id, "access_token": access_token}
+            return {
+                "client_id": client_id,
+                "access_token": access_token,
+                "token_expiry": str(data.get("token_expiry") or ""),
+                "auth_mode": str(data.get("auth_mode") or ""),
+            }
         except Exception:
-            return {"client_id": "", "access_token": ""}
+            return {"client_id": "", "access_token": "", "token_expiry": "", "auth_mode": ""}
+
+    async def save_dhan_api_credentials(
+        self, user_id: int, client_id: str, api_key: str, api_secret: str
+    ) -> None:
+        client_id = str(client_id or "").strip()
+        api_key = str(api_key or "").strip()
+        api_secret = str(api_secret or "").strip()
+        if self.encryption and self.encryption.is_enabled():
+            client_id = self.encryption.encrypt(client_id)
+            api_key = self.encryption.encrypt(api_key)
+            api_secret = self.encryption.encrypt(api_secret)
+        await self.redis.set(
+            k_dhan_api_creds(user_id),
+            json.dumps({"client_id": client_id, "api_key": api_key, "api_secret": api_secret}),
+        )
+
+    async def load_dhan_api_credentials(self, user_id: int) -> Dict[str, str]:
+        raw = await self.redis.get(k_dhan_api_creds(user_id))
+        if not raw:
+            return {"client_id": "", "api_key": "", "api_secret": ""}
+        try:
+            data = json.loads(raw)
+            client_id = str(data.get("client_id") or "")
+            api_key = str(data.get("api_key") or "")
+            api_secret = str(data.get("api_secret") or "")
+            if self.encryption and self.encryption.is_enabled():
+                if client_id:
+                    client_id = self.encryption.decrypt(client_id)
+                if api_key:
+                    api_key = self.encryption.decrypt(api_key)
+                if api_secret:
+                    api_secret = self.encryption.decrypt(api_secret)
+            return {"client_id": client_id, "api_key": api_key, "api_secret": api_secret}
+        except Exception:
+            return {"client_id": "", "api_key": "", "api_secret": ""}
+
+    async def save_dhan_auth_state(self, user_id: int, state: Dict[str, Any]) -> None:
+        payload = dict(state or {})
+        payload["user_id"] = int(user_id)
+        await self.redis.setex(k_dhan_auth_state(user_id), 15 * 60, json.dumps(payload))
+
+    async def load_dhan_auth_state(self, user_id: int) -> Dict[str, Any]:
+        try:
+            raw = await self.redis.get(k_dhan_auth_state(user_id))
+            return json.loads(raw) if raw else {}
+        except Exception:
+            return {}
 
     async def list_all_user_ids(self) -> List[int]:
         """Discover all user IDs who have credentials saved."""
         keys = list(await self.redis.keys(k_creds_pattern()))
         keys.extend(await self.redis.keys("dhan:creds:*"))
+        keys.extend(await self.redis.keys("dhan:api_creds:*"))
         keys.extend(await self.redis.keys("broker:selected:*"))
+        keys.extend(await self.redis.keys("positions:cnc_carry:*"))
         ids = []
         for k in keys:
             try:
@@ -567,6 +645,34 @@ class RedisStore:
                 out.append(json.loads(raw))
             except Exception:
                 continue
+        return out
+
+    async def save_cnc_carry_position(self, user_id: int, symbol: str, pos: Dict[str, Any]) -> None:
+        sym = norm_symbol(symbol)
+        if not sym:
+            return
+        payload = dict(pos or {})
+        payload["symbol"] = sym
+        payload["product"] = "CNC"
+        payload["carry_saved_at"] = now_ist().isoformat()
+        await self.redis.hset(k_cnc_carry_positions(user_id), sym, json.dumps(payload))
+
+    async def delete_cnc_carry_position(self, user_id: int, symbol: str) -> None:
+        sym = norm_symbol(symbol)
+        if not sym:
+            return
+        await self.redis.hdel(k_cnc_carry_positions(user_id), sym)
+
+    async def list_cnc_carry_positions(self, user_id: int) -> List[Dict[str, Any]]:
+        rows = await self.redis.hgetall(k_cnc_carry_positions(user_id))
+        out: List[Dict[str, Any]] = []
+        for _sym, raw in (rows or {}).items():
+            try:
+                row = json.loads(raw)
+            except Exception:
+                continue
+            if isinstance(row, dict):
+                out.append(row)
         return out
 
     # =========================

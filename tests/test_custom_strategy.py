@@ -817,6 +817,170 @@ class TradeEngineIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(position.status, "EXITING")
         self.assertEqual(position.exit_reason, "TARGET")
 
+    async def test_cnc_target_hit_triggers_exit_from_live_tick(self) -> None:
+        store = InMemoryStore()
+        engine = TradeEngine(1, store)
+        position = Position(
+            trade_id="cnc-target",
+            user_id=1,
+            symbol="SBIN",
+            alert_name="classic",
+            side="BUY",
+            product="CNC",
+            qty=2,
+            initial_qty=2,
+            entry_price=100.0,
+            target_price=110.0,
+            sl_price=95.0,
+            tsl_pct=1.0,
+            highest=100.0,
+            trail_price=99.0,
+        )
+        engine.positions["SBIN"] = position
+        await store.save_cnc_carry_position(1, "SBIN", position.to_public())
+        engine._exit_position = AsyncMock()
+
+        await engine.on_tick("SBIN", 110.5, 100.0, 110.5, 100.0)
+        await asyncio.sleep(0)
+
+        engine._exit_position.assert_awaited_once_with("SBIN", "TARGET")
+        self.assertEqual(position.status, "EXITING")
+        self.assertEqual(position.exit_reason, "TARGET")
+
+    async def test_cnc_exit_fill_removes_carry_and_keeps_closed_snapshot(self) -> None:
+        store = InMemoryStore()
+        engine = TradeEngine(1, store)
+        position = Position(
+            trade_id="cnc-target-fill",
+            user_id=1,
+            symbol="SBIN",
+            alert_name="classic",
+            side="BUY",
+            product="CNC",
+            qty=2,
+            initial_qty=2,
+            entry_price=100.0,
+            target_price=110.0,
+            sl_price=95.0,
+            status="OPEN",
+        )
+        engine.positions["SBIN"] = position
+        await store.save_cnc_carry_position(1, "SBIN", position.to_public())
+        await store.mark_open(1, "SBIN", position.trade_id, ttl_sec=60 * 60 * 24 * 14)
+        engine._place_order_with_execution = AsyncMock(
+            return_value=OrderExecution(
+                order_id="exit-1",
+                symbol="SBIN",
+                side="SELL",
+                qty=2,
+                status="COMPLETE",
+                avg_price=111.0,
+                filled_qty=2,
+                remaining_qty=0,
+                ltp=111.0,
+            )
+        )
+
+        await engine._exit_position("SBIN", "TARGET")
+
+        self.assertNotIn("SBIN", engine.positions)
+        self.assertEqual(await store.get_open(1, "SBIN"), "")
+        self.assertEqual(await store.list_cnc_carry_positions(1), [])
+        rows = await store.list_positions(1)
+        self.assertEqual(rows[0]["symbol"], "SBIN")
+        self.assertEqual(rows[0]["status"], "CLOSED")
+        self.assertEqual(rows[0]["qty"], 0)
+
+    async def test_cnc_exit_order_update_closes_carry_and_live_monitor(self) -> None:
+        store = InMemoryStore()
+        engine = TradeEngine(1, store)
+        position = Position(
+            trade_id="cnc-order-update",
+            user_id=1,
+            symbol="SBIN",
+            alert_name="classic",
+            side="BUY",
+            product="CNC",
+            qty=2,
+            initial_qty=2,
+            entry_price=100.0,
+            exit_order_id="exit-1",
+            status="EXITING",
+        )
+        engine.positions["SBIN"] = position
+        await store.save_cnc_carry_position(1, "SBIN", position.to_public())
+        await store.mark_open(1, "SBIN", position.trade_id, ttl_sec=60 * 60 * 24 * 14)
+
+        await engine.on_order_update(
+            {
+                "orderId": "exit-1",
+                "orderStatus": "COMPLETE",
+                "tradingSymbol": "SBIN-EQ",
+                "quantity": 2,
+                "remainingQuantity": 0,
+                "averageTradedPrice": 111.0,
+            }
+        )
+
+        self.assertNotIn("SBIN", engine.positions)
+        self.assertEqual(await store.get_open(1, "SBIN"), "")
+        self.assertEqual(await store.list_cnc_carry_positions(1), [])
+        rows = await store.list_positions(1)
+        self.assertEqual(rows[0]["status"], "CLOSED")
+        self.assertEqual(rows[0]["qty"], 0)
+
+    async def test_cnc_carry_rehydrates_from_dhan_holdings_next_day(self) -> None:
+        store = InMemoryStore()
+        await store.save_broker(1, "DHAN")
+        carry = Position(
+            trade_id="cnc-carry",
+            user_id=1,
+            symbol="SBIN",
+            alert_name="classic",
+            side="BUY",
+            product="CNC",
+            qty=5,
+            initial_qty=5,
+            entry_price=100.0,
+            target_price=110.0,
+            sl_price=95.0,
+            tsl_pct=1.0,
+            highest=105.0,
+            trail_price=103.95,
+            status="OPEN",
+        )
+        await store.save_cnc_carry_position(1, "SBIN", carry.to_public())
+
+        class FakeDhan:
+            def get_holdings(self):
+                return {
+                    "data": [
+                        {
+                            "tradingSymbol": "SBIN-EQ",
+                            "securityId": "3045",
+                            "availableQty": 3,
+                            "avgCostPrice": 101.0,
+                        }
+                    ]
+                }
+
+        engine = TradeEngine(1, store)
+        engine.broker = "DHAN"
+        engine.dhan_client_id = "client"
+        engine.dhan_access_token = "token"
+        engine.dhan = FakeDhan()
+
+        restored = await engine.rehydrate_cnc_carry_positions()
+
+        self.assertEqual(restored, ["SBIN"])
+        self.assertEqual(engine.positions["SBIN"].product, "CNC")
+        self.assertEqual(engine.positions["SBIN"].qty, 3)
+        self.assertEqual(engine.positions["SBIN"].entry_price, 101.0)
+        self.assertEqual(engine.positions["SBIN"].target_price, 110.0)
+        self.assertEqual(engine.positions["SBIN"].sl_price, 95.0)
+        self.assertEqual(engine.positions["SBIN"].trail_price, 103.95)
+        self.assertEqual(await store.get_open(1, "SBIN"), "cnc-carry")
+
     async def test_live_tick_hydrates_redis_position_and_exits_same_tick(self) -> None:
         store = InMemoryStore()
         position = Position(
@@ -881,6 +1045,71 @@ class TradeEngineIntegrationTests(unittest.IsolatedAsyncioTestCase):
         engine._exit_position.assert_awaited_once_with("ABREL", "TRAILING_SL")
         self.assertEqual(engine.positions["ABREL"].status, "EXITING")
         self.assertEqual(engine.positions["ABREL"].exit_reason, "TRAILING_SL")
+
+    async def test_auto_squareoff_exits_only_mis_when_filtered(self) -> None:
+        store = InMemoryStore()
+        engine = TradeEngine(1, store)
+        engine.positions["MISSTOCK"] = Position(
+            trade_id="mis-1",
+            user_id=1,
+            symbol="MISSTOCK",
+            alert_name="classic",
+            side="BUY",
+            product="MIS",
+            qty=1,
+            entry_price=100.0,
+            status="OPEN",
+        )
+        engine.positions["CNCSTOCK"] = Position(
+            trade_id="cnc-1",
+            user_id=1,
+            symbol="CNCSTOCK",
+            alert_name="classic",
+            side="BUY",
+            product="CNC",
+            qty=1,
+            entry_price=100.0,
+            status="OPEN",
+        )
+        engine._exit_position = AsyncMock()
+
+        count = await engine.exit_all_open_positions(reason="AUTO_SQ_OFF_320", products={"MIS"})
+        await asyncio.sleep(0)
+
+        self.assertEqual(count, 1)
+        engine._exit_position.assert_awaited_once_with("MISSTOCK", "AUTO_SQ_OFF_320")
+
+    async def test_squareoff_all_positions_filters_cnc_for_mis_risk(self) -> None:
+        store = InMemoryStore()
+        engine = TradeEngine(1, store)
+        engine.positions["MISSTOCK"] = Position(
+            trade_id="mis-1",
+            user_id=1,
+            symbol="MISSTOCK",
+            alert_name="classic",
+            side="BUY",
+            product="MIS",
+            qty=1,
+            entry_price=100.0,
+            status="OPEN",
+        )
+        engine.positions["CNCSTOCK"] = Position(
+            trade_id="cnc-1",
+            user_id=1,
+            symbol="CNCSTOCK",
+            alert_name="classic",
+            side="BUY",
+            product="CNC",
+            qty=1,
+            entry_price=100.0,
+            status="OPEN",
+        )
+        engine.manual_squareoff_zerodha = AsyncMock(return_value={"status": "OK", "symbol": "MISSTOCK"})
+
+        result = await engine.squareoff_all_positions(reason="PNL_EXIT", products={"MIS"})
+
+        self.assertEqual(result["count"], 1)
+        engine.manual_squareoff_zerodha.assert_awaited_once_with("MISSTOCK", reason="PNL_EXIT")
 
     async def test_classic_buy_tsl_ratches_up_and_never_reduces(self) -> None:
         store = InMemoryStore()

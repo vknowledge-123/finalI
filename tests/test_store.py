@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import AsyncMock
 
+from app.memory_store import InMemoryStore
 from app.redis_store import RedisStore, k_alert_cfg, k_alert_cfg_legacy
 
 
@@ -57,9 +58,30 @@ class RedisStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("positions:1", fake.deleted)
         self.assertIn("alerts:1", fake.deleted)
         self.assertIn("kill:1", fake.deleted)
+        self.assertNotIn("positions:cnc_carry:1", fake.deleted)
         self.assertIn("trade:open:1:SBIN", fake.deleted)
         self.assertIn("trade:count:1:20260614:test", fake.deleted)
         self.assertIn("lock:1:*", fake.scan_patterns)
+
+    async def test_memory_daily_cleanup_clears_dashboard_state_preserves_configs(self) -> None:
+        store = InMemoryStore()
+        await store.save_alert(1, {"alert_name": "a", "symbols": ["SBIN"], "result": []})
+        await store.upsert_position(1, "SBIN", {"symbol": "SBIN", "status": "OPEN", "qty": 1})
+        await store.mark_open(1, "SBIN", "trade-1")
+        await store.save_cnc_carry_position(1, "SBIN", {"symbol": "SBIN", "product": "CNC", "qty": 1})
+        await store.set_kill(1, True)
+        await store.set_auto_sq_off_enabled(1, True)
+        await store.mark_auto_sq_off_run(1)
+
+        await store.clear_daily_trading_state(1)
+
+        self.assertEqual(await store.get_recent_alerts(1), [])
+        self.assertEqual(await store.list_positions(1), [])
+        self.assertEqual(await store.get_open(1, "SBIN"), "")
+        self.assertEqual((await store.list_cnc_carry_positions(1))[0]["symbol"], "SBIN")
+        self.assertFalse(await store.is_kill(1))
+        self.assertTrue(await store.is_auto_sq_off_enabled(1))
+        self.assertFalse(await store.has_auto_sq_off_run(1))
 
 
 if __name__ == "__main__":

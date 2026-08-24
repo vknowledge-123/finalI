@@ -7,6 +7,7 @@ from app.dhan_broker import (
     DhanInstrumentRegistry,
     MarketFeed,
     normalize_dhan_candles,
+    normalize_dhan_holdings,
     normalize_dhan_positions,
     order_id_from_response,
     resample_intraday_candles,
@@ -42,6 +43,24 @@ class DhanBrokerTests(unittest.TestCase):
         self.assertEqual(result["net"][0]["quantity"], 10)
         self.assertEqual(result["net"][0]["product"], "MIS")
         self.assertEqual(result["net"][0]["pnl"], 50)
+
+    def test_holdings_are_converted_to_cnc_shape(self) -> None:
+        result = normalize_dhan_holdings(
+            {
+                "data": [
+                    {
+                        "tradingSymbol": "SBIN-EQ",
+                        "securityId": "3045",
+                        "availableQty": 3,
+                        "avgCostPrice": 812.5,
+                    }
+                ]
+            }
+        )
+        self.assertEqual(result[0]["tradingsymbol"], "SBIN")
+        self.assertEqual(result[0]["quantity"], 3)
+        self.assertEqual(result[0]["product"], "CNC")
+        self.assertEqual(result[0]["average_price"], 812.5)
 
     def test_open_candle_is_excluded(self) -> None:
         result = normalize_dhan_candles(

@@ -69,6 +69,10 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn("/api/backtest", r.text)
         self.assertIn('id="broker_select"', r.text)
         self.assertIn('id="dhan_access_token"', r.text)
+        self.assertIn('id="dhan_auth_mode"', r.text)
+        self.assertIn('id="dhan_api_key"', r.text)
+        self.assertIn('id="dhan_api_secret"', r.text)
+        self.assertIn('id="dhan_redirect_url"', r.text)
 
     def test_broker_config_supports_dhan_and_zerodha(self) -> None:
         missing = self.client.post(
@@ -90,6 +94,56 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(saved.json()["broker"], "DHAN")
         self.assertEqual(self.client.get("/api/broker-config").json()["broker"], "DHAN")
         self.assertEqual(self.client.get("/api/broker-status").json()["broker"], "DHAN")
+
+        restored = self.client.post(
+            "/api/broker-config",
+            json={"user_id": 1, "broker": "ZERODHA"},
+        )
+        self.assertEqual(restored.json()["broker"], "ZERODHA")
+
+    def test_dhan_api_key_auth_generates_and_consumes_access_token(self) -> None:
+        saved = self.client.post(
+            "/api/broker-config",
+            json={
+                "user_id": 1,
+                "broker": "DHAN",
+                "auth_mode": "API_KEY",
+                "client_id": "test-client",
+                "api_key": "test-api-key",
+                "api_secret": "test-api-secret",
+            },
+        )
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(saved.json()["broker"], "DHAN")
+
+        cfg = self.client.get("/api/broker-config", params={"user_id": 1}).json()
+        self.assertEqual(cfg["broker"], "DHAN")
+        self.assertEqual(cfg["dhan"]["auth_mode"], "API_KEY")
+        self.assertEqual(cfg["dhan"]["client_id"], "test-client")
+        self.assertEqual(cfg["dhan"]["has_api_credentials"], True)
+
+        consent = self.client.post(
+            "/api/dhan/generate-consent",
+            json={"user_id": 1},
+        )
+        self.assertEqual(consent.status_code, 200)
+        self.assertEqual(consent.json()["ok"], True)
+        self.assertIn("consentAppId=test-consent-app-id", consent.json()["login_url"])
+
+        consumed = self.client.post(
+            "/api/dhan/consume-token",
+            json={"user_id": 1, "tokenId": "test-token-id"},
+        )
+        body = consumed.json()
+        self.assertEqual(consumed.status_code, 200)
+        self.assertEqual(body["ok"], True)
+        self.assertEqual(body["broker"], "DHAN")
+        self.assertEqual(body["auth_mode"], "API_KEY")
+        self.assertEqual(body["access_token_generated"], True)
+
+        dhan_creds = main_module.store._dhan_credentials[1]
+        self.assertEqual(dhan_creds["access_token"], "test-generated-access-token")
+        self.assertEqual(dhan_creds["auth_mode"], "API_KEY")
 
         restored = self.client.post(
             "/api/broker-config",

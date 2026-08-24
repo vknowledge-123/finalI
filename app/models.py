@@ -1,9 +1,13 @@
 # app/models.py
 from typing import Optional, Dict, Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pydantic import BaseModel, EmailStr, validator
 import secrets
 import hashlib
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 class User(BaseModel):
@@ -14,7 +18,7 @@ class User(BaseModel):
     
     def __init__(self, **data):
         if 'created_at' not in data:
-            data['created_at'] = datetime.utcnow()
+            data['created_at'] = utc_now()
         super().__init__(**data)
     
     def to_dict(self) -> Dict[str, Any]:
@@ -49,13 +53,13 @@ class OTP(BaseModel):
         return OTP(
             code=OTP.generate_code(),
             email=email,
-            expires_at=datetime.utcnow() + timedelta(minutes=validity_minutes),
+            expires_at=utc_now() + timedelta(minutes=validity_minutes),
             attempts=0
         )
     
     def is_valid(self) -> bool:
         """Check if OTP is still valid"""
-        return datetime.utcnow() < self.expires_at and self.attempts < 3
+        return utc_now() < self.expires_at and self.attempts < 3
     
     def verify(self, input_code: str) -> bool:
         """Verify the OTP code"""
@@ -98,12 +102,12 @@ class Session(BaseModel):
             user_id=user_id,
             email=email,
             token=Session.generate_token(),
-            expires_at=datetime.utcnow() + timedelta(hours=validity_hours)
+            expires_at=utc_now() + timedelta(hours=validity_hours)
         )
     
     def is_valid(self) -> bool:
         """Check if session is still valid"""
-        return datetime.utcnow() < self.expires_at
+        return utc_now() < self.expires_at
     
     def to_dict(self) -> Dict[str, Any]:
         return {

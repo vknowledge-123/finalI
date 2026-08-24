@@ -292,6 +292,67 @@ def normalize_dhan_positions(response: Any) -> Dict[str, Any]:
     return {"net": normalized, "day": []}
 
 
+def normalize_dhan_holdings(response: Any) -> List[Dict[str, Any]]:
+    data = response_data(response)
+    if isinstance(data, dict):
+        for key in ("holdings", "data", "result"):
+            value = data.get(key)
+            if isinstance(value, list):
+                data = value
+                break
+    if not isinstance(data, list):
+        data = []
+
+    normalized: List[Dict[str, Any]] = []
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        symbol = norm_symbol(
+            str(
+                row.get("tradingSymbol")
+                or row.get("tradingsymbol")
+                or row.get("symbol")
+                or row.get("nseSymbol")
+                or row.get("securityName")
+                or ""
+            )
+        )
+        try:
+            qty = int(
+                float(
+                    row.get("availableQty")
+                    or row.get("sellableQty")
+                    or row.get("totalQty")
+                    or row.get("holdingQty")
+                    or row.get("quantity")
+                    or row.get("qty")
+                    or 0
+                )
+            )
+        except Exception:
+            qty = 0
+        if not symbol or qty <= 0:
+            continue
+        normalized.append(
+            {
+                "tradingsymbol": symbol,
+                "quantity": qty,
+                "average_price": float(
+                    row.get("avgCostPrice")
+                    or row.get("averagePrice")
+                    or row.get("costPrice")
+                    or row.get("buyAvg")
+                    or row.get("avgPrice")
+                    or 0.0
+                ),
+                "product": "CNC",
+                "security_id": str(row.get("securityId") or row.get("security_id") or ""),
+                "_raw": row,
+            }
+        )
+    return normalized
+
+
 def normalize_dhan_candles(response: Any, interval_minutes: int) -> List[Dict[str, Any]]:
     data = response_data(response)
     if isinstance(data, list):

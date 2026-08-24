@@ -1392,16 +1392,45 @@
 
             <div id="dhan_fields" class="space-y-4 hidden">
               <div class="group">
+                <label class="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2 ml-1">Dhan Auth Mode</label>
+                <select id="dhan_auth_mode" onchange="toggleDhanAuthMode()"
+                  class="w-full bg-[#1e293b] border border-white/10 text-white text-sm rounded-xl px-4 py-2.5 focus:outline-none focus:border-cyan-500">
+                  <option value="MANUAL">Manual Access Token</option>
+                  <option value="API_KEY">API Key Login</option>
+                </select>
+              </div>
+              <div class="group">
                 <label class="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2 ml-1">Dhan Client ID</label>
                 <input id="dhan_client_id" type="password"
                   class="w-full bg-[#1e293b] border border-white/10 text-white text-sm rounded-xl px-4 py-2.5 focus:outline-none focus:border-cyan-500"
                   placeholder="Enter Dhan Client ID">
               </div>
-              <div class="group">
+              <div id="dhan_manual_fields" class="group">
                 <label class="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2 ml-1">Dhan Access Token</label>
                 <input id="dhan_access_token" type="password"
                   class="w-full bg-[#1e293b] border border-white/10 text-white text-sm rounded-xl px-4 py-2.5 focus:outline-none focus:border-cyan-500"
                   placeholder="Paste access token from Dhan">
+              </div>
+              <div id="dhan_api_fields" class="space-y-4 hidden">
+                <div class="group">
+                  <label class="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2 ml-1">Dhan API Key</label>
+                  <input id="dhan_api_key" type="password"
+                    class="w-full bg-[#1e293b] border border-white/10 text-white text-sm rounded-xl px-4 py-2.5 focus:outline-none focus:border-cyan-500"
+                    placeholder="Enter API Key from Dhan">
+                </div>
+                <div class="group">
+                  <label class="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2 ml-1">Dhan API Secret</label>
+                  <input id="dhan_api_secret" type="password"
+                    class="w-full bg-[#1e293b] border border-white/10 text-white text-sm rounded-xl px-4 py-2.5 focus:outline-none focus:border-cyan-500"
+                    placeholder="Enter API Secret from Dhan">
+                </div>
+                <div class="group">
+                  <label class="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2 ml-1">Redirect URL for Dhan App</label>
+                  <input id="dhan_redirect_url" readonly
+                    class="w-full bg-[#0f172a] border border-cyan-500/20 text-cyan-200 text-xs rounded-xl px-4 py-2.5 focus:outline-none"
+                    value="">
+                </div>
+                <p id="dhan_token_status" class="text-[10px] text-slate-500 leading-relaxed"></p>
               </div>
             </div>
           </div>
@@ -1441,7 +1470,7 @@
         class="cfg-card rounded-2xl p-3 border border-white/10 shadow-2xl w-full max-w-3xl relative animate-enter my-3 bg-[#0f172a]">
         <button onclick="closeCfg()" class="absolute top-5 right-5 text-slate-400 hover:text-white">✕</button>
 
-        <div class="flex items-center justify-between mb-2">
+        <div class="cfg-header flex items-center justify-between mb-2">
           <div>
             <h3 class="text-base font-bold text-white">Strategy Configuration</h3>
             <p class="text-[9px] text-slate-400">Define parameters for your Chartink alerts.</p>
@@ -1577,7 +1606,7 @@
 
           <!-- Classic Risk Management -->
           <div id="classicRiskPanel" class="col-span-2 border-t border-white/5 pt-2 mt-1">
-            <h4 class="text-xs font-bold text-white mb-2">Risk Management (MIS Only)</h4>
+            <h4 class="text-xs font-bold text-white mb-2">Risk Management</h4>
             <div class="grid grid-cols-3 gap-2">
               <div>
                 <label class="block text-xs font-semibold text-emerald-400 uppercase mb-1.5">Target %</label>
@@ -1880,7 +1909,7 @@
           </div>
         </div>
 
-        <div class="flex gap-2 mt-6 pt-4 border-t border-white/10">
+        <div class="cfg-actions flex gap-2 mt-6 pt-4 border-t border-white/10">
           <button onclick="saveCfg()" class="btn btn-primary flex-1 py-2 text-sm">Save Configuration</button>
           <button onclick="loadCfgList()" class="btn btn-secondary py-2 text-sm">Reload</button>
         </div>
@@ -1975,6 +2004,26 @@
         const resp = await fetch(`/api/broker-config?user_id=${USER_ID}`);
         const d = await readJsonResponse(resp);
         document.getElementById("broker_select").value = d.broker || "ZERODHA";
+        if (d.dhan) {
+          const dhan = d.dhan || {};
+          const modeEl = document.getElementById("dhan_auth_mode");
+          const clientEl = document.getElementById("dhan_client_id");
+          const redirectEl = document.getElementById("dhan_redirect_url");
+          const tokenStatusEl = document.getElementById("dhan_token_status");
+          if (modeEl) modeEl.value = dhan.auth_mode || "MANUAL";
+          if (clientEl && dhan.client_id) clientEl.value = dhan.client_id;
+          if (redirectEl) {
+            const redirectUrl = dhan.redirect_url || `/dhan/callback/${USER_ID}`;
+            redirectEl.value = /^https?:\/\//i.test(redirectUrl)
+              ? redirectUrl
+              : `${location.protocol}//${location.host}${redirectUrl}`;
+          }
+          if (tokenStatusEl) {
+            tokenStatusEl.textContent = dhan.has_access_token
+              ? `Access token saved${dhan.token_expiry ? `, expires: ${dhan.token_expiry}` : ""}.`
+              : (dhan.has_api_credentials ? "API credentials saved. Use Login with Dhan to generate access token." : "");
+          }
+        }
       } catch (e) {}
       toggleBrokerFields();
     }
@@ -1984,8 +2033,23 @@
       const broker = document.getElementById("broker_select").value;
       document.getElementById("zerodha_fields").classList.toggle("hidden", broker !== "ZERODHA");
       document.getElementById("dhan_fields").classList.toggle("hidden", broker !== "DHAN");
-      document.getElementById("broker_connect_btn").textContent =
-        broker === "DHAN" ? "Connect Dhan" : "Log in to Kite";
+      toggleDhanAuthMode();
+    }
+
+    function toggleDhanAuthMode() {
+      const broker = document.getElementById("broker_select").value;
+      const mode = document.getElementById("dhan_auth_mode")?.value || "MANUAL";
+      const manual = mode !== "API_KEY";
+      const manualFields = document.getElementById("dhan_manual_fields");
+      const apiFields = document.getElementById("dhan_api_fields");
+      if (manualFields) manualFields.classList.toggle("hidden", broker !== "DHAN" || !manual);
+      if (apiFields) apiFields.classList.toggle("hidden", broker !== "DHAN" || manual);
+      const btn = document.getElementById("broker_connect_btn");
+      if (btn) {
+        btn.textContent = broker === "DHAN"
+          ? (manual ? "Connect Dhan" : "Login with Dhan")
+          : "Log in to Kite";
+      }
     }
 
     function openConfirm(msg) {
@@ -2123,10 +2187,15 @@
       const api_secret = document.getElementById("api_secret").value;
       const client_id = document.getElementById("dhan_client_id").value;
       const access_token = document.getElementById("dhan_access_token").value;
+      const dhan_auth_mode = document.getElementById("dhan_auth_mode")?.value || "MANUAL";
+      const dhan_api_key = document.getElementById("dhan_api_key")?.value || "";
+      const dhan_api_secret = document.getElementById("dhan_api_secret")?.value || "";
       try {
         const endpoint = broker === "DHAN" ? "/api/broker-config" : "/api/save-credentials";
         const body = broker === "DHAN"
-          ? { user_id: USER_ID, broker, client_id, access_token }
+          ? (dhan_auth_mode === "API_KEY"
+            ? { user_id: USER_ID, broker, auth_mode: "API_KEY", client_id, api_key: dhan_api_key, api_secret: dhan_api_secret }
+            : { user_id: USER_ID, broker, auth_mode: "MANUAL", client_id, access_token })
           : { user_id: USER_ID, api_key, api_secret };
         const r = await fetch(endpoint, {
           method: "POST", headers: { "Content-Type": "application/json" },
@@ -2145,19 +2214,31 @@
         if (d.warning) {
           toast("Dhan saved, but feed startup needs checking", "error");
         } else {
-          toast(broker === "DHAN" ? "Dhan connected successfully" : "Credentials saved successfully");
+          toast(broker === "DHAN"
+            ? (dhan_auth_mode === "API_KEY" ? "Dhan API credentials saved" : "Dhan connected successfully")
+            : "Credentials saved successfully");
         }
-        closeCred();
+        if (!(broker === "DHAN" && dhan_auth_mode === "API_KEY")) closeCred();
+        return d;
       } catch (e) {
         toast((e && e.message) ? e.message : String(e), 'error');
+        throw e;
       }
     }
 
     function connectZerodha() { location.href = `/connect/zerodha?user_id=${USER_ID}`; }
     async function connectBroker() {
       const broker = document.getElementById("broker_select").value;
-      if (broker === "DHAN") await saveCred();
-      else connectZerodha();
+      if (broker === "DHAN") {
+        const mode = document.getElementById("dhan_auth_mode")?.value || "MANUAL";
+        if (mode === "API_KEY") {
+          await saveCred();
+          toast("Opening Dhan login...");
+          location.href = `/connect/dhan?user_id=${USER_ID}`;
+        } else {
+          await saveCred();
+        }
+      } else connectZerodha();
     }
 
     async function refreshZ() {
@@ -3396,33 +3477,33 @@
 
           return `
             <tr class="${rowBg} transition-all duration-300 border-b border-white/5 last:border-0 group">
-              <td class="px-3 py-3">
+              <td data-label="Alert" class="px-3 py-3">
                 <span class="text-xs font-bold text-blue-300 tracking-wide">${a.alert_name}</span>
               </td>
-              <td class="px-3 py-3 whitespace-nowrap text-xs ${timeClass} font-mono">${timeStr}</td>
-              <td class="px-3 py-3 whitespace-nowrap text-sm ${symbolClass}">
+              <td data-label="Time" class="px-3 py-3 whitespace-nowrap text-xs ${timeClass} font-mono">${timeStr}</td>
+              <td data-label="Symbol" class="px-3 py-3 whitespace-nowrap text-sm ${symbolClass}">
                 <div class="flex flex-col">
                   <span>${symLabel}</span>
                   ${sector ? `<span class="inline-flex items-center px-2 py-0.5 mt-1 rounded text-[9px] font-black uppercase tracking-widest bg-cyan-500/15 text-cyan-300 border border-cyan-500/25 w-fit">${sector}</span>` : ''}
                 </div>
               </td>
-              <td class="px-3 py-3 whitespace-nowrap text-right font-mono font-bold text-5xl text-cyan-400" data-symbol="${sym}" data-field="ltp">                
+              <td data-label="LTP" class="px-3 py-3 whitespace-nowrap text-right font-mono font-bold text-5xl text-cyan-400" data-symbol="${sym}" data-field="ltp">
                 ${p && p.ltp ? Number(p.ltp).toFixed(2) : (r.ltp ? r.ltp.toFixed(2) : '--')}
               </td>
-              <td class="px-3 py-3 text-center ${p ? 'text-slate-200' : 'text-slate-300'}">${prod || '--'}</td>
-              <td class="px-3 py-3 text-center">
+              <td data-label="Type" class="px-3 py-3 text-center ${p ? 'text-slate-200' : 'text-slate-300'}">${prod || '--'}</td>
+              <td data-label="Side" class="px-3 py-3 text-center">
                 ${sideLabel ? `<span class="px-2.5 py-1 rounded text-[10px] font-black uppercase tracking-[0.2em] ${sideLabel === 'BUY' ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30' : 'bg-rose-500/20 text-rose-300 border border-rose-500/30'}">${sideLabel}</span>` : '<span class="text-slate-600">--</span>'}
               </td>
-              <td class="px-3 py-3 text-right ${p ? 'text-cyan-400 font-bold' : 'text-slate-600'}">
+              <td data-label="Qty" class="px-3 py-3 text-right ${p ? 'text-cyan-400 font-bold' : 'text-slate-600'}">
                 <div>${qty ?? '--'}</div>
                 ${pyramidInfo ? `<div class="text-[9px] text-fuchsia-300 font-normal">${pyramidInfo}</div>` : ''}
               </td>
-              <td class="px-3 py-3 text-right ${p ? 'text-slate-200' : 'text-slate-300'}">${entry ?? '--'}</td>
-              <td class="px-3 py-3 text-right ${p ? 'text-emerald-400 font-bold' : 'text-slate-600'}">${tgt ?? '--'}</td>
-              <td class="px-3 py-3 text-right ${p ? 'text-rose-400 font-bold' : 'text-slate-600'}">${sl ?? '--'}</td>
-              <td class="px-3 py-3 text-right ${p ? 'text-amber-400 font-bold' : 'text-slate-600'} atsl-${safeId(sym)}">${tslVal ?? '--'}</td>
-              <td class="px-3 py-3 text-right ${p ? pnlClass : 'text-slate-600'}" data-symbol="${sym}" data-field="pnl">${pnl ?? '--'}</td>
-              <td class="px-3 py-3 text-center">
+              <td data-label="Entry" class="px-3 py-3 text-right ${p ? 'text-slate-200' : 'text-slate-300'}">${entry ?? '--'}</td>
+              <td data-label="Target" class="px-3 py-3 text-right ${p ? 'text-emerald-400 font-bold' : 'text-slate-600'}">${tgt ?? '--'}</td>
+              <td data-label="SL" class="px-3 py-3 text-right ${p ? 'text-rose-400 font-bold' : 'text-slate-600'}">${sl ?? '--'}</td>
+              <td data-label="TSL" class="px-3 py-3 text-right ${p ? 'text-amber-400 font-bold' : 'text-slate-600'} atsl-${safeId(sym)}">${tslVal ?? '--'}</td>
+              <td data-label="P&L" class="px-3 py-3 text-right ${p ? pnlClass : 'text-slate-600'}" data-symbol="${sym}" data-field="pnl">${pnl ?? '--'}</td>
+              <td data-label="Status" class="px-3 py-3 text-center">
                 <div class="flex flex-col items-center gap-1">
                   <span class="px-2.5 py-1 rounded-full ${statusLabel === 'LIVE' ? 'text-[10px]' : 'text-[8px]'} font-black tracking-widest ${getStatusClass(statusLabel)}">
                     ${statusLabel === 'LIVE' ? `<span class="inline-flex items-center gap-1.5 text-emerald-300 drop-shadow-[0_0_6px_rgba(16,185,129,0.7)]"><span class="w-1.5 h-1.5 rounded-full bg-emerald-400 shadow-[0_0_6px_rgba(16,185,129,0.7)] animate-pulse"></span> LIVE</span>` : displayStatus}
@@ -3432,7 +3513,7 @@
               : (statusReason ? `<div class="text-[9px] text-slate-500 mt-0.5 max-w-[140px] truncate mx-auto" title="${statusReason}">${statusReason}</div>` : '')}
                 </div>
               </td>
-              <td class="px-3 py-3 text-center">
+              <td data-label="Action" class="px-3 py-3 text-center">
                 ${canSquareOff ? `<button onclick="squareoff('${p.symbol}')" class="px-3 py-1 text-[10px] font-black uppercase tracking-widest bg-rose-500/10 text-rose-400 border border-rose-500/20 rounded-lg hover:bg-rose-500/20 hover:text-white hover:border-rose-500/40 transition-all duration-300">SQ OFF</button>` : '<span class="text-slate-600">--</span>'}
               </td>
             </tr>
