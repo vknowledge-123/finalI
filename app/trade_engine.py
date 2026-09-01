@@ -10,6 +10,7 @@ import math
 import pytz
 from datetime import datetime
 from dataclasses import dataclass, asdict
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 from typing import Any, Dict, Optional, Literal, List, Tuple, Set
 from dataclasses import fields as _dc_fields
 from kiteconnect import KiteConnect  # type: ignore
@@ -315,18 +316,21 @@ def _cfg_float(cfg: Optional[Dict[str, Any]], keys: Tuple[str, ...], default: fl
 
 def _round_dhan_price(price: float, side: Side, tick: float = DHAN_PRICE_TICK) -> float:
     try:
-        tick = float(tick or DHAN_PRICE_TICK)
+        tick_value = float(tick or DHAN_PRICE_TICK)
     except Exception:
-        tick = DHAN_PRICE_TICK
-    tick = tick if tick > 0 else DHAN_PRICE_TICK
+        tick_value = DHAN_PRICE_TICK
+    tick_value = tick_value if tick_value > 0 else DHAN_PRICE_TICK
     if price <= 0:
         return 0.0
-    steps = price / tick
+
+    price_dec = Decimal(str(price))
+    tick_dec = Decimal(str(tick_value))
     if side == "BUY":
-        rounded = math.ceil(steps - 1e-9) * tick
+        rounded = (price_dec / tick_dec).to_integral_value(rounding=ROUND_CEILING) * tick_dec
     else:
-        rounded = math.floor(steps + 1e-9) * tick
-    return round(max(0.0, rounded), 2)
+        rounded = (price_dec / tick_dec).to_integral_value(rounding=ROUND_FLOOR) * tick_dec
+    rounded = max(Decimal("0"), rounded).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return float(rounded)
 
 
 def _depth_level_price(level: Any) -> Tuple[float, int]:
@@ -567,18 +571,19 @@ def _stepwise_anchor_short(entry: float, lowest: float, step_pct: float) -> floa
 
 
 def _classic_tsl_line(pos: "Position") -> float:
-    if float(pos.tsl_pct or 0.0) <= 0:
+    effective_tsl_pct = _effective_trailing_sl_pct(pos)
+    if effective_tsl_pct <= 0:
         return 0.0
     if pos.side == "BUY" and float(pos.highest or 0.0) > 0:
         anchor = float(pos.highest)
         if pos.tsl_stepwise and float(pos.entry_price) > 0:
-            anchor = _stepwise_anchor_long(float(pos.entry_price), float(pos.highest), float(pos.tsl_pct))
-        return anchor * (1.0 - float(pos.tsl_pct) / 100.0)
+            anchor = _stepwise_anchor_long(float(pos.entry_price), float(pos.highest), effective_tsl_pct)
+        return anchor * (1.0 - effective_tsl_pct / 100.0)
     if pos.side == "SELL" and float(pos.lowest or 0.0) > 0:
         anchor = float(pos.lowest)
         if pos.tsl_stepwise and float(pos.entry_price) > 0:
-            anchor = _stepwise_anchor_short(float(pos.entry_price), float(pos.lowest), float(pos.tsl_pct))
-        return anchor * (1.0 + float(pos.tsl_pct) / 100.0)
+            anchor = _stepwise_anchor_short(float(pos.entry_price), float(pos.lowest), effective_tsl_pct)
+        return anchor * (1.0 + effective_tsl_pct / 100.0)
     return 0.0
 
 
@@ -593,6 +598,40 @@ def _ratchet_classic_tsl(pos: "Position", computed_line: float) -> float:
     else:
         pos.trail_price = min(previous, float(computed_line))
     return float(pos.trail_price or computed_line)
+
+
+def _effective_trailing_sl_pct(pos: "Position") -> float:
+    if not bool(getattr(pos, "trailing_sl_enabled", True)):
+        return 0.0
+    return float(pos.tsl_pct or 0.0)
+
+
+def _apply_cost_sl_if_ready(pos: "Position") -> bool:
+    if not bool(getattr(pos, "cost_sl_enabled", False)):
+        return False
+    entry = float(pos.entry_price or 0.0)
+    risk_pct = float(pos.cfg_sl_pct or 0.0)
+    rr = float(pos.cost_sl_rr or 0.0)
+    if entry <= 0 or risk_pct <= 0 or rr <= 0:
+        return False
+
+    trigger_pct = risk_pct * rr
+    if pos.side == "BUY":
+        high = float(pos.highest or pos.ltp or 0.0)
+        if high < entry * (1.0 + trigger_pct / 100.0):
+            return False
+        previous = float(pos.sl_price or 0.0)
+        pos.sl_price = max(previous, entry)
+    else:
+        low = float(pos.lowest or pos.ltp or 0.0)
+        if low > entry * (1.0 - trigger_pct / 100.0):
+            return False
+        previous = float(pos.sl_price or 0.0)
+        pos.sl_price = entry if previous <= 0 else min(previous, entry)
+    moved = abs(float(pos.sl_price or 0.0) - entry) < 0.0001
+    if moved:
+        pos.cost_sl_moved = True
+    return moved
 
 
 def _is_within_entry_window(start_time: str, end_time: str) -> bool:
@@ -655,7 +694,10 @@ class AlertConfig:
     target_pct: float = 1.0
     stop_loss_pct: float = 0.7
     trailing_sl_pct: float = 0.5
+    trailing_sl_enabled: bool = True
     tsl_stepwise: bool = False
+    cost_sl_enabled: bool = False
+    cost_sl_rr: float = 2.0
 
     trade_limit_per_day: int = 5
 
@@ -705,7 +747,13 @@ class AlertConfig:
             target_pct=float(d.get("target_pct", 1.0) or 0.0),
             stop_loss_pct=float(d.get("stop_loss_pct", 0.7) or 0.0),
             trailing_sl_pct=float(d.get("trailing_sl_pct", 0.5) or 0.0),
+            trailing_sl_enabled=_as_bool(
+                d.get("trailing_sl_enabled"),
+                float(d.get("trailing_sl_pct", 0.5) or 0.0) > 0,
+            ),
             tsl_stepwise=_as_bool(d.get("tsl_stepwise"), False),
+            cost_sl_enabled=_as_bool(d.get("cost_sl_enabled"), False),
+            cost_sl_rr=float(d.get("cost_sl_rr", 2.0) or 0.0),
             trade_limit_per_day=int(d.get("trade_limit_per_day", 3) or 0),
             sector_filter_on=_as_bool(d.get("sector_filter_on"), False),
             top_n_sector=int(d.get("top_n_sector", 2) or 2),
@@ -737,7 +785,11 @@ class Position:
     target_price: float = 0.0
     sl_price: float = 0.0
     tsl_pct: float = 0.0
+    trailing_sl_enabled: bool = True
     tsl_stepwise: bool = False
+    cost_sl_enabled: bool = False
+    cost_sl_rr: float = 2.0
+    cost_sl_moved: bool = False
     highest: float = 0.0
     lowest: float = 0.0
 
@@ -758,7 +810,10 @@ class Position:
     cfg_target_pct: float = 0.0
     cfg_sl_pct: float = 0.0
     cfg_tsl_pct: float = 0.0
+    cfg_tsl_enabled: bool = True
     cfg_tsl_stepwise: bool = False
+    cfg_cost_sl_enabled: bool = False
+    cfg_cost_sl_rr: float = 2.0
 
 
     ltp: float = 0.0
@@ -929,6 +984,7 @@ class TradeEngine:
         self.sector_index_ltp: Dict[str, float] = {}
         self.sector_index_pct: Dict[str, float] = {}
         self.sector_index_updated_ts: Dict[str, float] = {}
+        self.sector_index_rank_ready: Set[str] = set()
 
         self.order_worker = OrderWorker()
         self.market_data_worker = MarketDataWorker(max_concurrency=4)
@@ -1208,7 +1264,7 @@ class TradeEngine:
                     pos.highest = pos.entry_price
                 if pos.side == "SELL" and pos.lowest <= 0:
                     pos.lowest = pos.entry_price
-                if pos.tsl_pct > 0 and pos.trail_price <= 0:
+                if _effective_trailing_sl_pct(pos) > 0 and pos.trail_price <= 0:
                     _ratchet_classic_tsl(pos, _classic_tsl_line(pos))
 
                 self.positions[sym] = pos
@@ -1385,13 +1441,13 @@ class TradeEngine:
             return 0.0, "NO_PRICE"
 
         buffer_pct, extra_ticks = self._dhan_limit_settings(cfg)
-        tick = DHAN_PRICE_TICK
+        tick = DHAN_INSTRUMENTS.tick_size(security_id, DHAN_PRICE_TICK)
         if side == "BUY":
             raw_price = reference * (1.0 + buffer_pct / 100.0) + (extra_ticks * tick)
         else:
             raw_price = reference * (1.0 - buffer_pct / 100.0) - (extra_ticks * tick)
         limit_price = _round_dhan_price(raw_price, side, tick)
-        return limit_price, f"{source}:ref={reference:.2f}:buffer={buffer_pct:.3f}:ticks={extra_ticks}"
+        return limit_price, f"{source}:ref={reference:.2f}:buffer={buffer_pct:.3f}:ticks={extra_ticks}:tick={tick:.2f}"
 
     async def _place_order(self, symbol: str, side: Side, qty: int, product: Product, cfg: Optional[Dict[str, Any]] = None) -> Any:
         if self.broker == "DHAN":
@@ -1432,15 +1488,17 @@ class TradeEngine:
             )
             if limit_price > 0:
                 order_type = getattr(self.dhan, "LIMIT", "LIMIT")
-                order_price = limit_price
+                tick_size = DHAN_INSTRUMENTS.tick_size(security_id, DHAN_PRICE_TICK)
+                order_price = _round_dhan_price(limit_price, side, tick_size)
                 log.info(
-                    "DHAN_AGGRESSIVE_LIMIT | user=%s symbol=%s security_id=%s side=%s qty=%s price=%.2f source=%s",
+                    "DHAN_AGGRESSIVE_LIMIT | user=%s symbol=%s security_id=%s side=%s qty=%s price=%.2f tick=%.2f source=%s",
                     self.user_id,
                     order_symbol,
                     security_id,
                     side,
                     qty,
                     order_price,
+                    tick_size,
                     price_source,
                 )
             else:
@@ -2459,6 +2517,10 @@ class TradeEngine:
                 target_price = 0.0
                 sl_price = 0.0
                 is_index_option_execution = execution_symbol != sym and DHAN_INSTRUMENTS.is_index_symbol(sym)
+                use_classic_risk = (not custom_signal) or is_index_option_execution
+                classic_tsl_enabled = bool(cfg.trailing_sl_enabled) and use_classic_risk
+                classic_tsl_pct = float(cfg.trailing_sl_pct) if classic_tsl_enabled else 0.0
+                classic_cost_sl_enabled = bool(cfg.cost_sl_enabled) and use_classic_risk
                 if custom_signal and not is_index_option_execution:
                     target_price = float(custom_signal.tp3)
                     sl_price = float(custom_signal.stop_loss)
@@ -2497,8 +2559,11 @@ class TradeEngine:
                     order_retry_count=max(0, int(execution.attempts) - 1),
                     target_price=target_price,
                     sl_price=sl_price,
-                    tsl_pct=float(cfg.trailing_sl_pct) if is_index_option_execution else (0.0 if custom_signal else float(cfg.trailing_sl_pct)),
+                    tsl_pct=classic_tsl_pct,
+                    trailing_sl_enabled=classic_tsl_enabled,
                     tsl_stepwise=bool(cfg.tsl_stepwise),
+                    cost_sl_enabled=classic_cost_sl_enabled,
+                    cost_sl_rr=float(cfg.cost_sl_rr or 0.0),
                     highest=entry if side == "BUY" else 0.0,
                     lowest=entry if side == "SELL" else 0.0,
                     status="OPEN",
@@ -2507,8 +2572,11 @@ class TradeEngine:
                     updated_ts=time.time(),
                     cfg_target_pct=float(cfg.target_pct),
                     cfg_sl_pct=float(cfg.stop_loss_pct),
-                    cfg_tsl_pct=float(cfg.trailing_sl_pct) if is_index_option_execution else (0.0 if custom_signal else float(cfg.trailing_sl_pct)),
+                    cfg_tsl_pct=classic_tsl_pct,
+                    cfg_tsl_enabled=classic_tsl_enabled,
                     cfg_tsl_stepwise=bool(cfg.tsl_stepwise),
+                    cfg_cost_sl_enabled=classic_cost_sl_enabled,
+                    cfg_cost_sl_rr=float(cfg.cost_sl_rr or 0.0),
                     ltp=entry,
                     pnl=0.0,
                     sector=self.sym_sector.get(sym, ""),
@@ -2539,7 +2607,7 @@ class TradeEngine:
                     pyramid_max_adds=max(0, int(cfg.pyramid_max_adds or 0)),
                     pyramid_last_add_price=entry,
                 )
-                if (not custom_signal or is_index_option_execution) and pos.tsl_pct > 0:
+                if use_classic_risk and _effective_trailing_sl_pct(pos) > 0:
                     _ratchet_classic_tsl(pos, _classic_tsl_line(pos))
 
                 self.positions[execution_symbol] = pos
@@ -2556,11 +2624,11 @@ class TradeEngine:
                 close = float(tick.get("close") or 0.0)
                 pct = ((entry - close) / close * 100.0) if close > 0 else 0.0
                 tsl_line = 0.0
-                if entry > 0 and cfg.trailing_sl_pct > 0:
+                if entry > 0 and classic_tsl_pct > 0:
                     if side == "BUY":
-                        tsl_line = entry * (1.0 - float(cfg.trailing_sl_pct) / 100.0)
+                        tsl_line = entry * (1.0 - classic_tsl_pct / 100.0)
                     else:
-                        tsl_line = entry * (1.0 + float(cfg.trailing_sl_pct) / 100.0)
+                        tsl_line = entry * (1.0 + classic_tsl_pct / 100.0)
 
                 results.append(
                     {
@@ -2908,6 +2976,7 @@ class TradeEngine:
                         if pos.side == "BUY"
                         else pos.entry_price * (1.0 + pos.cfg_sl_pct / 100.0)
                     )
+                    pos.cost_sl_moved = False
 
             if pos.custom_partial_profit_enabled:
                 q1, q2, q3 = _partial_quantities(
@@ -3129,8 +3198,9 @@ class TradeEngine:
                                 pos.sl_price = pos.entry_price * (1.0 - pos.cfg_sl_pct / 100.0)
                             else:
                                 pos.sl_price = pos.entry_price * (1.0 + pos.cfg_sl_pct / 100.0)
-                        if pos.cfg_tsl_pct > 0 and pos.tsl_pct <= 0:
+                        if pos.cfg_tsl_enabled and pos.cfg_tsl_pct > 0 and pos.tsl_pct <= 0:
                             pos.tsl_pct = float(pos.cfg_tsl_pct)
+                            pos.trailing_sl_enabled = True
 
                         if pos.side == "BUY" and pos.highest <= 0:
                             pos.highest = pos.entry_price
@@ -3253,10 +3323,13 @@ class TradeEngine:
         else:
             pos.lowest = min(pos.lowest, ltp) if pos.lowest else float(ltp)
 
+        previous_sl = float(pos.sl_price or 0.0)
+        cost_sl_changed = _apply_cost_sl_if_ready(pos) and float(pos.sl_price or 0.0) != previous_sl
+
         # tsl line for BUY/SELL
         previous_classic_trail = float(pos.trail_price or 0.0)
         tsl_line = 0.0
-        if pos.tsl_pct > 0:
+        if _effective_trailing_sl_pct(pos) > 0:
             tsl_line = _ratchet_classic_tsl(pos, _classic_tsl_line(pos))
         classic_trail_changed = float(pos.trail_price or 0.0) != previous_classic_trail
 
@@ -3307,7 +3380,7 @@ class TradeEngine:
 
             if not reason:
                 # Suppress continuous monitor logs; only log on exit triggers.
-                if classic_trail_changed:
+                if classic_trail_changed or cost_sl_changed:
                     try:
                         await self._persist_position_state(pos)
                     except Exception:
@@ -3382,7 +3455,7 @@ class TradeEngine:
             else:
                 log.debug("⏳ EXIT_DEBOUNCE | user=%s symbol=%s reason=%s", self.user_id, symbol, reason)
 
-        if not reason and classic_trail_changed:
+        if not reason and (classic_trail_changed or cost_sl_changed):
             try:
                 await self._persist_position_state(pos)
             except Exception:
@@ -3421,16 +3494,26 @@ class TradeEngine:
                 pct = float(row.get("pct") or row.get("pct_change") or 0.0)
             except Exception:
                 continue
+            rank_ready = _as_bool(
+                row.get("rank_ready", row.get("pct_ready", row.get("live_ready"))),
+                False,
+            )
             if prev_close > 0:
                 self.sector_index_prev_close[sector] = prev_close
             if ltp > 0:
                 self.sector_index_ltp[sector] = ltp
             if prev_close > 0 and ltp > 0:
                 pct = ((ltp - prev_close) / prev_close) * 100.0
-            self.sector_index_pct[sector] = float(pct)
+                if not rank_ready and abs(ltp - prev_close) > 0.0001:
+                    rank_ready = True
+            if rank_ready:
+                self.sector_index_pct[sector] = float(pct)
+                self.sector_index_rank_ready.add(sector)
+            elif sector not in self.sector_index_rank_ready:
+                self.sector_index_pct.pop(sector, None)
             self.sector_index_updated_ts[sector] = time.time()
 
-    def update_sector_index_tick(self, sector: str, ltp: float, prev_close: float = 0.0) -> None:
+    def update_sector_index_tick(self, sector: str, ltp: float, prev_close: float = 0.0, rank_ready: bool = True) -> None:
         sector = str(sector or "").strip().upper()
         if sector not in SECTOR_INDEX_INSTRUMENTS or float(ltp or 0.0) <= 0:
             return
@@ -3441,6 +3524,8 @@ class TradeEngine:
         self.sector_index_updated_ts[sector] = time.time()
         if cached_prev > 0:
             self.sector_index_pct[sector] = ((float(ltp) - cached_prev) / cached_prev) * 100.0
+            if rank_ready:
+                self.sector_index_rank_ready.add(sector)
 
     async def _refresh_dhan_sector_rank(self) -> bool:
         if self.broker != "DHAN":
@@ -3472,7 +3557,8 @@ class TradeEngine:
             prev_close = float(values.get("prev_close") or 0.0)
             if ltp <= 0 or prev_close <= 0:
                 continue
-            self.update_sector_index_tick(sector, ltp, prev_close=prev_close)
+            rank_ready = abs(float(ltp) - float(prev_close)) > 0.0001
+            self.update_sector_index_tick(sector, ltp, prev_close=prev_close, rank_ready=rank_ready)
             ok_count += 1
         if ok_count <= 0:
             log.warning(
@@ -3487,7 +3573,7 @@ class TradeEngine:
     def get_sector_rank(self) -> List[tuple]:
         ranked_map: Dict[str, float] = {}
         for sec, pct in self.sector_index_pct.items():
-            if sec in SECTOR_INDEX_INSTRUMENTS:
+            if sec in SECTOR_INDEX_INSTRUMENTS and sec in self.sector_index_rank_ready:
                 ranked_map[sec] = float(pct)
         for sec, total in self.sector_sum.items():
             cnt = self.sector_cnt.get(sec, 0)
@@ -3519,7 +3605,7 @@ class TradeEngine:
         sl = float(pos.sl_price)
 
         tsl_line = 0.0
-        if pos.product == "MIS" and pos.tsl_pct > 0:
+        if _effective_trailing_sl_pct(pos) > 0:
             tsl_line = float(pos.trail_price or _classic_tsl_line(pos) or 0.0)
 
         # distance sign: + means ltp above level, - means below (generic)
@@ -3531,37 +3617,36 @@ class TradeEngine:
         near_tags: List[str] = []
         hit_tags: List[str] = []
 
-        if pos.product == "MIS":
-            if pos.side == "BUY":
-                if tgt > 0 and ltp >= tgt:
-                    hit_tags.append("HIT_TARGET")
-                elif tgt > 0 and abs(_pct_dist(ltp, tgt)) <= self.near_pct:
-                    near_tags.append("NEAR_TARGET")
+        if pos.side == "BUY":
+            if tgt > 0 and ltp >= tgt:
+                hit_tags.append("HIT_TARGET")
+            elif tgt > 0 and abs(_pct_dist(ltp, tgt)) <= self.near_pct:
+                near_tags.append("NEAR_TARGET")
 
-                if sl > 0 and ltp <= sl:
-                    hit_tags.append("HIT_SL")
-                elif sl > 0 and abs(_pct_dist(ltp, sl)) <= self.near_pct:
-                    near_tags.append("NEAR_SL")
+            if sl > 0 and ltp <= sl:
+                hit_tags.append("HIT_SL")
+            elif sl > 0 and abs(_pct_dist(ltp, sl)) <= self.near_pct:
+                near_tags.append("NEAR_SL")
 
-                if tsl_line > 0 and ltp <= tsl_line:
-                    hit_tags.append("HIT_TSL")
-                elif tsl_line > 0 and abs(_pct_dist(ltp, tsl_line)) <= self.near_pct:
-                    near_tags.append("NEAR_TSL")
-            else:
-                if tgt > 0 and ltp <= tgt:
-                    hit_tags.append("HIT_TARGET")
-                elif tgt > 0 and abs(_pct_dist(ltp, tgt)) <= self.near_pct:
-                    near_tags.append("NEAR_TARGET")
+            if tsl_line > 0 and ltp <= tsl_line:
+                hit_tags.append("HIT_TSL")
+            elif tsl_line > 0 and abs(_pct_dist(ltp, tsl_line)) <= self.near_pct:
+                near_tags.append("NEAR_TSL")
+        else:
+            if tgt > 0 and ltp <= tgt:
+                hit_tags.append("HIT_TARGET")
+            elif tgt > 0 and abs(_pct_dist(ltp, tgt)) <= self.near_pct:
+                near_tags.append("NEAR_TARGET")
 
-                if sl > 0 and ltp >= sl:
-                    hit_tags.append("HIT_SL")
-                elif sl > 0 and abs(_pct_dist(ltp, sl)) <= self.near_pct:
-                    near_tags.append("NEAR_SL")
+            if sl > 0 and ltp >= sl:
+                hit_tags.append("HIT_SL")
+            elif sl > 0 and abs(_pct_dist(ltp, sl)) <= self.near_pct:
+                near_tags.append("NEAR_SL")
 
-                if tsl_line > 0 and ltp >= tsl_line:
-                    hit_tags.append("HIT_TSL")
-                elif tsl_line > 0 and abs(_pct_dist(ltp, tsl_line)) <= self.near_pct:
-                    near_tags.append("NEAR_TSL")
+            if tsl_line > 0 and ltp >= tsl_line:
+                hit_tags.append("HIT_TSL")
+            elif tsl_line > 0 and abs(_pct_dist(ltp, tsl_line)) <= self.near_pct:
+                near_tags.append("NEAR_TSL")
 
         tag_str = ""
         if hit_tags:

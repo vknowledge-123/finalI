@@ -45,6 +45,53 @@ class SectorCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ranks[0][0], "NIFTY AUTO")
         self.assertAlmostEqual(ranks[0][1], 4.0)
 
+    async def test_same_price_premarket_cache_is_not_rank_ready(self) -> None:
+        engine = TradeEngine(user_id=1, store=InMemoryStore())
+        engine.load_sector_cache(
+            {
+                "source": "DHAN_OHLC",
+                "rank_ready": False,
+                "rank_ready_count": 0,
+                "sectors": [
+                    {
+                        "name": "NIFTY AUTO",
+                        "ltp": 28841.5,
+                        "prev_close": 28841.5,
+                        "pct": 0.0,
+                        "ok": True,
+                        "rank_ready": False,
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(engine.get_sector_rank(), [])
+        self.assertEqual(engine.sector_index_prev_close["NIFTY AUTO"], 28841.5)
+        self.assertEqual(engine.sector_index_ltp["NIFTY AUTO"], 28841.5)
+
+    async def test_live_sector_tick_marks_cached_sector_rank_ready(self) -> None:
+        engine = TradeEngine(user_id=1, store=InMemoryStore())
+        engine.load_sector_cache(
+            {
+                "sectors": [
+                    {
+                        "name": "NIFTY AUTO",
+                        "ltp": 28841.5,
+                        "prev_close": 28841.5,
+                        "pct": 0.0,
+                        "ok": True,
+                        "rank_ready": False,
+                    }
+                ],
+            }
+        )
+
+        engine.update_sector_index_tick("NIFTY AUTO", 28900.0)
+        ranks = engine.get_sector_rank()
+
+        self.assertEqual(ranks[0][0], "NIFTY AUTO")
+        self.assertGreater(ranks[0][1], 0.0)
+
     async def test_sector_filter_does_not_bypass_unknown_symbols(self) -> None:
         store = InMemoryStore()
         await store.save_alert_config(

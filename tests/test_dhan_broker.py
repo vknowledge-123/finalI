@@ -13,7 +13,7 @@ from app.dhan_broker import (
     resample_intraday_candles,
 )
 from app.memory_store import InMemoryStore
-from app.trade_engine import OrderExecution, Position, TradeEngine
+from app.trade_engine import OrderExecution, Position, TradeEngine, _round_dhan_price
 
 
 class DhanBrokerTests(unittest.TestCase):
@@ -147,6 +147,43 @@ class DhanBrokerTests(unittest.TestCase):
         self.assertEqual(registry.symbol("9001"), "BANKNIFTY26JUN54000CE")
         self.assertEqual(registry.feed_segment("9001"), MarketFeed.NSE_FNO)
 
+    def test_dhan_registry_reads_tick_size_from_master(self) -> None:
+        registry = DhanInstrumentRegistry()
+        registry._master_frame = pd.DataFrame(
+            [
+                {
+                    "SEM_EXM_EXCH_ID": "NSE",
+                    "SEM_SEGMENT": "E",
+                    "SEM_SERIES": "EQ",
+                    "SEM_INSTRUMENT_NAME": "EQUITY",
+                    "SEM_TRADING_SYMBOL": "ABREL",
+                    "SEM_SMST_SECURITY_ID": "625",
+                    "SEM_TICK_SIZE": 10,
+                },
+                {
+                    "SEM_EXM_EXCH_ID": "NSE",
+                    "SEM_SEGMENT": "E",
+                    "SEM_SERIES": "EQ",
+                    "SEM_INSTRUMENT_NAME": "EQUITY",
+                    "SEM_TRADING_SYMBOL": "GODREJCP",
+                    "SEM_SMST_SECURITY_ID": "10099",
+                    "SEM_TICK_SIZE": 5,
+                },
+            ]
+        )
+
+        __import__("asyncio").run(registry.ensure_loaded())
+
+        self.assertEqual(__import__("asyncio").run(registry.security_id("ABREL")), "625")
+        self.assertAlmostEqual(registry.tick_size("625"), 0.10)
+        self.assertAlmostEqual(registry.tick_size("10099"), 0.05)
+
+    def test_dhan_order_price_rounds_to_tick_size(self) -> None:
+        self.assertEqual(_round_dhan_price(351.57, "SELL", 0.10), 351.50)
+        self.assertEqual(_round_dhan_price(351.57, "BUY", 0.10), 351.60)
+        self.assertEqual(_round_dhan_price(351.57, "SELL", 0.05), 351.55)
+        self.assertEqual(_round_dhan_price(351.57, "BUY", 0.05), 351.60)
+
 
 class DhanTradeEngineTests(unittest.IsolatedAsyncioTestCase):
     async def test_dhan_market_order_uses_security_id(self) -> None:
@@ -243,6 +280,69 @@ class DhanTradeEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(order_id, "DHAN-LIMIT")
         self.assertEqual(placed_kwargs["order_type"], "LIMIT")
         self.assertEqual(placed_kwargs["price"], 101.2)
+        engine.order_worker.task.cancel()
+        if engine._pnl_exit_task:
+            engine._pnl_exit_task.cancel()
+
+    async def test_dhan_sell_order_uses_instrument_tick_size(self) -> None:
+        store = InMemoryStore()
+        await store.save_broker(1, "DHAN")
+        await store.save_dhan_credentials(1, "client", "token")
+        engine = TradeEngine(1, store)
+        await engine.configure_broker()
+        engine.dhan = MagicMock(
+            NSE="NSE_EQ",
+            BUY="BUY",
+            SELL="SELL",
+            MARKET="MARKET",
+            LIMIT="LIMIT",
+            INTRA="INTRADAY",
+            CNC="CNC",
+        )
+        engine.dhan.place_order = MagicMock()
+        engine.dhan.quote_data = MagicMock()
+
+        placed_kwargs = {}
+
+        async def fake_order_submit(fn, *args, **kwargs):
+            self.assertIs(fn, engine.dhan.place_order)
+            placed_kwargs.update(kwargs)
+            return {"status": "success", "data": {"orderId": "DHAN-TICK"}}
+
+        async def fake_market_submit(fn, *args, **kwargs):
+            self.assertIs(fn, engine.dhan.quote_data)
+            return {
+                "data": {
+                    "NSE_EQ": {
+                        "625": {
+                            "last_price": 351.57,
+                            "depth": {
+                                "buy": [{"price": 351.57, "quantity": 10, "orders": 1}],
+                                "sell": [{"price": 351.65, "quantity": 10, "orders": 1}],
+                            },
+                        }
+                    }
+                }
+            }
+
+        engine.order_worker.submit = fake_order_submit
+        engine.market_data_worker.submit = fake_market_submit
+
+        with patch("app.trade_engine.DHAN_INSTRUMENTS.security_id", AsyncMock(return_value="625")), patch(
+            "app.trade_engine.DHAN_INSTRUMENTS.tick_size",
+            return_value=0.10,
+        ):
+            order_id = await engine._place_order(
+                "ABREL",
+                "SELL",
+                1,
+                "MIS",
+                {"order_limit_buffer_pct": 0, "order_limit_extra_ticks": 0},
+            )
+
+        self.assertEqual(order_id, "DHAN-TICK")
+        self.assertEqual(placed_kwargs["order_type"], "LIMIT")
+        self.assertEqual(placed_kwargs["price"], 351.50)
         engine.order_worker.task.cancel()
         if engine._pnl_exit_task:
             engine._pnl_exit_task.cancel()

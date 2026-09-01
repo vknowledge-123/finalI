@@ -1141,6 +1141,67 @@ class TradeEngineIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(position.trail_price, first_trail)
         engine._exit_position.assert_not_awaited()
 
+    async def test_classic_tsl_toggle_off_disables_trailing_exit(self) -> None:
+        store = InMemoryStore()
+        engine = TradeEngine(1, store)
+        position = Position(
+            trade_id="classic-tsl-off",
+            user_id=1,
+            symbol="SBIN",
+            alert_name="classic",
+            side="BUY",
+            product="MIS",
+            qty=1,
+            initial_qty=1,
+            entry_price=100.0,
+            target_price=200.0,
+            sl_price=95.0,
+            tsl_pct=2.0,
+            trailing_sl_enabled=False,
+            highest=110.0,
+            trail_price=107.8,
+            status="OPEN",
+        )
+        engine.positions["SBIN"] = position
+        engine._exit_position = AsyncMock()
+
+        await engine.on_tick("SBIN", 107.0, 100, 110.0, 107.0)
+        await asyncio.sleep(0)
+
+        self.assertEqual(position.status, "OPEN")
+        engine._exit_position.assert_not_awaited()
+
+    async def test_classic_cost_sl_moves_stop_to_entry_at_rr_trigger(self) -> None:
+        store = InMemoryStore()
+        engine = TradeEngine(1, store)
+        position = Position(
+            trade_id="classic-cost-sl",
+            user_id=1,
+            symbol="SBIN",
+            alert_name="classic",
+            side="BUY",
+            product="MIS",
+            qty=1,
+            initial_qty=1,
+            entry_price=100.0,
+            target_price=200.0,
+            sl_price=99.4,
+            cfg_sl_pct=0.6,
+            cost_sl_enabled=True,
+            cost_sl_rr=2.0,
+            highest=100.0,
+            status="OPEN",
+        )
+        engine.positions["SBIN"] = position
+        engine._exit_position = AsyncMock()
+
+        await engine.on_tick("SBIN", 101.2, 100, 101.2, 100.8)
+
+        self.assertAlmostEqual(position.sl_price, 100.0)
+        self.assertTrue(position.cost_sl_moved)
+        self.assertEqual(position.status, "OPEN")
+        engine._exit_position.assert_not_awaited()
+
     async def test_custom_strategy_pyramiding_adds_before_custom_exit_checks(self) -> None:
         store = InMemoryStore()
         engine = TradeEngine(1, store)
@@ -1351,11 +1412,15 @@ class TradeEngineIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 "enabled": "false",
                 "sector_filter_on": "false",
                 "tsl_stepwise": "false",
+                "trailing_sl_enabled": "false",
+                "cost_sl_enabled": "false",
             }
         )
         self.assertFalse(cfg.enabled)
         self.assertFalse(cfg.sector_filter_on)
         self.assertFalse(cfg.tsl_stepwise)
+        self.assertFalse(cfg.trailing_sl_enabled)
+        self.assertFalse(cfg.cost_sl_enabled)
 
 
 if __name__ == "__main__":

@@ -32,6 +32,7 @@ class DhanInstrumentRegistry:
         self.symbol_to_security: Dict[str, str] = {}
         self.security_to_symbol: Dict[str, str] = {}
         self.security_to_feed_segment: Dict[str, int] = {}
+        self.security_to_tick_size: Dict[str, float] = {}
         self._master_frame: Optional[pd.DataFrame] = None
         self._lock = asyncio.Lock()
         self.loaded_at: Optional[datetime] = None
@@ -76,12 +77,16 @@ class DhanInstrumentRegistry:
                         symbol_map[symbol] = security_id
                         security_map[security_id] = symbol
                         self.security_to_feed_segment[security_id] = MarketFeed.NSE
+                        self.security_to_tick_size[security_id] = self._normalise_tick_size(
+                            _value(row, "SEM_TICK_SIZE", "TICK_SIZE")
+                        )
                 if not symbol_map:
                     raise RuntimeError("DHAN_SCRIP_MASTER_EMPTY")
                 for symbol, security_id in self.INDEX_SECURITY_IDS.items():
                     symbol_map[symbol] = security_id
                     security_map[security_id] = self.INDEX_DISPLAY.get(security_id, symbol)
                     self.security_to_feed_segment[security_id] = MarketFeed.IDX
+                    self.security_to_tick_size[security_id] = 0.05
                 self.symbol_to_security = symbol_map
                 self.security_to_symbol = security_map
                 self.loaded_at = datetime.now()
@@ -176,7 +181,12 @@ class DhanInstrumentRegistry:
         trading_symbol = norm_symbol(_value(row, "SEM_TRADING_SYMBOL", "TRADING_SYMBOL"))
         if not security_id or not trading_symbol:
             return None
-        self.register_instrument(trading_symbol, security_id, MarketFeed.NSE_FNO)
+        self.register_instrument(
+            trading_symbol,
+            security_id,
+            MarketFeed.NSE_FNO,
+            self._normalise_tick_size(_value(row, "SEM_TICK_SIZE", "TICK_SIZE")),
+        )
         return {
             "security_id": security_id,
             "trading_symbol": trading_symbol,
@@ -186,7 +196,27 @@ class DhanInstrumentRegistry:
             "expiry": str(row.get("_expiry") or ""),
         }
 
-    def register_instrument(self, symbol: str, security_id: str, feed_segment: Optional[int] = None) -> None:
+    @staticmethod
+    def _normalise_tick_size(value: Any) -> float:
+        try:
+            tick = float(value or 0.0)
+        except Exception:
+            tick = 0.0
+        if tick <= 0:
+            return 0.05
+        # Dhan equity/derivative master reports tick in paise for many NSE rows:
+        # 5 => Rs 0.05, 10 => Rs 0.10. Sub-rupee values are already rupees.
+        if tick >= 1.0:
+            tick = tick / 100.0
+        return max(0.01, float(tick))
+
+    def register_instrument(
+        self,
+        symbol: str,
+        security_id: str,
+        feed_segment: Optional[int] = None,
+        tick_size: Optional[float] = None,
+    ) -> None:
         normalized = norm_symbol(symbol)
         security_id = str(security_id or "").strip()
         if not normalized or not security_id:
@@ -194,9 +224,18 @@ class DhanInstrumentRegistry:
         self.symbol_to_security[normalized] = security_id
         self.security_to_symbol[security_id] = normalized
         self.security_to_feed_segment[security_id] = feed_segment or MarketFeed.NSE
+        if tick_size is not None:
+            self.security_to_tick_size[security_id] = self._normalise_tick_size(tick_size)
 
     def feed_segment(self, security_id: Any) -> int:
         return self.security_to_feed_segment.get(str(security_id), MarketFeed.NSE)
+
+    def tick_size(self, security_id: Any, default: float = 0.05) -> float:
+        try:
+            fallback = self._normalise_tick_size(default)
+        except Exception:
+            fallback = 0.05
+        return self.security_to_tick_size.get(str(security_id), fallback)
 
     def exchange_segment_for_symbol(self, symbol: str, dhan: Any) -> Any:
         normalized = norm_symbol(symbol)

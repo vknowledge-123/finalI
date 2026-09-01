@@ -32,6 +32,10 @@ class IntegrationTests(unittest.TestCase):
         r = self.client.get("/dashboard")
         self.assertEqual(r.status_code, 200)
         self.assertIn("AlgoEdge", r.text)
+        self.assertIn("आज की loss limit खत्म हो गई है। Laptop बंद कर।", r.text)
+        self.assertIn("BROKER CONNECTED", r.text)
+        self.assertNotIn("IoneAlgo", r.text)
+        self.assertNotIn("DHAN CONNECTED", r.text)
         self.assertIn('id="webhook_url"', r.text)
         self.assertIn('id="cfg_strategy_mode"', r.text)
         self.assertIn('id="cfg_order_timeout"', r.text)
@@ -73,6 +77,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn('id="dhan_api_key"', r.text)
         self.assertIn('id="dhan_api_secret"', r.text)
         self.assertIn('id="dhan_redirect_url"', r.text)
+        self.assertIn("const displayName = c.alert_name_raw || c.alert_name || name;", r.text)
 
     def test_broker_config_supports_dhan_and_zerodha(self) -> None:
         missing = self.client.post(
@@ -102,6 +107,15 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(restored.json()["broker"], "ZERODHA")
 
     def test_dhan_api_key_auth_generates_and_consumes_access_token(self) -> None:
+        self.assertEqual(
+            main_module._normalise_dhan_auth_base_url("https://partner-login.dhan.co"),
+            "https://auth.dhan.co",
+        )
+        self.assertEqual(
+            main_module._dhan_auth_login_url("test-consent-app-id"),
+            "https://auth.dhan.co/login/consentApp-login?consentAppId=test-consent-app-id",
+        )
+
         saved = self.client.post(
             "/api/broker-config",
             json={
@@ -232,6 +246,45 @@ class IntegrationTests(unittest.TestCase):
         ]:
             self.assertIn(name, body["services"])
 
+    def test_sector_cache_accepts_get_and_post(self) -> None:
+        get_response = self.client.get("/api/sectors/cache", params={"user_id": 1})
+        self.assertEqual(get_response.status_code, 200)
+        get_body = get_response.json()
+        self.assertIn("sectors", get_body)
+        self.assertIn("ready", get_body)
+        self.assertIn("reason", get_body)
+
+        post_response = self.client.post("/api/sectors/cache", json={"user_id": 1})
+        self.assertEqual(post_response.status_code, 200)
+        post_body = post_response.json()
+        self.assertIn("sectors", post_body)
+        self.assertIn("ready", post_body)
+        self.assertIn("reason", post_body)
+
+    def test_sector_routes_return_json_without_lifespan_context(self) -> None:
+        old_store = main_module.store
+        old_auth_service = main_module.auth_service
+        old_service_runtime = main_module.SERVICE_RUNTIME
+        old_engine = dict(main_module.ENGINE)
+        try:
+            main_module.store = None
+            main_module.auth_service = None
+            main_module.SERVICE_RUNTIME = None
+            main_module.ENGINE.clear()
+
+            client = TestClient(app)
+            response = client.get("/api/sectors/top", params={"user_id": 1, "limit": 3})
+
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("application/json", response.headers.get("content-type", ""))
+            self.assertEqual(response.json()["reason"], "SECTOR_RANK_NOT_READY")
+        finally:
+            main_module.store = old_store
+            main_module.auth_service = old_auth_service
+            main_module.SERVICE_RUNTIME = old_service_runtime
+            main_module.ENGINE.clear()
+            main_module.ENGINE.update(old_engine)
+
     def test_four_server_service_entrypoints_import(self) -> None:
         import app.alert_service
         import app.execution_service
@@ -294,6 +347,73 @@ class IntegrationTests(unittest.TestCase):
 
         listed = self.client.get("/api/alert-config", params={"user_id": 1}).json()["configs"]
         self.assertIn("sniper test", listed)
+
+    def test_classic_risk_toggles_are_saved(self) -> None:
+        payload = {
+            "user_id": 1,
+            "alert_name": "CLASSIC_RISK_TOGGLES",
+            "enabled": True,
+            "direction": "LONG",
+            "product": "MIS",
+            "strategy_mode": "CLASSIC",
+            "target_pct": 2.0,
+            "stop_loss_pct": 0.6,
+            "trailing_sl_enabled": False,
+            "trailing_sl_pct": 1.0,
+            "cost_sl_enabled": True,
+            "cost_sl_rr": 2.0,
+        }
+        r = self.client.post("/api/alert-config", json=payload)
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body["status"], "saved")
+        self.assertEqual(body["config"]["trailing_sl_enabled"], False)
+        self.assertEqual(body["config"]["cost_sl_enabled"], True)
+        self.assertEqual(body["config"]["cost_sl_rr"], 2.0)
+
+        listed = self.client.get("/api/alert-config", params={"user_id": 1}).json()["configs"]
+        cfg = listed["classic risk toggles"]
+        self.assertEqual(cfg["trailing_sl_enabled"], False)
+        self.assertEqual(cfg["cost_sl_enabled"], True)
+        self.assertEqual(cfg["cost_sl_rr"], 2.0)
+
+    def test_alert_config_preserves_raw_name_and_blocks_real_collision(self) -> None:
+        payload = {
+            "user_id": 1,
+            "alert_name": "5,8,13 ema d/w algo dhan r.",
+            "enabled": True,
+            "direction": "LONG",
+            "product": "CNC",
+            "strategy_mode": "CLASSIC",
+            "target_pct": 12.0,
+            "stop_loss_pct": 3.5,
+            "trailing_sl_pct": 2.0,
+        }
+        created = self.client.post("/api/alert-config", json=payload)
+        self.assertEqual(created.status_code, 200)
+        self.assertEqual(created.json()["status"], "saved")
+
+        listed = self.client.get("/api/alert-config", params={"user_id": 1}).json()["configs"]
+        cfg = listed["5,8,13 ema d/w algo dhan r."]
+        self.assertEqual(cfg["alert_name_raw"], "5,8,13 ema d/w algo dhan r.")
+
+        edited = dict(payload)
+        edited["target_pct"] = 13.0
+        saved = self.client.post("/api/alert-config", json=edited)
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(saved.json()["status"], "saved")
+
+        first = dict(payload)
+        first["alert_name"] = "COLLISION_TEST"
+        saved_first = self.client.post("/api/alert-config", json=first)
+        self.assertEqual(saved_first.status_code, 200)
+        self.assertEqual(saved_first.json()["status"], "saved")
+
+        collision = dict(first)
+        collision["alert_name"] = "COLLISION-TEST"
+        blocked = self.client.post("/api/alert-config", json=collision)
+        self.assertEqual(blocked.status_code, 200)
+        self.assertEqual(blocked.json()["error"], "ALERT_NAME_COLLISION")
 
     def test_precision_sniper_rejects_invalid_targets(self) -> None:
         r = self.client.post(

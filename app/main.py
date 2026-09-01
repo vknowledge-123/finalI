@@ -8,6 +8,7 @@ import pytz
 import datetime
 import subprocess
 import sys
+from urllib.parse import urlparse
 
 from typing import Any, Dict, List, Optional, Set, Tuple
 import httpx
@@ -149,8 +150,30 @@ if _SUPPRESS_MW:
 # -----------------------------
 # Config
 # -----------------------------
+OFFICIAL_DHAN_AUTH_BASE_URL = "https://auth.dhan.co"
+
+
+def _normalise_dhan_auth_base_url(raw: str | None) -> str:
+    """
+    Dhan individual API-key auth must start from auth.dhan.co.
+    The login page may internally redirect to Dhan-owned UI hosts, but the app
+    should never generate partner-login URLs from configuration.
+    """
+    value = (raw or OFFICIAL_DHAN_AUTH_BASE_URL).strip().rstrip("/")
+    if not value:
+        return OFFICIAL_DHAN_AUTH_BASE_URL
+    if "://" not in value:
+        value = f"https://{value}"
+    parsed = urlparse(value)
+    scheme = parsed.scheme.lower() if parsed.scheme else "https"
+    host = parsed.netloc.lower()
+    if scheme != "https" or host != "auth.dhan.co":
+        return OFFICIAL_DHAN_AUTH_BASE_URL
+    return f"{scheme}://{host}"
+
+
 REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
-DHAN_AUTH_BASE_URL = (os.getenv("DHAN_AUTH_BASE_URL") or "https://auth.dhan.co").rstrip("/")
+DHAN_AUTH_BASE_URL = _normalise_dhan_auth_base_url(os.getenv("DHAN_AUTH_BASE_URL"))
 ENABLE_SERVICE_RESTART = (os.getenv("ENABLE_SERVICE_RESTART") or "").strip().lower() in {"1", "true", "yes", "on"}
 SERVICE_RESTART_TOKEN = (os.getenv("SERVICE_RESTART_TOKEN") or "").strip()
 TRADING_SYSTEMD_UNIT = (os.getenv("TRADING_SYSTEMD_UNIT") or "trading").strip()
@@ -248,6 +271,41 @@ ENGINE: Dict[int, TradeEngine] = {}
 SERVICE_RUNTIME: Optional[ServiceRuntime] = None
 DAILY_DASHBOARD_CLEANUP_TASK: Optional[asyncio.Task] = None
 _LAST_DASHBOARD_CLEANUP_YMD: str = ""
+
+
+async def ensure_store_ready():
+    """
+    Lazily initialize storage for tests and direct app clients that do not run
+    FastAPI lifespan startup. Normal uvicorn startup still initializes this first.
+    """
+    global encryption_manager, store, auth_service
+    if store is not None:
+        return store
+
+    if _is_test_mode():
+        from .memory_store import InMemoryStore
+
+        store = InMemoryStore()
+    else:
+        if ENCRYPTION_AVAILABLE and encryption_manager is None:
+            try:
+                encryption_manager = init_encryption()
+            except Exception as exc:
+                print(f"⚠️  Encryption initialization failed: {exc}")
+                encryption_manager = None
+        store = RedisStore(REDIS_URL, encryption_manager)
+        if not await store.ping():
+            raise RuntimeError(f"Redis is not reachable at {REDIS_URL}")
+        await store.init_scripts()
+
+    auth_service = AuthService(store)
+    return store
+
+
+@app.middleware("http")
+async def ensure_app_state_middleware(request: Request, call_next):
+    await ensure_store_ready()
+    return await call_next(request)
 
 # -----------------------------
 # KiteTicker globals (single ticker)
@@ -508,14 +566,15 @@ async def is_session_valid(user_id: int) -> bool:
     """
     Dashboard polls every 5s. Cache validity for short TTL.
     """
+    app_store = await ensure_store_ready()
     now = time.time()
     cached = _SESSION_CACHE.get(user_id)
     if cached and (now - float(cached.get("ts", 0.0)) < _SESSION_CACHE_TTL):
         return bool(cached.get("ok", False))
 
-    broker = await store.load_broker(user_id)
+    broker = await app_store.load_broker(user_id)
     if broker == "DHAN":
-        creds = await store.load_dhan_credentials(user_id)
+        creds = await app_store.load_dhan_credentials(user_id)
         client_id = str(creds.get("client_id") or "").strip()
         access_token = str(creds.get("access_token") or "").strip()
         if not client_id or not access_token:
@@ -531,8 +590,8 @@ async def is_session_valid(user_id: int) -> bool:
             _SESSION_CACHE[user_id] = {"ok": False, "ts": now, "broker": broker}
             return False
 
-    creds = await store.load_credentials(user_id)
-    at = (await store.load_access_token(user_id)).strip()
+    creds = await app_store.load_credentials(user_id)
+    at = (await app_store.load_access_token(user_id)).strip()
     api_key = (creds.get("api_key") or "").strip()
 
     if not api_key or not at:
@@ -557,17 +616,18 @@ async def is_session_valid(user_id: int) -> bool:
 #     return ENGINE[user_id]
 async def ensure_engine(user_id: int) -> TradeEngine:
     user_id = int(user_id)
+    app_store = await ensure_store_ready()
     if user_id not in ENGINE:
         ENGINE[user_id] = TradeEngine(
             user_id=user_id,
-            store=store,
+            store=app_store,
             broadcast_cb=ws_mgr.broadcast_nowait,
             token_resolver=lambda symbol: SYMBOL_TOKEN.get(_sym_safe(symbol)),
             token_ready_cb=_ensure_token_map_ready,
         )
         await ENGINE[user_id].configure_kite()
         try:
-            cache = await store.load_sector_cache(user_id)
+            cache = await app_store.load_sector_cache(user_id)
             if cache:
                 ENGINE[user_id].load_sector_cache(cache)
         except Exception:
@@ -584,6 +644,7 @@ async def ensure_engine(user_id: int) -> TradeEngine:
 
 async def ensure_service_runtime() -> ServiceRuntime:
     global SERVICE_RUNTIME
+    await ensure_store_ready()
     if SERVICE_RUNTIME is None:
         SERVICE_RUNTIME = ServiceRuntime(
             store_provider=lambda: store,
@@ -790,7 +851,8 @@ async def subscribe_dhan_sector_indices_for_user(user_id: int) -> None:
 
 
 async def load_sector_cache_for_user(user_id: int) -> Dict[str, Any]:
-    cache = await store.load_sector_cache(int(user_id))
+    app_store = await ensure_store_ready()
+    cache = await app_store.load_sector_cache(int(user_id))
     if cache:
         eng = await ensure_engine(int(user_id))
         eng.load_sector_cache(cache)
@@ -799,10 +861,11 @@ async def load_sector_cache_for_user(user_id: int) -> Dict[str, Any]:
 
 async def fetch_and_cache_dhan_sector_data(user_id: int) -> Dict[str, Any]:
     user_id = int(user_id)
-    broker = await store.load_broker(user_id)
+    app_store = await ensure_store_ready()
+    broker = await app_store.load_broker(user_id)
     if broker != "DHAN":
         return {"ok": False, "error": "DHAN_BROKER_REQUIRED"}
-    creds = await store.load_dhan_credentials(user_id)
+    creds = await app_store.load_dhan_credentials(user_id)
     client_id = str(creds.get("client_id") or "").strip()
     access_token = str(creds.get("access_token") or "").strip()
     if not client_id or not access_token:
@@ -824,6 +887,7 @@ async def fetch_and_cache_dhan_sector_data(user_id: int) -> Dict[str, Any]:
 
     rows: List[Dict[str, Any]] = []
     ok_count = 0
+    rank_ready_count = 0
     for sector, item in SECTOR_INDEX_INSTRUMENTS.items():
         security_id = str(item["security_id"])
         values = _sector_quote_values(response, security_id)
@@ -831,8 +895,11 @@ async def fetch_and_cache_dhan_sector_data(user_id: int) -> Dict[str, Any]:
         prev_close = float(values.get("prev_close") or 0.0)
         pct = float(values.get("pct") or 0.0)
         ok = ltp > 0 and prev_close > 0
+        rank_ready = ok and abs(ltp - prev_close) > 0.0001
         if ok:
             ok_count += 1
+        if rank_ready:
+            rank_ready_count += 1
         rows.append(
             {
                 "name": sector,
@@ -843,6 +910,7 @@ async def fetch_and_cache_dhan_sector_data(user_id: int) -> Dict[str, Any]:
                 "prev_close": prev_close,
                 "pct": pct,
                 "ok": ok,
+                "rank_ready": rank_ready,
             }
         )
 
@@ -853,10 +921,12 @@ async def fetch_and_cache_dhan_sector_data(user_id: int) -> Dict[str, Any]:
         "trading_day": now_ist_date(),
         "cached_at": now_ist().isoformat(),
         "ok_count": ok_count,
+        "rank_ready_count": rank_ready_count,
+        "rank_ready": rank_ready_count > 0,
         "total": len(rows),
         "sectors": rows,
     }
-    await store.save_sector_cache(user_id, payload)
+    await app_store.save_sector_cache(user_id, payload)
     eng = await ensure_engine(user_id)
     eng.load_sector_cache(payload)
     await subscribe_dhan_sector_indices_for_user(user_id)
@@ -1981,6 +2051,21 @@ async def save_alert_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": "PYRAMID_SETTINGS_INVALID"}
     if pyramid_enabled and pyramid_max < 1:
         return {"error": "PYRAMID_SETTINGS_INVALID"}
+    try:
+        target_pct = float(payload.get("target_pct") or 0.0)
+        stop_loss_pct = float(payload.get("stop_loss_pct") or 0.0)
+        trailing_sl_pct = float(payload.get("trailing_sl_pct") or 0.0)
+        cost_sl_rr = float(payload.get("cost_sl_rr") or 2.0)
+    except Exception:
+        return {"error": "RISK_SETTINGS_INVALID"}
+    trailing_sl_enabled = str(payload.get("trailing_sl_enabled", "true")).lower() in {"1", "true", "yes", "on"}
+    cost_sl_enabled = str(payload.get("cost_sl_enabled", "false")).lower() in {"1", "true", "yes", "on"}
+    if not (0.0 <= target_pct <= 100.0 and 0.0 <= stop_loss_pct <= 100.0 and 0.0 <= trailing_sl_pct <= 100.0):
+        return {"error": "RISK_SETTINGS_INVALID"}
+    if not (0.1 <= cost_sl_rr <= 20.0):
+        return {"error": "RISK_SETTINGS_INVALID"}
+    if cost_sl_enabled and stop_loss_pct <= 0:
+        return {"error": "COST_SL_REQUIRES_STOP_LOSS"}
     if strategy_mode == "PRECISION_SNIPER":
         custom_error = validate_custom_config(payload)
         if custom_error:
@@ -2029,6 +2114,12 @@ async def save_alert_config(payload: Dict[str, Any]) -> Dict[str, Any]:
     payload2["alert_name_raw"] = str(raw_name)
     payload2["strategy_mode"] = strategy_mode
     payload2["order_limit_buffer_pct"] = order_buffer
+    payload2["target_pct"] = target_pct
+    payload2["stop_loss_pct"] = stop_loss_pct
+    payload2["trailing_sl_pct"] = trailing_sl_pct
+    payload2["trailing_sl_enabled"] = trailing_sl_enabled
+    payload2["cost_sl_enabled"] = cost_sl_enabled
+    payload2["cost_sl_rr"] = cost_sl_rr
 
     await store.save_alert_config(user_id, payload2)
     
@@ -2316,7 +2407,11 @@ async def get_top_sectors(user_id: int = Query(..., alias="user_id"), limit: int
     
     # Format for display: [{"name": "NIFTY AUTO", "pct": 1.23}, ...]
     top = [{"name": r[0], "pct": r[1]} for r in ranks[:limit]]
-    return {"sectors": top}
+    return {
+        "ready": bool(top),
+        "reason": "" if top else "SECTOR_RANK_NOT_READY",
+        "sectors": top,
+    }
 
 
 @app.get("/api/sectors/cache")
@@ -2325,11 +2420,20 @@ async def get_sector_cache_api(user_id: int = 1) -> Dict[str, Any]:
     cache = await load_sector_cache_for_user(user_id)
     eng = await ensure_engine(user_id)
     ranks = eng.get_sector_rank()
+    ranked = [{"name": sec, "pct": pct} for sec, pct in ranks]
     return {
         "ok": bool(cache),
         "cache": cache,
-        "sectors": [{"name": sec, "pct": pct} for sec, pct in ranks],
+        "ready": bool(ranked),
+        "reason": "" if ranked else "SECTOR_RANK_NOT_READY",
+        "sectors": ranked,
     }
+
+
+@app.post("/api/sectors/cache")
+async def post_sector_cache_api(payload: Dict[str, Any]) -> Dict[str, Any]:
+    user_id = int(payload.get("user_id", 1))
+    return await get_sector_cache_api(user_id=user_id)
 
 
 @app.post("/api/sectors/cache-dhan")

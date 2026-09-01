@@ -879,12 +879,12 @@
           </div>
           <div class="flex items-center gap-2">
             <div class="flex flex-col">
-              <span class="brand-title text-2xl font-bold font-serif text-white tracking-tight leading-none font-[Outfit]">
-                IoneAlgo
+              <span class="brand-title text-sm sm:text-base font-bold text-white tracking-normal leading-tight font-[Outfit] max-w-[260px] sm:max-w-none">
+                आज की loss limit खत्म हो गई है। Laptop बंद कर।
               </span>
-              <span
-                class="brand-sub text-[10px] font-bold text-cyan-400 tracking-[0.2em] leading-none mt-0.5">PRO
-                TERMINAL</span>
+              <span class="brand-sub text-[10px] sm:text-xs font-bold text-cyan-400 tracking-normal leading-tight mt-0.5">
+                Overtrade मत कर। Target या Stop Loss — बस, और कुछ नहीं।
+              </span>
             </div>
 
             <!-- Mobile: 3-line toggle next to brand -->
@@ -1607,7 +1607,7 @@
           <!-- Classic Risk Management -->
           <div id="classicRiskPanel" class="col-span-2 border-t border-white/5 pt-2 mt-1">
             <h4 class="text-xs font-bold text-white mb-2">Risk Management</h4>
-            <div class="grid grid-cols-3 gap-2">
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-2">
               <div>
                 <label class="block text-xs font-semibold text-emerald-400 uppercase mb-1.5">Target %</label>
                 <input id="cfg_tgt" type="number" step="0.1" class="input-field">
@@ -1617,18 +1617,38 @@
                 <input id="cfg_sl" type="number" step="0.1" class="input-field">
               </div>
               <div>
+                <label class="block text-xs font-semibold text-slate-400 uppercase mb-1.5">Trailing SL</label>
+                <select id="cfg_tsl_on" class="input-field">
+                  <option value="true">On</option>
+                  <option value="false">Off</option>
+                </select>
+              </div>
+              <div>
                 <label class="block text-xs font-semibold text-blue-400 uppercase mb-1.5">Trailing SL %</label>
                 <input id="cfg_tsl" type="number" step="0.1" class="input-field">
               </div>
             </div>
-            <div class="mt-2">
-              <label class="block text-xs font-semibold text-slate-400 uppercase mb-1.5">TSL Mode</label>
-              <select id="cfg_tsl_stepwise" class="input-field">
-                <option value="false">Continuous Trailing</option>
-                <option value="true">Step-wise Trailing</option>
-              </select>
-              <p class="text-[10px] text-slate-500 mt-1">If step-wise is ON: for every TSL% move from entry, SL trails once.</p>
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-2 mt-2">
+              <div>
+                <label class="block text-xs font-semibold text-slate-400 uppercase mb-1.5">TSL Mode</label>
+                <select id="cfg_tsl_stepwise" class="input-field">
+                  <option value="false">Continuous Trailing</option>
+                  <option value="true">Step-wise Trailing</option>
+                </select>
+              </div>
+              <div>
+                <label class="block text-xs font-semibold text-slate-400 uppercase mb-1.5">Cost SL</label>
+                <select id="cfg_cost_sl_on" class="input-field">
+                  <option value="false">Off</option>
+                  <option value="true">On</option>
+                </select>
+              </div>
+              <div>
+                <label class="block text-xs font-semibold text-slate-400 uppercase mb-1.5">Cost SL RR</label>
+                <input id="cfg_cost_sl_rr" type="number" min="0.1" max="20" step="0.1" class="input-field" value="2">
+              </div>
             </div>
+            <p class="text-[10px] text-slate-500 mt-1">Cost SL moves SL to entry after price moves by Stop Loss % x RR in your favour. Example: SL 0.6% and RR 2 moves SL to cost after 1.2% profit.</p>
           </div>
 
           <!-- Precision Sniper -->
@@ -2082,7 +2102,14 @@
         const cont = document.getElementById("topSecContainer");
         const list = document.getElementById("topSecList");
 
-        if (d.sectors && d.sectors.length > 0) {
+        if (d.ready === false) {
+          cont.classList.remove("hidden");
+          list.innerHTML = `
+                    <div class="px-2 py-1 rounded bg-amber-500/10 border border-amber-500/30 text-amber-200 font-bold">
+                        Sector rank not ready
+                    </div>
+                `;
+        } else if (d.sectors && d.sectors.length > 0) {
           cont.classList.remove("hidden");
           list.innerHTML = d.sectors.map((s, i) => `
                     <div class="px-2 py-1 rounded bg-slate-800 border border-slate-700 flex items-center gap-2">
@@ -2102,9 +2129,14 @@
       if (!badge) return;
       const okCount = Number(cache && cache.ok_count || 0);
       const total = Number(cache && cache.total || 0);
+      const rankReadyCount = Number(cache && cache.rank_ready_count || 0);
       if (okCount > 0) {
-        badge.textContent = `Sectors: ${okCount}/${total || okCount} Cached`;
-        badge.className = "badge bg-cyan-500/10 text-cyan-200 border-cyan-500/30 px-2.5 py-1 text-[10px] font-bold";
+        badge.textContent = rankReadyCount > 0
+          ? `Sectors: ${rankReadyCount}/${total || okCount} Ranked`
+          : `Sectors: ${okCount}/${total || okCount} Cached, Rank Not Ready`;
+        badge.className = rankReadyCount > 0
+          ? "badge bg-cyan-500/10 text-cyan-200 border-cyan-500/30 px-2.5 py-1 text-[10px] font-bold"
+          : "badge bg-amber-500/10 text-amber-200 border-amber-500/30 px-2.5 py-1 text-[10px] font-bold";
       } else {
         badge.textContent = "Sectors: Not Cached";
         badge.className = "badge bg-slate-500/10 text-slate-300 border-slate-500/20 px-2.5 py-1 text-[10px] font-bold";
@@ -2137,7 +2169,10 @@
         if (!d.ok) throw new Error(d.detail || d.error || "Sector cache failed");
         renderSectorCacheBadge(d);
         await fetchTopSectors();
-        toast(`Cached ${d.ok_count}/${d.total} Dhan sectors`);
+        const rankReadyCount = Number(d.rank_ready_count || 0);
+        toast(rankReadyCount > 0
+          ? `Ranked ${rankReadyCount}/${d.total} Dhan sectors`
+          : `Cached ${d.ok_count}/${d.total} Dhan sectors. Rank waits for live ticks.`);
       } catch (e) {
         toast((e && e.message) ? e.message : String(e), "error");
       } finally {
@@ -2246,9 +2281,8 @@
       try {
         const resp = await fetch(`/api/broker-status?user_id=${USER_ID}`);
         const r = await readJsonResponse(resp);
-        const brokerLabel = r.broker === "DHAN" ? "DHAN" : "KITE";
         if (r.connected) {
-        const label = r.ticker_connected ? `${brokerLabel} CONNECTED` : `${brokerLabel} AUTH OK`;
+        const label = r.ticker_connected ? "BROKER CONNECTED" : "BROKER AUTH OK";
         el.innerHTML = `<span class="w-1.5 h-1.5 rounded-full bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.6)] inline-block mr-1.5"></span> ${label}`;
           el.className = "px-3 py-1.5 rounded-full text-[10px] font-bold uppercase tracking-wider bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 shadow-[0_0_10px_rgba(16,185,129,0.2)] transition-all";
         } else {
@@ -2457,8 +2491,9 @@
               <span>Engine: <span class="text-cyan-300">${c.strategy_mode === 'PRECISION_SNIPER' ? `SNIPER ${c.strategy_timeframe_minutes || 5}M` : c.strategy_mode === 'GMMA_OBV' ? `GMMA OBV ${c.strategy_timeframe_minutes || 5}M` : c.strategy_mode === 'GMMA_GOLD_CROSS' ? `GMMA GC ${c.strategy_timeframe_minutes || 5}M` : c.strategy_mode === 'LIQUIDITY_SWEEP' ? `LIQ SWEEP ${c.strategy_timeframe_minutes || 5}M` : c.strategy_mode === 'PURE_LIQUIDITY_SWEEP' ? `PURE LIQ ${c.strategy_timeframe_minutes || 5}M` : c.strategy_mode === 'GVK_TREND' ? `GVK ${c.strategy_timeframe_minutes || 5}M` : 'CLASSIC'}</span></span>
               <span>Target: <span class="text-white">${c.target_pct}%</span></span>
               <span>SL: <span class="text-rose-300">${c.stop_loss_pct}%</span></span>
-              <span>TSL: <span class="text-blue-300">${c.trailing_sl_pct}%</span></span>
+              <span>TSL: <span class="text-blue-300">${c.trailing_sl_enabled === false ? 'OFF' : `${c.trailing_sl_pct}%`}</span></span>
               <span>Mode: <span class="text-slate-200">${c.tsl_stepwise ? 'STEP' : 'CONT'}</span></span>
+              ${c.cost_sl_enabled ? `<span>Cost SL: <span class="text-emerald-300">1:${c.cost_sl_rr ?? 2}</span></span>` : ''}
               <span>Limit: <span class="text-yellow-200">${c.trade_limit_per_day}/day</span></span>
               ${c.pyramid_enabled ? `<span>Pyramid: <span class="text-fuchsia-300">${c.pyramid_step_pct ?? 0.8}% x ${c.pyramid_max_adds ?? 3}</span></span>` : ''}
               ${c.custom_partial_profit_enabled ? `<span>Partial: <span class="text-emerald-300">${c.custom_partial_tp1_pct ?? 50}%/${c.custom_partial_tp2_pct ?? 25}%/${c.custom_partial_tp3_pct ?? 25}%</span></span>` : ''}
@@ -2496,11 +2531,17 @@
       if (!c) return;
 
       // Populate fields
+      const displayName = c.alert_name_raw || c.alert_name || name;
       const sets = {
-        "cfg_alert": name, "cfg_enabled": String(!!c.enabled), "cfg_dir": c.direction,
+        "cfg_alert": displayName, "cfg_enabled": String(!!c.enabled), "cfg_dir": c.direction,
         "cfg_prod": c.product, "cfg_qtymode": c.qty_mode, "cfg_cap": c.capital,
         "cfg_qty": c.qty, "cfg_tgt": c.target_pct, "cfg_sl": c.stop_loss_pct,
-        "cfg_tsl": c.trailing_sl_pct, "cfg_tsl_stepwise": String(!!c.tsl_stepwise), "cfg_limit": c.trade_limit_per_day,
+        "cfg_tsl_on": String(c.trailing_sl_enabled !== false),
+        "cfg_tsl": c.trailing_sl_pct,
+        "cfg_tsl_stepwise": String(!!c.tsl_stepwise),
+        "cfg_cost_sl_on": String(!!c.cost_sl_enabled),
+        "cfg_cost_sl_rr": c.cost_sl_rr ?? 2,
+        "cfg_limit": c.trade_limit_per_day,
         "cfg_sector_on": String(!!c.sector_filter_on), "cfg_topn": c.top_n_sector,
         "cfg_entry_start": c.entry_start_time || "09:15",
         "cfg_entry_end": c.entry_end_time || "15:15",
@@ -2640,8 +2681,11 @@
         qty: parseInt(document.getElementById("cfg_qty").value || 1),
         target_pct: parseFloat(document.getElementById("cfg_tgt").value || 0),
         stop_loss_pct: parseFloat(document.getElementById("cfg_sl").value || 0),
+        trailing_sl_enabled: document.getElementById("cfg_tsl_on").value === "true",
         trailing_sl_pct: parseFloat(document.getElementById("cfg_tsl").value || 0),
         tsl_stepwise: document.getElementById("cfg_tsl_stepwise").value === "true",
+        cost_sl_enabled: document.getElementById("cfg_cost_sl_on").value === "true",
+        cost_sl_rr: parseFloat(document.getElementById("cfg_cost_sl_rr").value || 2),
         trade_limit_per_day: parseInt(document.getElementById("cfg_limit").value || 0),
         sector_filter_on: document.getElementById("cfg_sector_on").value === "true",
         top_n_sector: parseInt(document.getElementById("cfg_topn").value || 0),
@@ -3446,12 +3490,14 @@
           if (p) {
             let tslPrice = 0.0;
             const tslPct = Number(p.tsl_pct || 0);
-            if (tslPct > 0 && Number(p.trail_price || 0) > 0) {
+            const classicTslEnabled = p.trailing_sl_enabled !== false;
+            const isCustomRisk = p.strategy_mode === 'PRECISION_SNIPER' || p.strategy_mode === 'GMMA_OBV' || p.strategy_mode === 'GMMA_GOLD_CROSS' || p.strategy_mode === 'LIQUIDITY_SWEEP' || p.strategy_mode === 'PURE_LIQUIDITY_SWEEP' || p.strategy_mode === 'GVK_TREND';
+            if (classicTslEnabled && tslPct > 0 && Number(p.trail_price || 0) > 0) {
               tslPrice = Number(p.trail_price || 0);
-            } else if (p.strategy_mode === 'PRECISION_SNIPER' || p.strategy_mode === 'GMMA_OBV' || p.strategy_mode === 'GMMA_GOLD_CROSS' || p.strategy_mode === 'LIQUIDITY_SWEEP' || p.strategy_mode === 'PURE_LIQUIDITY_SWEEP' || p.strategy_mode === 'GVK_TREND') {
+            } else if (isCustomRisk) {
               tslPrice = Number(p.trail_price || p.sl_price || 0);
             }
-            if (tslPrice <= 0 && tslPct > 0) {
+            if (classicTslEnabled && tslPrice <= 0 && tslPct > 0) {
               const stepwise = !!p.tsl_stepwise;
               const entryPx = Number(p.entry_price || 0);
               if (p.side === 'BUY' && Number(p.highest || 0) > 0) {
@@ -3743,18 +3789,19 @@
             if (p) {
               let tslPrice = 0.0;
               const tslPct = Number(p.tsl_pct || 0);
+              const tslEnabled = p.trailing_sl_enabled !== false;
               const previousTrail = Number(p.trail_price || 0);
               // Update high/low locally for immediate TSL feedback
               if (p.side === 'BUY') {
                 p.highest = Math.max(Number(p.highest || 0), Number(d.ltp));
-                if (tslPct > 0 && p.highest > 0) {
+                if (tslEnabled && tslPct > 0 && p.highest > 0) {
                   const computedTrail = p.highest * (1.0 - tslPct / 100.0);
                   tslPrice = previousTrail > 0 ? Math.max(previousTrail, computedTrail) : computedTrail;
                   p.trail_price = tslPrice;
                 }
               } else if (p.side === 'SELL') {
                 p.lowest = (Number(p.lowest) === 0 ? Number(d.ltp) : Math.min(Number(p.lowest), Number(d.ltp)));
-                if (tslPct > 0 && p.lowest > 0) {
+                if (tslEnabled && tslPct > 0 && p.lowest > 0) {
                   const computedTrail = p.lowest * (1.0 + tslPct / 100.0);
                   tslPrice = previousTrail > 0 ? Math.min(previousTrail, computedTrail) : computedTrail;
                   p.trail_price = tslPrice;
@@ -3764,6 +3811,8 @@
               if (tslPrice > 0) {
                 const tslVal = tslPrice.toFixed(2);
                 document.querySelectorAll(`.atsl-${sid}`).forEach(el => el.innerText = tslVal);
+              } else if (!tslEnabled) {
+                document.querySelectorAll(`.atsl-${sid}`).forEach(el => el.innerText = '--');
               }
             }
 
