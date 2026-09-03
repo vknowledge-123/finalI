@@ -964,8 +964,10 @@
               </svg>
             </button>
 
-            <!-- Logout Tile -->
-            <!-- Logout removed -->
+            <button onclick="adminLogout()" title="Logout"
+              class="p-2 rounded-lg bg-white/5 hover:bg-rose-500/20 text-slate-400 hover:text-rose-300 border border-white/5 hover:border-rose-500/30 transition-all duration-300">
+              <i class="fa-solid fa-right-from-bracket"></i>
+            </button>
           </div>
         </div>
       </div>
@@ -1969,8 +1971,7 @@
   <script>
     const USER_ID = "{{USER_ID}}";
 
-    /* ================= AUTHENTICATION REMOVED (Cloudflare Zero Trust) ================= */
-    // Logic removed to prevent redirects to /login
+    /* ================= ADMIN SESSION ================= */
 
     /* ================= UI HELPERS ================= */
     function toast(msg, type = 'success') {
@@ -1994,6 +1995,10 @@
       }, 3000);
     }
 
+    function redirectToAdminLogin() {
+      window.location.href = "/auth";
+    }
+
     async function readJsonResponse(response) {
       const text = await response.text();
       let data = {};
@@ -2003,6 +2008,10 @@
         } catch (_) {
           throw new Error(text.slice(0, 180) || `HTTP ${response.status}`);
         }
+      }
+      if (response.status === 401 && (data.error === "ADMIN_AUTH_REQUIRED" || data.detail === "ADMIN_AUTH_REQUIRED")) {
+        redirectToAdminLogin();
+        throw new Error("Admin login required");
       }
       if (!response.ok) {
         throw new Error(data.detail || data.message || data.error || `HTTP ${response.status}`);
@@ -2187,14 +2196,21 @@
     document.getElementById("cfg_topn").addEventListener("keyup", fetchTopSectors);
 
     function closeCfg() { document.getElementById("cfgModal").classList.add("hidden"); }
-    function openCfg() {
+    async function openCfg() {
       document.getElementById("cfgModal").classList.remove("hidden");
 
       // Populate Webhook URL
       const proto = location.protocol;
       const host = location.host;
-      const url = `${proto}//${host}/webhook/chartink?user_id=${USER_ID}`;
+      let url = `${proto}//${host}/webhook/chartink?user_id=${USER_ID}`;
       const el = document.getElementById("webhook_url");
+      try {
+        const resp = await fetch(`/api/webhook-url?user_id=${USER_ID}`);
+        const d = await readJsonResponse(resp);
+        if (d && d.url) url = d.url;
+      } catch (e) {
+        console.error("Failed to load webhook URL", e);
+      }
       if (el) el.value = url;
 
       loadCfgList();
@@ -2345,6 +2361,14 @@
         setTimeout(() => location.reload(), 2500);
       } catch (e) {
         toast((e && e.message) ? e.message : String(e), "error");
+      }
+    }
+
+    async function adminLogout() {
+      try {
+        await fetch("/auth/logout", { method: "POST" });
+      } finally {
+        window.location.href = "/auth";
       }
     }
 
@@ -3743,16 +3767,20 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path stroke-linecap="round" stroke-linejoin="round" d="M4.5 9a7.5 7.5 0 0115 0M7.5 12a4.5 4.5 0 019 0M10.5 15a1.5 1.5 0 013 0"></path>
           </svg>
-          WS Live`;
+          Dashboard WS Live`;
         el.className = "ws-pill ws-live";
       };
 
-      WS.onclose = () => {
+      WS.onclose = (ev) => {
+        if (ev && ev.code === 4401) {
+          redirectToAdminLogin();
+          return;
+        }
         el.innerHTML = `
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path stroke-linecap="round" stroke-linejoin="round" d="M4.5 9a7.5 7.5 0 0115 0M7.5 12a4.5 4.5 0 019 0M9 18l6-6M15 18l-6-6"></path>
           </svg>
-          WS Offline`;
+          Dashboard WS Offline`;
         el.className = "ws-pill ws-offline";
         setTimeout(startWS, 2000);
       };

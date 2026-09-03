@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import hmac
+import os
 import time
 import uuid
 from typing import Any, Dict
@@ -28,6 +30,7 @@ app.add_middleware(
 )
 
 store = None
+WEBHOOK_SECRET = (os.getenv("WEBHOOK_SECRET") or "").strip()
 
 
 def _json_error_response(
@@ -115,6 +118,13 @@ async def _read_payload(request: Request) -> Dict[str, Any]:
     return {}
 
 
+def _webhook_secret_valid(request: Request) -> bool:
+    if not WEBHOOK_SECRET:
+        return True
+    provided = str(request.query_params.get("secret") or request.headers.get("X-Webhook-Secret") or "").strip()
+    return bool(provided) and hmac.compare_digest(provided, WEBHOOK_SECRET)
+
+
 @app.on_event("startup")
 async def startup() -> None:
     global store
@@ -144,6 +154,8 @@ async def health() -> Dict[str, Any]:
 
 @app.api_route("/webhook/chartink", methods=["POST", "GET"])
 async def chartink_webhook(request: Request, user_id: int = 1) -> Dict[str, Any]:
+    if not _webhook_secret_valid(request):
+        raise HTTPException(status_code=401, detail="WEBHOOK_SECRET_INVALID")
     started = time.perf_counter()
     payload = await _read_payload(request)
     alert_name_raw, symbols_raw, ts = parse_chartink_payload(payload)

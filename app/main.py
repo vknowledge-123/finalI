@@ -2,7 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import hmac
+import io
 import os
+import re
+import secrets
 import time
 import pytz
 import datetime
@@ -181,6 +187,172 @@ SERVICE_RESTART_TOKEN = (os.getenv("SERVICE_RESTART_TOKEN") or "").strip()
 TRADING_SYSTEMD_UNIT = (os.getenv("TRADING_SYSTEMD_UNIT") or "trading").strip()
 TRADING_RESTART_CMD = (os.getenv("TRADING_RESTART_CMD") or f"systemctl restart --no-block {TRADING_SYSTEMD_UNIT}").strip()
 TRADING_RESTART_TIMEOUT_SEC = float((os.getenv("TRADING_RESTART_TIMEOUT_SEC") or "15").strip() or "15")
+ADMIN_SESSION_COOKIE = (os.getenv("ADMIN_SESSION_COOKIE") or "ashuchart_admin_session").strip()
+ADMIN_SESSION_TTL_SEC = int(float((os.getenv("ADMIN_SESSION_TTL_SEC") or "43200").strip() or "43200"))
+ADMIN_EMAIL = (os.getenv("ADMIN_EMAIL") or "").strip().lower()
+ADMIN_AUTH_ENABLED_RAW = (os.getenv("ADMIN_AUTH_ENABLED") or "1").strip().lower()
+WEBHOOK_SECRET = (os.getenv("WEBHOOK_SECRET") or "").strip()
+ADMIN_COOKIE_SECURE = (os.getenv("ADMIN_COOKIE_SECURE") or "").strip().lower()
+PASSWORD_MIN_LEN = 8
+ADMIN_LOGIN_LOCK_AFTER = int(float((os.getenv("ADMIN_LOGIN_LOCK_AFTER") or "8").strip() or "8"))
+
+
+def _admin_auth_enabled() -> bool:
+    if _is_test_mode():
+        return False
+    return ADMIN_AUTH_ENABLED_RAW not in {"0", "false", "no", "off"}
+
+
+def _admin_cookie_secure() -> bool:
+    if ADMIN_COOKIE_SECURE in {"1", "true", "yes", "on"}:
+        return True
+    if ADMIN_COOKIE_SECURE in {"0", "false", "no", "off"}:
+        return False
+    return str(os.getenv("PUBLIC_BASE_URL") or "").strip().lower().startswith("https://")
+
+
+def _hash_session_token(token: str) -> str:
+    return hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
+
+
+def _new_admin_session_token() -> str:
+    return secrets.token_urlsafe(48)
+
+
+def _normalise_admin_email(email: str) -> str:
+    return str(email or "").strip().lower()
+
+
+def _valid_email(email: str) -> bool:
+    return bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", _normalise_admin_email(email)))
+
+
+def _hash_password(password: str, *, iterations: int = 390000) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", str(password or "").encode("utf-8"), salt, int(iterations))
+    return "pbkdf2_sha256${}${}${}".format(
+        int(iterations),
+        base64.urlsafe_b64encode(salt).decode("ascii"),
+        base64.urlsafe_b64encode(digest).decode("ascii"),
+    )
+
+
+def _verify_password(password: str, password_hash: str) -> bool:
+    try:
+        algo, raw_iterations, raw_salt, raw_digest = str(password_hash or "").split("$", 3)
+        if algo != "pbkdf2_sha256":
+            return False
+        iterations = int(raw_iterations)
+        salt = base64.urlsafe_b64decode(raw_salt.encode("ascii"))
+        expected = base64.urlsafe_b64decode(raw_digest.encode("ascii"))
+        actual = hashlib.pbkdf2_hmac("sha256", str(password or "").encode("utf-8"), salt, iterations)
+        return hmac.compare_digest(actual, expected)
+    except Exception:
+        return False
+
+
+async def _load_admin() -> Dict[str, Any]:
+    fn = getattr(store, "load_admin_auth", None)
+    if not callable(fn):
+        return {}
+    return await fn()
+
+
+async def _load_admin_totp_secret() -> str:
+    fn = getattr(store, "load_admin_totp_secret", None)
+    if not callable(fn):
+        return ""
+    return str(await fn() or "").strip()
+
+
+async def _admin_totp_is_set() -> bool:
+    return bool(await _load_admin_totp_secret())
+
+
+def _admin_public_http_path(path: str) -> bool:
+    path = str(path or "")
+    return (
+        path == "/auth"
+        or path.startswith("/auth/")
+        or path.startswith("/static/")
+        or path.startswith("/webhook/")
+        or path in {"/favicon.ico", "/robots.txt"}
+    )
+
+
+async def _admin_session_from_request(request: Request) -> Dict[str, Any]:
+    return await _admin_session_from_token(request.cookies.get(ADMIN_SESSION_COOKIE, ""))
+
+
+async def _admin_session_from_token(token: str) -> Dict[str, Any]:
+    if not token:
+        return {}
+    fn = getattr(store, "load_admin_session", None)
+    if not callable(fn):
+        return {}
+    session = await fn(_hash_session_token(token))
+    admin = await _load_admin()
+    if not session or not admin:
+        return {}
+    if _normalise_admin_email(str(session.get("email") or "")) != _normalise_admin_email(str(admin.get("email") or "")):
+        return {}
+    return dict(session)
+
+
+def _webhook_secret_valid(request: Request) -> bool:
+    if not WEBHOOK_SECRET:
+        return True
+    provided = str(request.query_params.get("secret") or request.headers.get("X-Webhook-Secret") or "").strip()
+    return bool(provided) and hmac.compare_digest(provided, WEBHOOK_SECRET)
+
+
+def _public_base_url(request: Request) -> str:
+    configured = str(os.getenv("PUBLIC_BASE_URL") or "").strip().rstrip("/")
+    if configured:
+        return configured
+    return str(request.base_url).rstrip("/")
+
+
+async def _create_admin_session(email: str) -> str:
+    token = _new_admin_session_token()
+    fn = getattr(store, "save_admin_session", None)
+    if not callable(fn):
+        raise RuntimeError("ADMIN_SESSION_STORE_UNAVAILABLE")
+    await fn(_hash_session_token(token), _normalise_admin_email(email), ADMIN_SESSION_TTL_SEC)
+    return token
+
+
+async def _verify_admin_password(email: str, password: str) -> bool:
+    admin = await _load_admin()
+    stored_email = _normalise_admin_email(str(admin.get("email") or ""))
+    if not stored_email or _normalise_admin_email(email) != stored_email:
+        return False
+    return _verify_password(password, str(admin.get("password_hash") or ""))
+
+
+def _totp_uri(email: str, secret: str) -> str:
+    import pyotp
+
+    issuer = os.getenv("ADMIN_TOTP_ISSUER", "AshuChart")
+    return pyotp.TOTP(secret).provisioning_uri(name=_normalise_admin_email(email), issuer_name=issuer)
+
+
+def _totp_qr_data_url(uri: str) -> str:
+    import qrcode
+
+    img = qrcode.make(uri)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _verify_totp(secret: str, code: str) -> bool:
+    import pyotp
+
+    clean_code = re.sub(r"\D", "", str(code or ""))
+    if len(clean_code) != 6:
+        return False
+    return bool(pyotp.TOTP(secret).verify(clean_code, valid_window=1))
 
 
 def _is_test_mode() -> bool:
@@ -349,6 +521,12 @@ async def ensure_store_ready():
 @app.middleware("http")
 async def ensure_app_state_middleware(request: Request, call_next):
     await ensure_store_ready()
+    if _admin_auth_enabled() and not _admin_public_http_path(request.url.path):
+        session = await _admin_session_from_request(request)
+        if not session:
+            if request.url.path.startswith("/api/") or request.url.path.startswith("/ws/"):
+                return _json_error_response(request, 401, "ADMIN_AUTH_REQUIRED", "Admin login required")
+            return RedirectResponse(url="/auth", status_code=303)
     return await call_next(request)
 
 # -----------------------------
@@ -1692,14 +1870,288 @@ async def shutdown() -> None:
 # -----------------------------
 # Authentication Endpoints
 # -----------------------------
+def _admin_auth_html() -> str:
+    return """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Admin Login</title>
+  <style>
+    :root { color-scheme: dark; --bg:#102324; --panel:#142c2d; --line:#2a4b4c; --text:#f2fbfb; --muted:#9ab7b8; --accent:#35d0a4; --bad:#ff7373; }
+    * { box-sizing: border-box; }
+    body { margin:0; min-height:100vh; display:grid; place-items:center; background:var(--bg); color:var(--text); font-family: Inter, system-ui, -apple-system, Segoe UI, sans-serif; padding:20px; }
+    main { width:min(440px, 100%); background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:24px; box-shadow:0 18px 50px rgba(0,0,0,.28); }
+    h1 { margin:0 0 6px; font-size:24px; line-height:1.15; }
+    p { color:var(--muted); margin:0 0 18px; line-height:1.5; }
+    label { display:block; margin:14px 0 6px; color:var(--muted); font-size:13px; }
+    input { width:100%; border:1px solid var(--line); background:#071819; color:var(--text); border-radius:6px; padding:12px; font-size:16px; outline:none; }
+    input:focus { border-color:var(--accent); }
+    button { width:100%; margin-top:18px; border:0; background:var(--accent); color:#06201b; border-radius:6px; padding:12px 14px; font-weight:800; cursor:pointer; }
+    button:disabled { opacity:.55; cursor:not-allowed; }
+    .hidden { display:none; }
+    .msg { min-height:22px; margin-top:14px; color:var(--bad); font-size:14px; }
+    .ok { color:var(--accent); }
+    img { width:220px; height:220px; display:block; margin:14px auto; background:white; border-radius:6px; padding:8px; }
+    code { display:block; overflow-wrap:anywhere; background:#071819; border:1px solid var(--line); border-radius:6px; padding:10px; color:var(--accent); }
+  </style>
+</head>
+<body>
+  <main>
+    <section id="loading"><h1>Checking Access</h1><p>Please wait.</p></section>
+
+    <section id="create" class="hidden">
+      <h1>Create Admin</h1>
+      <p>This runs once. After admin creation, setup Google Authenticator.</p>
+      <label>Email</label><input id="create_email" type="email" autocomplete="username">
+      <label>Password</label><input id="create_password" type="password" autocomplete="new-password">
+      <label>Confirm Password</label><input id="create_confirm" type="password" autocomplete="new-password">
+      <button onclick="createAdmin()">Create Admin</button>
+    </section>
+
+    <section id="totp" class="hidden">
+      <h1>Setup Authenticator</h1>
+      <p>Enter admin password, scan the QR code, then verify the 6-digit code.</p>
+      <label>Email</label><input id="totp_email" type="email" autocomplete="username">
+      <label>Password</label><input id="totp_password" type="password" autocomplete="current-password">
+      <button onclick="startTotp()">Show QR Code</button>
+      <div id="qrBox" class="hidden">
+        <img id="qr" alt="Authenticator QR code">
+        <label>Manual Key</label><code id="secret"></code>
+        <label>6-digit Code</label><input id="totp_code" inputmode="numeric" autocomplete="one-time-code">
+        <button onclick="verifyTotp()">Verify & Continue</button>
+      </div>
+    </section>
+
+    <section id="login" class="hidden">
+      <h1>Admin Login</h1>
+      <p>Only the configured admin can access this application.</p>
+      <label>Email</label><input id="login_email" type="email" autocomplete="username">
+      <label>Password</label><input id="login_password" type="password" autocomplete="current-password">
+      <label>Authenticator Code</label><input id="login_code" inputmode="numeric" autocomplete="one-time-code">
+      <button onclick="login()">Login</button>
+    </section>
+
+    <div id="msg" class="msg"></div>
+  </main>
+  <script>
+    let pendingSecret = "";
+    const $ = (id) => document.getElementById(id);
+    function show(id) {
+      ["loading", "create", "totp", "login"].forEach(x => $(x).classList.toggle("hidden", x !== id));
+      $("msg").textContent = "";
+      $("msg").className = "msg";
+    }
+    async function api(url, payload) {
+      const resp = await fetch(url, {
+        method: payload ? "POST" : "GET",
+        headers: payload ? {"Content-Type": "application/json"} : {},
+        body: payload ? JSON.stringify(payload) : undefined,
+      });
+      const text = await resp.text();
+      let data = {};
+      try { data = text ? JSON.parse(text) : {}; } catch { data = {ok:false, error:text || "INVALID_RESPONSE"}; }
+      if (!resp.ok || data.ok === false) throw new Error(data.error || data.detail || "REQUEST_FAILED");
+      return data;
+    }
+    function message(text, ok=false) { $("msg").textContent = text; $("msg").className = ok ? "msg ok" : "msg"; }
+    async function refreshState() {
+      try {
+        const state = await api("/auth/state");
+        if (state.mode === "AUTHENTICATED") location.href = "/dashboard";
+        else if (state.mode === "CREATE_ADMIN") show("create");
+        else if (state.mode === "SETUP_TOTP") show("totp");
+        else show("login");
+      } catch (e) { show("login"); message(e.message); }
+    }
+    async function createAdmin() {
+      try {
+        const email = $("create_email").value.trim();
+        const password = $("create_password").value;
+        await api("/auth/admin/setup", {email, password, confirm_password: $("create_confirm").value});
+        $("totp_email").value = email;
+        $("totp_password").value = password;
+        show("totp");
+        message("Admin created. Setup authenticator now.", true);
+      } catch (e) { message(e.message); }
+    }
+    async function startTotp() {
+      try {
+        const data = await api("/auth/totp/setup", {email: $("totp_email").value.trim(), password: $("totp_password").value});
+        pendingSecret = data.secret;
+        $("qr").src = data.qr_data_url;
+        $("secret").textContent = data.secret;
+        $("qrBox").classList.remove("hidden");
+        message("Scan QR and enter code.", true);
+      } catch (e) { message(e.message); }
+    }
+    async function verifyTotp() {
+      try {
+        await api("/auth/totp/verify", {email: $("totp_email").value.trim(), password: $("totp_password").value, code: $("totp_code").value, secret: pendingSecret});
+        location.href = "/dashboard";
+      } catch (e) { message(e.message); }
+    }
+    async function login() {
+      try {
+        await api("/auth/login", {email: $("login_email").value.trim(), password: $("login_password").value, code: $("login_code").value});
+        location.href = "/dashboard";
+      } catch (e) { message(e.message); }
+    }
+    refreshState();
+  </script>
+</body>
+</html>"""
+
+
+@app.get("/auth", response_class=HTMLResponse)
+async def admin_auth_page() -> HTMLResponse:
+    if not _admin_auth_enabled():
+        return HTMLResponse("<meta http-equiv='refresh' content='0;url=/dashboard'>")
+    return HTMLResponse(_admin_auth_html())
+
+
+@app.get("/auth/state")
+async def admin_auth_state(request: Request) -> Dict[str, Any]:
+    if not _admin_auth_enabled():
+        return {"ok": True, "mode": "AUTHENTICATED", "auth_enabled": False}
+    admin = await _load_admin()
+    if not admin:
+        return {"ok": True, "mode": "CREATE_ADMIN", "auth_enabled": True}
+    if await _admin_session_from_request(request):
+        return {"ok": True, "mode": "AUTHENTICATED", "auth_enabled": True}
+    if not await _admin_totp_is_set():
+        return {"ok": True, "mode": "SETUP_TOTP", "auth_enabled": True}
+    return {"ok": True, "mode": "LOGIN", "auth_enabled": True}
+
+
+@app.post("/auth/admin/setup")
+async def admin_setup(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not _admin_auth_enabled():
+        return {"ok": False, "error": "ADMIN_AUTH_DISABLED"}
+    if await _load_admin():
+        return {"ok": False, "error": "ADMIN_ALREADY_CONFIGURED"}
+    email = _normalise_admin_email(str(payload.get("email") or ""))
+    password = str(payload.get("password") or "")
+    confirm = str(payload.get("confirm_password") or password)
+    if ADMIN_EMAIL and email != ADMIN_EMAIL:
+        return {"ok": False, "error": "ADMIN_EMAIL_NOT_ALLOWED"}
+    if not _valid_email(email):
+        return {"ok": False, "error": "INVALID_EMAIL"}
+    if len(password) < PASSWORD_MIN_LEN:
+        return {"ok": False, "error": f"PASSWORD_MIN_{PASSWORD_MIN_LEN}"}
+    if password != confirm:
+        return {"ok": False, "error": "PASSWORD_CONFIRM_MISMATCH"}
+    fn = getattr(store, "save_admin_auth", None)
+    if not callable(fn):
+        return {"ok": False, "error": "ADMIN_AUTH_STORE_UNAVAILABLE"}
+    await fn(email, _hash_password(password))
+    log.warning("ADMIN_CREATED | email=%s", email)
+    return {"ok": True, "mode": "SETUP_TOTP"}
+
+
+@app.post("/auth/totp/setup")
+async def admin_totp_setup(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not _admin_auth_enabled():
+        return {"ok": False, "error": "ADMIN_AUTH_DISABLED"}
+    admin = await _load_admin()
+    if not admin:
+        return {"ok": False, "error": "ADMIN_NOT_CONFIGURED"}
+    if await _admin_totp_is_set():
+        return {"ok": False, "error": "TOTP_ALREADY_CONFIGURED"}
+    email = _normalise_admin_email(str(payload.get("email") or ""))
+    password = str(payload.get("password") or "")
+    if not await _verify_admin_password(email, password):
+        return {"ok": False, "error": "INVALID_ADMIN_CREDENTIALS"}
+    import pyotp
+
+    secret = pyotp.random_base32()
+    uri = _totp_uri(email, secret)
+    return {"ok": True, "secret": secret, "otpauth_uri": uri, "qr_data_url": _totp_qr_data_url(uri)}
+
+
+@app.post("/auth/totp/verify")
+async def admin_totp_verify(payload: Dict[str, Any]) -> JSONResponse:
+    if not _admin_auth_enabled():
+        return JSONResponse({"ok": False, "error": "ADMIN_AUTH_DISABLED"}, status_code=400)
+    if await _admin_totp_is_set():
+        return JSONResponse({"ok": False, "error": "TOTP_ALREADY_CONFIGURED"}, status_code=400)
+    email = _normalise_admin_email(str(payload.get("email") or ""))
+    password = str(payload.get("password") or "")
+    secret = str(payload.get("secret") or "").strip().replace(" ", "")
+    code = str(payload.get("code") or payload.get("totp") or "")
+    if not await _verify_admin_password(email, password):
+        return JSONResponse({"ok": False, "error": "INVALID_ADMIN_CREDENTIALS"}, status_code=401)
+    if not secret or not _verify_totp(secret, code):
+        return JSONResponse({"ok": False, "error": "INVALID_TOTP"}, status_code=401)
+    fn = getattr(store, "save_admin_totp_secret", None)
+    if not callable(fn):
+        return JSONResponse({"ok": False, "error": "ADMIN_TOTP_STORE_UNAVAILABLE"}, status_code=500)
+    await fn(secret)
+    token = await _create_admin_session(email)
+    response = JSONResponse({"ok": True, "mode": "AUTHENTICATED"})
+    response.set_cookie(
+        ADMIN_SESSION_COOKIE,
+        token,
+        max_age=ADMIN_SESSION_TTL_SEC,
+        httponly=True,
+        secure=_admin_cookie_secure(),
+        samesite="lax",
+        path="/",
+    )
+    log.warning("ADMIN_TOTP_ENABLED | email=%s", email)
+    return response
+
+
+@app.post("/auth/login")
+async def admin_login(payload: Dict[str, Any]) -> JSONResponse:
+    if not _admin_auth_enabled():
+        return JSONResponse({"ok": False, "error": "ADMIN_AUTH_DISABLED"}, status_code=400)
+    email = _normalise_admin_email(str(payload.get("email") or ""))
+    password = str(payload.get("password") or "")
+    code = str(payload.get("code") or payload.get("totp") or "")
+    if not await _admin_totp_is_set():
+        return JSONResponse({"ok": False, "error": "TOTP_NOT_CONFIGURED"}, status_code=409)
+    if not await _verify_admin_password(email, password):
+        attempts = await store.record_admin_login_failure(email) if hasattr(store, "record_admin_login_failure") else 1
+        status_code = 429 if attempts >= ADMIN_LOGIN_LOCK_AFTER else 401
+        return JSONResponse({"ok": False, "error": "INVALID_ADMIN_CREDENTIALS"}, status_code=status_code)
+    secret = await _load_admin_totp_secret()
+    if not _verify_totp(secret, code):
+        attempts = await store.record_admin_login_failure(email) if hasattr(store, "record_admin_login_failure") else 1
+        status_code = 429 if attempts >= ADMIN_LOGIN_LOCK_AFTER else 401
+        return JSONResponse({"ok": False, "error": "INVALID_TOTP"}, status_code=status_code)
+    if hasattr(store, "clear_admin_login_failures"):
+        await store.clear_admin_login_failures(email)
+    token = await _create_admin_session(email)
+    response = JSONResponse({"ok": True, "mode": "AUTHENTICATED"})
+    response.set_cookie(
+        ADMIN_SESSION_COOKIE,
+        token,
+        max_age=ADMIN_SESSION_TTL_SEC,
+        httponly=True,
+        secure=_admin_cookie_secure(),
+        samesite="lax",
+        path="/",
+    )
+    log.info("ADMIN_LOGIN_OK | email=%s", email)
+    return response
+
+
+@app.post("/auth/logout")
+async def admin_logout(request: Request) -> JSONResponse:
+    token = request.cookies.get(ADMIN_SESSION_COOKIE, "")
+    if token and hasattr(store, "delete_admin_session"):
+        await store.delete_admin_session(_hash_session_token(token))
+    response = JSONResponse({"ok": True})
+    response.delete_cookie(ADMIN_SESSION_COOKIE, path="/")
+    return response
+
+
 @app.get("/", response_class=RedirectResponse)
 @limiter.limit(RATE_LIMIT_LOGIN)
 async def root(request: Request):
-    """Redirect to dashboard (Auth managed by Cloudflare)"""
+    """Redirect to dashboard; admin/TOTP middleware enforces access when enabled."""
     return RedirectResponse(url="/dashboard")
-
-
-# Auth endpoints removed as requested (Cloudflare Zero Trust managed)
 
 
 # -----------------------------
@@ -1709,7 +2161,7 @@ async def root(request: Request):
 async def dashboard_page(request: Request):
     """
     Serve the main trading dashboard.
-    Auth is bypassed here as it is handled by Cloudflare Zero Trust.
+    Admin/TOTP access is enforced by middleware before this route is reached.
     Defaulting to User ID 1.
     """
     # Simply render for default user (Ashutosh)
@@ -1758,6 +2210,19 @@ async def broker_config(user_id: int = 1) -> Dict[str, Any]:
             if os.getenv("PUBLIC_BASE_URL")
             else f"/dhan/callback/{uid}",
         },
+    }
+
+
+@app.get("/api/webhook-url")
+async def webhook_url(request: Request, user_id: int = 1) -> Dict[str, Any]:
+    base_url = _public_base_url(request)
+    url = f"{base_url}/webhook/chartink?user_id={int(user_id)}"
+    if WEBHOOK_SECRET:
+        url = f"{url}&secret={WEBHOOK_SECRET}"
+    return {
+        "ok": True,
+        "url": url,
+        "secret_required": bool(WEBHOOK_SECRET),
     }
 
 
@@ -2526,6 +2991,8 @@ async def exit_all_positions_api(payload: Dict[str, Any]) -> Dict[str, Any]:
 # -----------------------------
 @app.api_route("/webhook/chartink", methods=["POST", "GET"])
 async def chartink_webhook(request: Request, user_id: int = 1) -> Dict[str, Any]:
+    if not _webhook_secret_valid(request):
+        raise HTTPException(status_code=401, detail="WEBHOOK_SECRET_INVALID")
     runtime = await ensure_service_runtime()
     result = await runtime.api_gateway.receive_chartink_webhook(request, int(user_id))
     logging.getLogger("trade_engine").info(
@@ -2780,6 +3247,10 @@ async def ws_feed_http(user_id: int = 1) -> Dict[str, Any]:
 @app.websocket("/ws/feed")
 async def ws_feed(ws: WebSocket, user_id: int = 1):
     user_id = int(user_id)
+    await ensure_store_ready()
+    if _admin_auth_enabled() and not await _admin_session_from_token(ws.cookies.get(ADMIN_SESSION_COOKIE, "")):
+        await ws.close(code=4401, reason="ADMIN_AUTH_REQUIRED")
+        return
     await ws_mgr.connect(user_id, ws)
     try:
         while True:

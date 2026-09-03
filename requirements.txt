@@ -8,6 +8,8 @@ jinja2==3.1.4
 python-multipart==0.0.9
 passlib[bcrypt]==1.7.4
 bcrypt==3.2.2
+pyotp==2.9.0
+qrcode==7.4.2
 pytz==2024.1
 itsdangerous==2.2.0
 pydantic[email]==2.10.4

@@ -48,6 +48,10 @@ class InMemoryStore:
         self._otp_by_email: Dict[str, Dict[str, Any]] = {}
         self._otp_requests: Dict[str, List[float]] = {}  # email -> timestamps
         self._sessions_by_token: Dict[str, Dict[str, Any]] = {}
+        self._admin_auth: Dict[str, Any] = {}
+        self._admin_totp_secret: str = ""
+        self._admin_sessions: Dict[str, Dict[str, Any]] = {}
+        self._admin_login_failures: Dict[str, int] = {}
 
     # -------------------------
     # Compatibility / lifecycle
@@ -123,6 +127,66 @@ class InMemoryStore:
 
     async def load_dhan_auth_state(self, user_id: int) -> Dict[str, Any]:
         return dict(self._dhan_auth_state.get(int(user_id), {}))
+
+    # -------------------------
+    # Admin app authentication
+    # -------------------------
+    async def save_admin_auth(self, email: str, password_hash: str) -> Dict[str, Any]:
+        self._admin_auth = {
+            "email": str(email or "").strip().lower(),
+            "password_hash": str(password_hash or "").strip(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        return dict(self._admin_auth)
+
+    async def load_admin_auth(self) -> Dict[str, Any]:
+        return dict(self._admin_auth)
+
+    async def delete_admin_auth(self) -> None:
+        self._admin_auth = {}
+        self._admin_totp_secret = ""
+        self._admin_sessions.clear()
+        self._admin_login_failures.clear()
+
+    async def save_admin_totp_secret(self, secret: str) -> Dict[str, Any]:
+        self._admin_totp_secret = str(secret or "").strip()
+        return {
+            "secret": self._admin_totp_secret,
+            "enabled": bool(self._admin_totp_secret),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    async def load_admin_totp_secret(self) -> str:
+        return self._admin_totp_secret
+
+    async def save_admin_session(self, token_hash: str, email: str, ttl_sec: int) -> Dict[str, Any]:
+        payload = {
+            "email": str(email or "").strip().lower(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "expires_at_ts": time.time() + max(60, int(ttl_sec)),
+        }
+        self._admin_sessions[str(token_hash or "")] = dict(payload)
+        return payload
+
+    async def load_admin_session(self, token_hash: str) -> Dict[str, Any]:
+        payload = dict(self._admin_sessions.get(str(token_hash or ""), {}))
+        if not payload:
+            return {}
+        if float(payload.get("expires_at_ts") or 0.0) <= time.time():
+            self._admin_sessions.pop(str(token_hash or ""), None)
+            return {}
+        return payload
+
+    async def delete_admin_session(self, token_hash: str) -> None:
+        self._admin_sessions.pop(str(token_hash or ""), None)
+
+    async def record_admin_login_failure(self, email: str, ttl_sec: int = 600) -> int:
+        key = str(email or "").strip().lower()
+        self._admin_login_failures[key] = int(self._admin_login_failures.get(key, 0)) + 1
+        return self._admin_login_failures[key]
+
+    async def clear_admin_login_failures(self, email: str) -> None:
+        self._admin_login_failures.pop(str(email or "").strip().lower(), None)
 
     # -------------------------
     # Kill switch

@@ -8,10 +8,13 @@ from subprocess import CompletedProcess
 # Ensure app startup uses in-memory store (no Redis/Kite required)
 os.environ.setdefault("APP_TESTING", "1")
 
+import pyotp
 from fastapi.testclient import TestClient
 
 from app import main as main_module
+from app.auth import AuthService
 from app.main import app
+from app.memory_store import InMemoryStore
 
 
 @app.get("/__test__/explode")
@@ -104,6 +107,113 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(body["ok"], False)
         self.assertEqual(body["error"], "INTERNAL_SERVER_ERROR")
         self.assertIn("request_id", body)
+
+    def test_admin_password_totp_gate_protects_dashboard_and_api(self) -> None:
+        old_store = main_module.store
+        old_auth_service = main_module.auth_service
+        old_service_runtime = main_module.SERVICE_RUNTIME
+        old_engine = dict(main_module.ENGINE)
+        old_auth_enabled = main_module.ADMIN_AUTH_ENABLED_RAW
+        old_admin_email = main_module.ADMIN_EMAIL
+        old_webhook_secret = main_module.WEBHOOK_SECRET
+        test_store = InMemoryStore()
+        try:
+            main_module.store = test_store
+            main_module.auth_service = AuthService(test_store)
+            main_module.SERVICE_RUNTIME = None
+            main_module.ENGINE.clear()
+            main_module.ADMIN_AUTH_ENABLED_RAW = "1"
+            main_module.ADMIN_EMAIL = ""
+            main_module.WEBHOOK_SECRET = "hook-secret"
+
+            with patch.dict(os.environ, {"APP_TESTING": "", "APP_ENV": "production"}):
+                client = TestClient(app, raise_server_exceptions=False)
+                try:
+                    blocked_page = client.get("/dashboard", follow_redirects=False)
+                    self.assertEqual(blocked_page.status_code, 303)
+                    self.assertEqual(blocked_page.headers.get("location"), "/auth")
+
+                    blocked_api = client.get("/api/broker-status?user_id=1")
+                    self.assertEqual(blocked_api.status_code, 401)
+                    self.assertEqual(blocked_api.json()["error"], "ADMIN_AUTH_REQUIRED")
+
+                    state = client.get("/auth/state").json()
+                    self.assertEqual(state["mode"], "CREATE_ADMIN")
+
+                    created = client.post(
+                        "/auth/admin/setup",
+                        json={
+                            "email": "admin@example.com",
+                            "password": "StrongPass123",
+                            "confirm_password": "StrongPass123",
+                        },
+                    )
+                    self.assertEqual(created.status_code, 200)
+                    self.assertEqual(created.json()["mode"], "SETUP_TOTP")
+                    self.assertNotIn("StrongPass123", str(test_store._admin_auth))
+
+                    setup = client.post(
+                        "/auth/totp/setup",
+                        json={"email": "admin@example.com", "password": "StrongPass123"},
+                    )
+                    self.assertEqual(setup.status_code, 200)
+                    setup_body = setup.json()
+                    self.assertTrue(setup_body["qr_data_url"].startswith("data:image/png;base64,"))
+
+                    code = pyotp.TOTP(setup_body["secret"]).now()
+                    verified = client.post(
+                        "/auth/totp/verify",
+                        json={
+                            "email": "admin@example.com",
+                            "password": "StrongPass123",
+                            "secret": setup_body["secret"],
+                            "code": code,
+                        },
+                    )
+                    self.assertEqual(verified.status_code, 200)
+                    self.assertIn(main_module.ADMIN_SESSION_COOKIE, verified.headers.get("set-cookie", ""))
+
+                    allowed_page = client.get("/dashboard")
+                    self.assertEqual(allowed_page.status_code, 200)
+
+                    logout = client.post("/auth/logout")
+                    self.assertEqual(logout.status_code, 200)
+                    self.assertEqual(client.get("/api/broker-status?user_id=1").status_code, 401)
+
+                    login_code = pyotp.TOTP(test_store._admin_totp_secret).now()
+                    logged_in = client.post(
+                        "/auth/login",
+                        json={
+                            "email": "admin@example.com",
+                            "password": "StrongPass123",
+                            "code": login_code,
+                        },
+                    )
+                    self.assertEqual(logged_in.status_code, 200)
+                    self.assertEqual(client.get("/api/broker-status?user_id=1").status_code, 200)
+                    webhook_url = client.get("/api/webhook-url?user_id=1").json()
+                    self.assertEqual(webhook_url["ok"], True)
+                    self.assertEqual(webhook_url["secret_required"], True)
+                    self.assertIn("/webhook/chartink?user_id=1&secret=hook-secret", webhook_url["url"])
+
+                    webhook_blocked = client.post(
+                        "/webhook/chartink?user_id=1",
+                        json={"scan_name": "x", "stocks": "SBIN"},
+                    )
+                    self.assertEqual(webhook_blocked.status_code, 401)
+                finally:
+                    client.close()
+        finally:
+            for engine in list(main_module.ENGINE.values()):
+                asyncio.run(engine.close())
+            main_module.store = old_store
+            main_module.auth_service = old_auth_service
+            main_module.SERVICE_RUNTIME = old_service_runtime
+            main_module.ENGINE.clear()
+            main_module.ENGINE.update(old_engine)
+            main_module.ADMIN_AUTH_ENABLED_RAW = old_auth_enabled
+            main_module.ADMIN_EMAIL = old_admin_email
+            main_module.WEBHOOK_SECRET = old_webhook_secret
 
     def test_broker_config_supports_dhan_and_zerodha(self) -> None:
         missing = self.client.post(

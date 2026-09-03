@@ -184,6 +184,22 @@ def k_latest_tick(user_id: int, symbol: str) -> str:
     return f"tick:latest:{int(user_id)}:{norm_symbol(symbol)}"
 
 
+def k_admin_auth() -> str:
+    return "auth:admin"
+
+
+def k_admin_totp() -> str:
+    return "auth:totp:admin"
+
+
+def k_admin_session(token_hash: str) -> str:
+    return f"auth:session:{str(token_hash or '').strip()}"
+
+
+def k_admin_login_attempts(email: str) -> str:
+    return f"auth:login_attempts:{norm_alert_name(email)}"
+
+
 # =========================
 # Lua scripts
 # =========================
@@ -618,6 +634,84 @@ class RedisStore:
             return json.loads(raw) if raw else {}
         except Exception:
             return {}
+
+    # =========================
+    # Admin app authentication
+    # =========================
+    async def save_admin_auth(self, email: str, password_hash: str) -> Dict[str, Any]:
+        payload = {
+            "email": str(email or "").strip().lower(),
+            "password_hash": str(password_hash or "").strip(),
+            "created_at": now_ist().isoformat(),
+        }
+        await self.redis.set(k_admin_auth(), json.dumps(payload))
+        return payload
+
+    async def load_admin_auth(self) -> Dict[str, Any]:
+        try:
+            raw = await self.redis.get(k_admin_auth())
+            data = json.loads(raw) if raw else {}
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    async def delete_admin_auth(self) -> None:
+        await self.redis.delete(k_admin_auth(), k_admin_totp())
+        async for key in self.redis.scan_iter("auth:session:*"):
+            await self.redis.delete(key)
+        async for key in self.redis.scan_iter("auth:login_attempts:*"):
+            await self.redis.delete(key)
+
+    async def save_admin_totp_secret(self, secret: str) -> Dict[str, Any]:
+        value = str(secret or "").strip()
+        if self.encryption and self.encryption.is_enabled() and value:
+            value = self.encryption.encrypt(value)
+        payload = {"secret": value, "enabled": True, "created_at": now_ist().isoformat()}
+        await self.redis.set(k_admin_totp(), json.dumps(payload))
+        return payload
+
+    async def load_admin_totp_secret(self) -> str:
+        try:
+            raw = await self.redis.get(k_admin_totp())
+            data = json.loads(raw) if raw else {}
+            if not isinstance(data, dict) or not data.get("enabled"):
+                return ""
+            secret = str(data.get("secret") or "")
+            if self.encryption and self.encryption.is_enabled() and secret:
+                secret = self.encryption.decrypt(secret)
+            return secret
+        except Exception:
+            return ""
+
+    async def save_admin_session(self, token_hash: str, email: str, ttl_sec: int) -> Dict[str, Any]:
+        payload = {
+            "email": str(email or "").strip().lower(),
+            "created_at": now_ist().isoformat(),
+            "expires_at_ts": time.time() + max(60, int(ttl_sec)),
+        }
+        await self.redis.setex(k_admin_session(token_hash), max(60, int(ttl_sec)), json.dumps(payload))
+        return payload
+
+    async def load_admin_session(self, token_hash: str) -> Dict[str, Any]:
+        try:
+            raw = await self.redis.get(k_admin_session(token_hash))
+            data = json.loads(raw) if raw else {}
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    async def delete_admin_session(self, token_hash: str) -> None:
+        await self.redis.delete(k_admin_session(token_hash))
+
+    async def record_admin_login_failure(self, email: str, ttl_sec: int = 600) -> int:
+        key = k_admin_login_attempts(email)
+        attempts = int(await self.redis.incr(key))
+        if attempts == 1:
+            await self.redis.expire(key, max(60, int(ttl_sec)))
+        return attempts
+
+    async def clear_admin_login_failures(self, email: str) -> None:
+        await self.redis.delete(k_admin_login_attempts(email))
 
     async def list_all_user_ids(self) -> List[int]:
         """Discover all user IDs who have credentials saved."""
