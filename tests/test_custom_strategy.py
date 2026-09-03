@@ -1171,6 +1171,128 @@ class TradeEngineIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(position.status, "OPEN")
         engine._exit_position.assert_not_awaited()
 
+    async def test_alert_exit_only_exits_matching_strategy_position(self) -> None:
+        store = InMemoryStore()
+        await store.save_alert_config(
+            1,
+            {
+                "alert_name": "strategy a entry",
+                "enabled": False,
+                "exit_alert_enabled": True,
+                "exit_alert_name": "strategy a exit",
+            },
+        )
+        await store.save_alert_config(
+            1,
+            {
+                "alert_name": "strategy b entry",
+                "enabled": True,
+                "exit_alert_enabled": True,
+                "exit_alert_name": "strategy b exit",
+            },
+        )
+        engine = TradeEngine(1, store)
+        pos_a = Position(
+            trade_id="A1",
+            user_id=1,
+            symbol="RELIANCE",
+            alert_name="strategy a entry",
+            exit_alert_name="strategy a exit",
+            side="BUY",
+            product="MIS",
+            qty=1,
+            entry_price=100.0,
+            status="OPEN",
+        )
+        pos_b = Position(
+            trade_id="B1",
+            user_id=1,
+            symbol="DABUR",
+            alert_name="strategy b entry",
+            exit_alert_name="strategy b exit",
+            side="BUY",
+            product="MIS",
+            qty=1,
+            entry_price=100.0,
+            status="OPEN",
+        )
+        engine.positions["RELIANCE"] = pos_a
+        engine.positions["DABUR"] = pos_b
+        await store.upsert_position(1, "RELIANCE", pos_a.to_public())
+        await store.upsert_position(1, "DABUR", pos_b.to_public())
+        await store.mark_open(1, "RELIANCE", "A1")
+        await store.mark_open(1, "DABUR", "B1")
+        engine._place_order_with_execution = AsyncMock(
+            return_value=OrderExecution(
+                order_id="EXIT-A",
+                symbol="RELIANCE",
+                side="SELL",
+                qty=1,
+                status="COMPLETE",
+                avg_price=101.0,
+                filled_qty=1,
+                remaining_qty=0,
+            )
+        )
+
+        result = await engine.on_chartink_alert("strategy a exit", ["RELIANCE", "DABUR", "TCS"])
+
+        by_symbol = {row["symbol"]: row for row in result}
+        self.assertEqual(by_symbol["RELIANCE"]["status"], "EXITED")
+        self.assertEqual(by_symbol["RELIANCE"]["reason"], "ALERT_EXIT")
+        self.assertEqual(by_symbol["DABUR"]["status"], "SKIPPED")
+        self.assertEqual(by_symbol["DABUR"]["reason"], "EXIT_CONFIG_MISMATCH")
+        self.assertEqual(by_symbol["TCS"]["status"], "SKIPPED")
+        self.assertEqual(by_symbol["TCS"]["reason"], "NO_OPEN_POSITION")
+        self.assertNotIn("RELIANCE", engine.positions)
+        self.assertIn("DABUR", engine.positions)
+        engine._place_order_with_execution.assert_awaited_once()
+
+    async def test_alert_exit_works_when_entry_strategy_is_paused_and_kill_switch_on(self) -> None:
+        store = InMemoryStore()
+        await store.save_alert_config(
+            1,
+            {
+                "alert_name": "paused entry",
+                "enabled": False,
+                "exit_alert_enabled": True,
+                "exit_alert_name": "paused exit",
+            },
+        )
+        await store.set_kill(1, True)
+        engine = TradeEngine(1, store)
+        pos = Position(
+            trade_id="P1",
+            user_id=1,
+            symbol="SBIN",
+            alert_name="paused entry",
+            exit_alert_name="paused exit",
+            side="BUY",
+            product="MIS",
+            qty=1,
+            entry_price=100.0,
+            status="OPEN",
+        )
+        engine.positions["SBIN"] = pos
+        engine._place_order_with_execution = AsyncMock(
+            return_value=OrderExecution(
+                order_id="EXIT-P",
+                symbol="SBIN",
+                side="SELL",
+                qty=1,
+                status="COMPLETE",
+                avg_price=101.0,
+                filled_qty=1,
+                remaining_qty=0,
+            )
+        )
+
+        result = await engine.on_chartink_alert("paused exit", ["SBIN"])
+
+        self.assertEqual(result[0]["status"], "EXITED")
+        self.assertEqual(result[0]["reason"], "ALERT_EXIT")
+        engine._place_order_with_execution.assert_awaited_once()
+
     async def test_classic_cost_sl_moves_stop_to_entry_at_rr_trigger(self) -> None:
         store = InMemoryStore()
         engine = TradeEngine(1, store)

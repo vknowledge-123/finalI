@@ -47,6 +47,8 @@ class IntegrationTests(unittest.TestCase):
         self.assertNotIn("DHAN CONNECTED", r.text)
         self.assertIn('id="webhook_url"', r.text)
         self.assertIn('id="cfg_strategy_mode"', r.text)
+        self.assertIn('id="cfg_exit_alert_on"', r.text)
+        self.assertIn('id="cfg_exit_alert_name"', r.text)
         self.assertIn('id="cfg_order_timeout"', r.text)
         self.assertIn('id="cfg_order_retries"', r.text)
         self.assertIn('id="cfg_order_buffer"', r.text)
@@ -571,6 +573,55 @@ class IntegrationTests(unittest.TestCase):
         blocked = self.client.post("/api/alert-config", json=collision)
         self.assertEqual(blocked.status_code, 200)
         self.assertEqual(blocked.json()["error"], "ALERT_NAME_COLLISION")
+
+    def test_alert_config_validates_exit_alert_mapping(self) -> None:
+        base = {
+            "user_id": 1,
+            "alert_name": "EXIT_MAP_ENTRY_A",
+            "enabled": True,
+            "direction": "LONG",
+            "product": "MIS",
+            "strategy_mode": "CLASSIC",
+            "target_pct": 1.0,
+            "stop_loss_pct": 0.7,
+            "trailing_sl_pct": 0.5,
+        }
+
+        missing = self.client.post(
+            "/api/alert-config",
+            json={**base, "alert_name": "EXIT_MAP_MISSING", "exit_alert_enabled": True, "exit_alert_name": ""},
+        )
+        self.assertEqual(missing.status_code, 200)
+        self.assertEqual(missing.json()["error"], "EXIT_ALERT_NAME_REQUIRED")
+
+        same = self.client.post(
+            "/api/alert-config",
+            json={**base, "alert_name": "EXIT_MAP_SAME", "exit_alert_enabled": True, "exit_alert_name": "EXIT_MAP_SAME"},
+        )
+        self.assertEqual(same.status_code, 200)
+        self.assertEqual(same.json()["error"], "EXIT_ALERT_CANNOT_MATCH_ENTRY_ALERT")
+
+        saved_a = self.client.post(
+            "/api/alert-config",
+            json={**base, "exit_alert_enabled": True, "exit_alert_name": "EXIT_MAP_EXIT_A"},
+        )
+        self.assertEqual(saved_a.status_code, 200)
+        self.assertEqual(saved_a.json()["status"], "saved")
+        self.assertEqual(saved_a.json()["config"]["exit_alert_name"], "exit map exit a")
+
+        collides_with_existing_exit = self.client.post(
+            "/api/alert-config",
+            json={**base, "alert_name": "EXIT_MAP_ENTRY_B", "exit_alert_enabled": True, "exit_alert_name": "EXIT_MAP_EXIT_A"},
+        )
+        self.assertEqual(collides_with_existing_exit.status_code, 200)
+        self.assertEqual(collides_with_existing_exit.json()["error"], "EXIT_ALERT_NAME_COLLISION")
+
+        entry_collides_with_exit = self.client.post(
+            "/api/alert-config",
+            json={**base, "alert_name": "EXIT_MAP_EXIT_A", "exit_alert_enabled": False},
+        )
+        self.assertEqual(entry_collides_with_exit.status_code, 200)
+        self.assertEqual(entry_collides_with_exit.json()["error"], "ALERT_NAME_COLLIDES_WITH_EXIT_ALERT")
 
     def test_precision_sniper_rejects_invalid_targets(self) -> None:
         r = self.client.post(

@@ -714,6 +714,8 @@ def _is_within_entry_window(start_time: str, end_time: str) -> bool:
 class AlertConfig:
     alert_name: str
     enabled: bool = True
+    exit_alert_enabled: bool = False
+    exit_alert_name: str = ""
 
     direction: Literal["LONG", "SHORT", "BOTH"] = "LONG"   # LONG->BUY, SHORT->SELL
     product: Product = "MIS"                       # MIS / CNC
@@ -771,6 +773,8 @@ class AlertConfig:
         return AlertConfig(
             alert_name=normalize_alert_key(raw_name),
             enabled=_as_bool(d.get("enabled"), True),
+            exit_alert_enabled=_as_bool(d.get("exit_alert_enabled"), False),
+            exit_alert_name=normalize_alert_key(str(d.get("exit_alert_name") or d.get("exit_alert") or "")),
             direction=direction,  # type: ignore[arg-type]
             product=product,
             qty_mode=qty_mode,  # type: ignore[arg-type]
@@ -836,6 +840,7 @@ class Position:
     order_status: str = ""
     order_retry_count: int = 0
     alert_time: str = ""
+    exit_alert_name: str = ""
     created_ts: float = 0.0
     updated_ts: float = 0.0
 
@@ -2378,8 +2383,172 @@ class TradeEngine:
             rows = resample_intraday_candles(rows, requested_interval)
         return rows
 
+    async def _find_exit_alert_config(self, exit_alert_key: str) -> Optional[AlertConfig]:
+        try:
+            configs = await self.store.list_alert_configs(self.user_id)
+        except Exception as exc:
+            log.warning("EXIT_ALERT_CONFIG_LOOKUP_FAIL | user=%s alert=%s err=%s", self.user_id, exit_alert_key, exc)
+            return None
+
+        matches: List[AlertConfig] = []
+        for raw in (configs or {}).values():
+            if not isinstance(raw, dict):
+                continue
+            try:
+                cfg = AlertConfig.from_dict(raw)
+            except Exception:
+                continue
+            if cfg.exit_alert_enabled and cfg.exit_alert_name and cfg.exit_alert_name == exit_alert_key:
+                matches.append(cfg)
+
+        if len(matches) > 1:
+            log.error(
+                "EXIT_ALERT_DUPLICATE_CONFIG | user=%s exit_alert=%s entry_alerts=%s",
+                self.user_id,
+                exit_alert_key,
+                [cfg.alert_name for cfg in matches],
+            )
+        return matches[0] if matches else None
+
+    async def _process_exit_alert(
+        self,
+        exit_alert_key: str,
+        cfg: AlertConfig,
+        symbols: List[str],
+        ts: str = "",
+    ) -> List[Dict[str, Any]]:
+        results: List[Dict[str, Any]] = []
+        for raw in symbols:
+            sym = norm_symbol(raw)
+            if not sym:
+                results.append({"symbol": raw, "status": "ERROR", "reason": "BAD_SYMBOL"})
+                continue
+
+            pos = self.positions.get(sym)
+            if not pos:
+                pos = await self._hydrate_open_position_from_store(sym)
+
+            if not pos or pos.status not in ("OPEN", "EXIT_CONDITIONS_MET", "EXITING"):
+                results.append(
+                    {
+                        "symbol": sym,
+                        "status": "SKIPPED",
+                        "reason": "NO_OPEN_POSITION",
+                        "exit_alert": exit_alert_key,
+                        "entry_alert": cfg.alert_name,
+                    }
+                )
+                continue
+
+            position_alert = normalize_alert_key(pos.alert_name)
+            if position_alert != cfg.alert_name:
+                results.append(
+                    {
+                        "symbol": sym,
+                        "status": "SKIPPED",
+                        "reason": "EXIT_CONFIG_MISMATCH",
+                        "exit_alert": exit_alert_key,
+                        "expected_entry_alert": cfg.alert_name,
+                        "position_entry_alert": position_alert,
+                    }
+                )
+                continue
+
+            if pos.status == "EXITING" or self._exit_inflight.get(sym):
+                results.append(
+                    {
+                        "symbol": sym,
+                        "status": "SKIPPED",
+                        "reason": "EXIT_ALREADY_IN_PROGRESS",
+                        "exit_alert": exit_alert_key,
+                        "entry_alert": cfg.alert_name,
+                    }
+                )
+                continue
+
+            before_qty = max(0, int(pos.qty or 0))
+            try:
+                self._exit_inflight[sym] = True
+                self._exit_signal_sent[sym] = True
+                await self._exit_position(sym, "ALERT_EXIT")
+                updated = self.positions.get(sym)
+                if not updated:
+                    results.append(
+                        {
+                            "symbol": sym,
+                            "status": "EXITED",
+                            "reason": "ALERT_EXIT",
+                            "exit_alert": exit_alert_key,
+                            "entry_alert": cfg.alert_name,
+                            "qty": before_qty,
+                        }
+                    )
+                elif updated.status == "ERROR":
+                    results.append(
+                        {
+                            "symbol": sym,
+                            "status": "ERROR",
+                            "reason": updated.exit_reason or updated.pending_reason or "ALERT_EXIT_FAILED",
+                            "exit_alert": exit_alert_key,
+                            "entry_alert": cfg.alert_name,
+                            "qty": int(updated.qty or 0),
+                        }
+                    )
+                elif int(updated.qty or 0) < before_qty:
+                    results.append(
+                        {
+                            "symbol": sym,
+                            "status": "PARTIAL_EXIT",
+                            "reason": updated.pending_reason or "ALERT_EXIT_PARTIAL",
+                            "exit_alert": exit_alert_key,
+                            "entry_alert": cfg.alert_name,
+                            "qty": int(updated.qty or 0),
+                        }
+                    )
+                else:
+                    results.append(
+                        {
+                            "symbol": sym,
+                            "status": "EXITING",
+                            "reason": "ALERT_EXIT",
+                            "exit_alert": exit_alert_key,
+                            "entry_alert": cfg.alert_name,
+                            "qty": int(updated.qty or 0),
+                        }
+                    )
+            except Exception as exc:
+                log.exception(
+                    "ALERT_EXIT_FAIL | user=%s exit_alert=%s entry_alert=%s symbol=%s",
+                    self.user_id,
+                    exit_alert_key,
+                    cfg.alert_name,
+                    sym,
+                )
+                results.append(
+                    {
+                        "symbol": sym,
+                        "status": "ERROR",
+                        "reason": f"ALERT_EXIT_FAIL:{_safe_error(exc)}",
+                        "exit_alert": exit_alert_key,
+                        "entry_alert": cfg.alert_name,
+                    }
+                )
+            finally:
+                if sym in self._exit_inflight:
+                    self._exit_inflight[sym] = False
+                if sym in self._exit_signal_sent:
+                    self._exit_signal_sent[sym] = False
+
+        if not results:
+            return [{"symbol": "", "status": "SKIPPED", "reason": "NO_SYMBOLS_PARSED", "exit_alert": exit_alert_key}]
+        return results
+
     async def on_chartink_alert(self, alert_name: str, symbols: List[str], ts: str = "") -> List[Dict[str, Any]]:
         alert_key = normalize_alert_key(alert_name)
+        exit_cfg = await self._find_exit_alert_config(alert_key)
+        if exit_cfg:
+            return await self._process_exit_alert(alert_key, exit_cfg, symbols, ts=ts)
+
         cfg_raw = await self.store.get_alert_config(self.user_id, alert_key)
         if not cfg_raw:
             return [{"symbol": s, "status": "ERROR", "reason": "CFG_MISSING"} for s in symbols]
@@ -2651,6 +2820,7 @@ class TradeEngine:
                     entry_remaining_qty=int(execution.remaining_qty or 0),
                     order_status=str(execution.status or "COMPLETE"),
                     order_retry_count=max(0, int(execution.attempts) - 1),
+                    exit_alert_name=cfg.exit_alert_name if cfg.exit_alert_enabled else "",
                     target_price=target_price,
                     sl_price=sl_price,
                     tsl_pct=classic_tsl_pct,

@@ -2669,6 +2669,56 @@ async def save_alert_config(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     # Normalize key consistently
     alert_name = normalize_alert_name(raw_name)
+    exit_alert_enabled = str(payload.get("exit_alert_enabled", "false")).lower() in {"1", "true", "yes", "on"}
+    exit_alert_raw = str(payload.get("exit_alert_name_raw") or payload.get("exit_alert_name") or payload.get("exit_alert") or "").strip()
+    exit_alert_name = normalize_alert_name(exit_alert_raw) if exit_alert_raw else ""
+    if exit_alert_enabled and not exit_alert_name:
+        return {"error": "EXIT_ALERT_NAME_REQUIRED"}
+    if exit_alert_enabled and exit_alert_name == alert_name:
+        return {"error": "EXIT_ALERT_CANNOT_MATCH_ENTRY_ALERT"}
+
+    try:
+        existing_configs = await store.list_alert_configs(user_id)
+    except Exception:
+        existing_configs = {}
+    for existing_key, existing_cfg in (existing_configs or {}).items():
+        if not isinstance(existing_cfg, dict):
+            continue
+        other_entry = normalize_alert_name(
+            existing_cfg.get("alert_name") or existing_cfg.get("alert_name_raw") or existing_key
+        )
+        if other_entry == alert_name:
+            continue
+        other_exit_enabled = str(existing_cfg.get("exit_alert_enabled", "false")).lower() in {"1", "true", "yes", "on"}
+        other_exit_raw = str(
+            existing_cfg.get("exit_alert_name_raw")
+            or existing_cfg.get("exit_alert_name")
+            or existing_cfg.get("exit_alert")
+            or ""
+        ).strip()
+        other_exit = normalize_alert_name(other_exit_raw) if other_exit_raw else ""
+        if exit_alert_enabled and exit_alert_name and other_entry == exit_alert_name:
+            return {
+                "error": "EXIT_ALERT_COLLIDES_WITH_ENTRY_ALERT",
+                "message": "Exit alert name matches another strategy entry alert name.",
+                "exit_alert_name": exit_alert_raw,
+                "existing_entry_alert": existing_cfg.get("alert_name_raw") or other_entry,
+            }
+        if other_exit_enabled and other_exit and other_exit == alert_name:
+            return {
+                "error": "ALERT_NAME_COLLIDES_WITH_EXIT_ALERT",
+                "message": "Entry alert name matches another strategy exit alert name.",
+                "existing_entry_alert": existing_cfg.get("alert_name_raw") or other_entry,
+                "existing_exit_alert": other_exit_raw,
+            }
+        if exit_alert_enabled and other_exit_enabled and exit_alert_name and other_exit == exit_alert_name:
+            return {
+                "error": "EXIT_ALERT_NAME_COLLISION",
+                "message": "This exit alert name is already assigned to another strategy.",
+                "exit_alert_name": exit_alert_raw,
+                "existing_entry_alert": existing_cfg.get("alert_name_raw") or other_entry,
+            }
+
     strategy_mode = str(payload.get("strategy_mode", "CLASSIC") or "CLASSIC").strip().upper()
     if strategy_mode not in {"CLASSIC", "PRECISION_SNIPER", "GMMA_OBV", "GMMA_GOLD_CROSS", "LIQUIDITY_SWEEP", "PURE_LIQUIDITY_SWEEP", "GVK_TREND"}:
         return {"error": "INVALID_STRATEGY_MODE"}
@@ -2751,6 +2801,9 @@ async def save_alert_config(payload: Dict[str, Any]) -> Dict[str, Any]:
     payload2 = dict(payload)
     payload2["alert_name"] = alert_name
     payload2["alert_name_raw"] = str(raw_name)
+    payload2["exit_alert_enabled"] = exit_alert_enabled
+    payload2["exit_alert_name"] = exit_alert_name if exit_alert_enabled else ""
+    payload2["exit_alert_name_raw"] = exit_alert_raw if exit_alert_enabled else ""
     payload2["strategy_mode"] = strategy_mode
     payload2["order_limit_buffer_pct"] = order_buffer
     payload2["target_pct"] = target_pct

@@ -1500,6 +1500,18 @@
             </select>
           </div>
 
+          <div>
+            <label class="block text-xs font-semibold text-slate-400 uppercase mb-1.5">Alert Exit</label>
+            <select id="cfg_exit_alert_on" class="input-field" onchange="toggleExitAlertFields()">
+              <option value="false">Off</option>
+              <option value="true">On</option>
+            </select>
+          </div>
+          <div id="exitAlertNameBox" class="hidden">
+            <label class="block text-xs font-semibold text-rose-300 uppercase mb-1.5">Exit Alert Name</label>
+            <input id="cfg_exit_alert_name" class="input-field" placeholder="e.g. BULLISH_EXIT">
+          </div>
+
           <div class="col-span-2">
             <label class="block text-xs font-semibold text-cyan-400 uppercase mb-1.5">Strategy Engine</label>
             <select id="cfg_strategy_mode" class="input-field" onchange="toggleStrategyMode()">
@@ -2215,6 +2227,7 @@
 
       loadCfgList();
       loadPnlExitCfg();
+      toggleExitAlertFields();
       toggleStrategyMode();
       togglePartialProfitFields();
     }
@@ -2417,6 +2430,14 @@
     let PNL_EXIT_CFG = null;
     let BACKTEST_CONFIGS = {};
 
+    function toggleExitAlertFields() {
+      const enabled = document.getElementById("cfg_exit_alert_on")?.value === "true";
+      const box = document.getElementById("exitAlertNameBox");
+      const input = document.getElementById("cfg_exit_alert_name");
+      if (box) box.classList.toggle("hidden", !enabled);
+      if (input) input.disabled = !enabled;
+    }
+
     function toggleStrategyMode() {
       const mode = document.getElementById("cfg_strategy_mode").value;
       const precision = mode === "PRECISION_SNIPER";
@@ -2530,6 +2551,7 @@
               <span>Mode: <span class="text-slate-200">${c.tsl_stepwise ? 'STEP' : 'CONT'}</span></span>
               ${c.cost_sl_enabled ? `<span>Cost SL: <span class="text-emerald-300">1:${c.cost_sl_rr ?? 2}</span></span>` : ''}
               <span>Limit: <span class="text-yellow-200">${c.trade_limit_per_day}/day</span></span>
+              ${c.exit_alert_enabled ? `<span>Exit Alert: <span class="text-rose-300">${c.exit_alert_name_raw || c.exit_alert_name}</span></span>` : ''}
               ${c.pyramid_enabled ? `<span>Pyramid: <span class="text-fuchsia-300">${c.pyramid_step_pct ?? 0.8}% x ${c.pyramid_max_adds ?? 3}</span></span>` : ''}
               ${c.custom_partial_profit_enabled ? `<span>Partial: <span class="text-emerald-300">${c.custom_partial_tp1_pct ?? 50}%/${c.custom_partial_tp2_pct ?? 25}%/${c.custom_partial_tp3_pct ?? 25}%</span></span>` : ''}
               ${c.sector_filter_on ? `<span>Sector: <span class="text-fuchsia-300">Top ${c.top_n_sector}</span></span>` : ''}
@@ -2569,6 +2591,8 @@
       const displayName = c.alert_name_raw || c.alert_name || name;
       const sets = {
         "cfg_alert": displayName, "cfg_enabled": String(!!c.enabled), "cfg_dir": c.direction,
+        "cfg_exit_alert_on": String(!!c.exit_alert_enabled),
+        "cfg_exit_alert_name": c.exit_alert_name_raw || c.exit_alert_name || "",
         "cfg_prod": c.product, "cfg_qtymode": c.qty_mode, "cfg_cap": c.capital,
         "cfg_qty": c.qty, "cfg_tgt": c.target_pct, "cfg_sl": c.stop_loss_pct,
         "cfg_tsl_on": String(c.trailing_sl_enabled !== false),
@@ -2700,6 +2724,7 @@
         const el = document.getElementById(k);
         if (el) el.value = sets[k];
       }
+      toggleExitAlertFields();
       toggleStrategyMode();
       togglePartialProfitFields();
     }
@@ -2709,6 +2734,8 @@
         user_id: USER_ID,
         alert_name: document.getElementById("cfg_alert").value.trim(),
         enabled: document.getElementById("cfg_enabled").value === "true",
+        exit_alert_enabled: document.getElementById("cfg_exit_alert_on").value === "true",
+        exit_alert_name: document.getElementById("cfg_exit_alert_name").value.trim(),
         direction: document.getElementById("cfg_dir").value,
         product: document.getElementById("cfg_prod").value,
         qty_mode: document.getElementById("cfg_qtymode").value,
@@ -2844,6 +2871,14 @@
       };
 
       if (!payload.alert_name) { toast("Alert Name is required", 'error'); return; }
+      if (payload.exit_alert_enabled && !payload.exit_alert_name) {
+        toast("Exit Alert Name is required when Alert Exit is On", "error");
+        return;
+      }
+      if (payload.exit_alert_enabled && payload.exit_alert_name.toLowerCase() === payload.alert_name.toLowerCase()) {
+        toast("Exit Alert Name cannot be same as Entry Alert Name", "error");
+        return;
+      }
       if (payload.pyramid_enabled && !(payload.pyramid_step_pct >= 0.05 && payload.pyramid_step_pct <= 20 && payload.pyramid_max_adds >= 1 && payload.pyramid_max_adds <= 20)) {
         toast("Pyramiding requires Step % between 0.05 and 20 and Max Adds between 1 and 20", "error");
         return;
