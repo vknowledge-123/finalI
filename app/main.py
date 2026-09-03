@@ -338,12 +338,16 @@ def _totp_uri(email: str, secret: str) -> str:
 
 
 def _totp_qr_data_url(uri: str) -> str:
-    import qrcode
+    try:
+        import qrcode
 
-    img = qrcode.make(uri)
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+        img = qrcode.make(uri)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception as exc:
+        log.warning("ADMIN_TOTP_QR_GENERATION_FAILED | err=%s", exc)
+        return ""
 
 
 def _verify_totp(secret: str, code: str) -> bool:
@@ -1979,10 +1983,16 @@ def _admin_auth_html() -> str:
       try {
         const data = await api("/auth/totp/setup", {email: $("totp_email").value.trim(), password: $("totp_password").value});
         pendingSecret = data.secret;
-        $("qr").src = data.qr_data_url;
+        if (data.qr_data_url) {
+          $("qr").src = data.qr_data_url;
+          $("qr").classList.remove("hidden");
+        } else {
+          $("qr").removeAttribute("src");
+          $("qr").classList.add("hidden");
+        }
         $("secret").textContent = data.secret;
         $("qrBox").classList.remove("hidden");
-        message("Scan QR and enter code.", true);
+        message(data.qr_data_url ? "Scan QR and enter code." : "QR unavailable. Enter the manual key in Authenticator.", true);
       } catch (e) { message(e.message); }
     }
     async function verifyTotp() {
@@ -2066,7 +2076,14 @@ async def admin_totp_setup(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     secret = pyotp.random_base32()
     uri = _totp_uri(email, secret)
-    return {"ok": True, "secret": secret, "otpauth_uri": uri, "qr_data_url": _totp_qr_data_url(uri)}
+    qr_data_url = _totp_qr_data_url(uri)
+    return {
+        "ok": True,
+        "secret": secret,
+        "otpauth_uri": uri,
+        "qr_data_url": qr_data_url,
+        "qr_available": bool(qr_data_url),
+    }
 
 
 @app.post("/auth/totp/verify")
