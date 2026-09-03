@@ -34,6 +34,12 @@ def configure_logging(service_name: str) -> None:
 
 
 async def init_store() -> RedisStore:
+    testing = (os.getenv("APP_TESTING") or "").strip().lower() in {"1", "true", "yes", "on"}
+    if testing or (os.getenv("APP_ENV") or "").strip().lower() == "test":
+        from .memory_store import InMemoryStore
+
+        return InMemoryStore()  # type: ignore[return-value]
+
     encryption_manager = None
     if init_encryption is not None:
         try:
@@ -99,4 +105,3 @@ async def wait_for_shutdown() -> None:
         except NotImplementedError:
             pass
     await stop.wait()
-

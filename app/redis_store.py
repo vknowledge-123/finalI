@@ -176,6 +176,14 @@ def k_sector_cache(user_id: int) -> str:
     return f"sector:cache:{int(user_id)}:{now_ist_date()}"
 
 
+def k_broker_feed_health(user_id: int, broker: str) -> str:
+    return f"broker:feed:health:{int(user_id)}:{str(broker or '').strip().upper()}"
+
+
+def k_latest_tick(user_id: int, symbol: str) -> str:
+    return f"tick:latest:{int(user_id)}:{norm_symbol(symbol)}"
+
+
 # =========================
 # Lua scripts
 # =========================
@@ -378,6 +386,80 @@ class RedisStore:
                 return {}
             data = json.loads(raw)
             return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    # =========================
+    # Broker feed health / latest tick
+    # =========================
+    async def save_broker_feed_health(
+        self,
+        user_id: int,
+        broker: str,
+        connected: bool,
+        ttl_sec: int = 15,
+        detail: str = "",
+    ) -> Dict[str, Any]:
+        payload = {
+            "user_id": int(user_id),
+            "broker": str(broker or "").strip().upper(),
+            "connected": bool(connected),
+            "detail": str(detail or ""),
+            "ts": time.time(),
+        }
+        await self.redis.setex(
+            k_broker_feed_health(user_id, payload["broker"]),
+            max(1, int(ttl_sec)),
+            json.dumps(payload, separators=(",", ":")),
+        )
+        return payload
+
+    async def load_broker_feed_health(self, user_id: int, broker: str) -> Dict[str, Any]:
+        try:
+            raw = await self.redis.get(k_broker_feed_health(user_id, broker))
+            if not raw:
+                return {"connected": False, "reason": "BROKER_FEED_HEALTH_MISSING"}
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                return {"connected": False, "reason": "BROKER_FEED_HEALTH_BAD"}
+            ts = float(data.get("ts") or 0.0)
+            data["age_sec"] = max(0.0, time.time() - ts) if ts > 0 else 999999.0
+            return data
+        except Exception as exc:
+            return {"connected": False, "reason": f"BROKER_FEED_HEALTH_ERROR:{exc}"}
+
+    async def save_latest_tick(
+        self,
+        user_id: int,
+        symbol: str,
+        payload: Dict[str, Any],
+        ttl_sec: int = 30,
+    ) -> Dict[str, Any]:
+        sym = norm_symbol(symbol)
+        if not sym:
+            return {}
+        data = dict(payload or {})
+        data["user_id"] = int(user_id)
+        data["symbol"] = sym
+        data["ts"] = time.time()
+        await self.redis.setex(
+            k_latest_tick(user_id, sym),
+            max(1, int(ttl_sec)),
+            json.dumps(data, separators=(",", ":")),
+        )
+        return data
+
+    async def load_latest_tick(self, user_id: int, symbol: str) -> Dict[str, Any]:
+        try:
+            raw = await self.redis.get(k_latest_tick(user_id, symbol))
+            if not raw:
+                return {}
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                return {}
+            ts = float(data.get("ts") or 0.0)
+            data["age_sec"] = max(0.0, time.time() - ts) if ts > 0 else 999999.0
+            return data
         except Exception:
             return {}
 

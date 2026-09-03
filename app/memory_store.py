@@ -32,6 +32,8 @@ class InMemoryStore:
         self._cnc_carry_positions: Dict[int, Dict[str, Dict[str, Any]]] = {}
         self._pnl_exit_cfg: Dict[int, Dict[str, Any]] = {}
         self._sector_cache: Dict[int, Dict[str, Any]] = {}
+        self._broker_feed_health: Dict[str, Dict[str, Any]] = {}
+        self._latest_ticks: Dict[str, Dict[str, Any]] = {}
         self._locks: Dict[str, float] = {}
         self._open_trades: Dict[str, str] = {}
         self._trade_counts: Dict[str, int] = {}
@@ -157,6 +159,69 @@ class InMemoryStore:
 
     async def load_sector_cache(self, user_id: int) -> Dict[str, Any]:
         return dict(self._sector_cache.get(int(user_id), {}))
+
+    def _feed_key(self, user_id: int, broker: str) -> str:
+        return f"{int(user_id)}:{str(broker or '').strip().upper()}"
+
+    def _tick_key(self, user_id: int, symbol: str) -> str:
+        return f"{int(user_id)}:{norm_symbol(symbol)}"
+
+    async def save_broker_feed_health(
+        self,
+        user_id: int,
+        broker: str,
+        connected: bool,
+        ttl_sec: int = 15,
+        detail: str = "",
+    ) -> Dict[str, Any]:
+        payload = {
+            "user_id": int(user_id),
+            "broker": str(broker or "").strip().upper(),
+            "connected": bool(connected),
+            "detail": str(detail or ""),
+            "ts": time.time(),
+            "expires_at": time.time() + max(1, int(ttl_sec)),
+        }
+        self._broker_feed_health[self._feed_key(user_id, broker)] = dict(payload)
+        return payload
+
+    async def load_broker_feed_health(self, user_id: int, broker: str) -> Dict[str, Any]:
+        payload = self._broker_feed_health.get(self._feed_key(user_id, broker))
+        if not payload:
+            return {"connected": False, "reason": "BROKER_FEED_HEALTH_MISSING"}
+        if float(payload.get("expires_at") or 0.0) < time.time():
+            return {"connected": False, "reason": "BROKER_FEED_HEALTH_EXPIRED"}
+        data = dict(payload)
+        ts = float(data.get("ts") or 0.0)
+        data["age_sec"] = max(0.0, time.time() - ts) if ts > 0 else 999999.0
+        return data
+
+    async def save_latest_tick(
+        self,
+        user_id: int,
+        symbol: str,
+        payload: Dict[str, Any],
+        ttl_sec: int = 30,
+    ) -> Dict[str, Any]:
+        sym = norm_symbol(symbol)
+        if not sym:
+            return {}
+        data = dict(payload or {})
+        data["user_id"] = int(user_id)
+        data["symbol"] = sym
+        data["ts"] = time.time()
+        data["expires_at"] = time.time() + max(1, int(ttl_sec))
+        self._latest_ticks[self._tick_key(user_id, sym)] = dict(data)
+        return data
+
+    async def load_latest_tick(self, user_id: int, symbol: str) -> Dict[str, Any]:
+        payload = self._latest_ticks.get(self._tick_key(user_id, symbol))
+        if not payload or float(payload.get("expires_at") or 0.0) < time.time():
+            return {}
+        data = dict(payload)
+        ts = float(data.get("ts") or 0.0)
+        data["age_sec"] = max(0.0, time.time() - ts) if ts > 0 else 999999.0
+        return data
 
     # -------------------------
     # Alert config

@@ -6,6 +6,8 @@ import pandas as pd
 from app.dhan_broker import (
     DhanInstrumentRegistry,
     MarketFeed,
+    broker_error_message,
+    ensure_no_broker_error,
     normalize_dhan_candles,
     normalize_dhan_holdings,
     normalize_dhan_positions,
@@ -22,6 +24,18 @@ class DhanBrokerTests(unittest.TestCase):
             order_id_from_response({"status": "success", "data": {"orderId": "123"}}),
             "123",
         )
+
+    def test_nested_broker_error_message_is_extracted(self) -> None:
+        response = {
+            "data": {
+                "orderStatus": "REJECTED",
+                "details": {"omsErrorDescription": "Rate Not Within Ckt Limit 605.35 To 669.05"},
+            }
+        }
+
+        self.assertIn("Rate Not Within Ckt Limit", broker_error_message(response))
+        with self.assertRaisesRegex(RuntimeError, "DHAN_PLACE_ORDER_REJECTED"):
+            ensure_no_broker_error(response, "DHAN_PLACE_ORDER_REJECTED")
 
     def test_positions_are_converted_to_engine_shape(self) -> None:
         result = normalize_dhan_positions(
@@ -186,7 +200,7 @@ class DhanBrokerTests(unittest.TestCase):
 
 
 class DhanTradeEngineTests(unittest.IsolatedAsyncioTestCase):
-    async def test_dhan_market_order_uses_security_id(self) -> None:
+    async def test_dhan_market_order_fallback_is_opt_in(self) -> None:
         store = InMemoryStore()
         await store.save_broker(1, "DHAN")
         await store.save_dhan_credentials(1, "client", "token")
@@ -203,14 +217,28 @@ class DhanTradeEngineTests(unittest.IsolatedAsyncioTestCase):
         engine.order_worker.submit = AsyncMock(
             return_value={"status": "success", "data": {"orderId": "DHAN-1"}}
         )
+        engine._fetch_ltp = AsyncMock(return_value=0.0)
+        engine.market_data_worker.submit = AsyncMock(return_value={})
 
-        with patch(
-            "app.trade_engine.DHAN_INSTRUMENTS.security_id",
-            AsyncMock(return_value="3045"),
-        ):
+        with patch.dict("os.environ", {"APP_TESTING": "", "APP_ENV": "production"}):
+            with patch("app.trade_engine.DHAN_INSTRUMENTS.security_id", AsyncMock(return_value="3045")):
+                with self.assertRaisesRegex(RuntimeError, "DHAN_EXECUTABLE_PRICE_UNAVAILABLE"):
+                    await engine._place_order("SBIN", "BUY", 10, "MIS")
+        engine.order_worker.submit.assert_not_awaited()
+
+        with patch("app.trade_engine.DHAN_INSTRUMENTS.security_id", AsyncMock(return_value="3045")):
             order_id = await engine._place_order("SBIN", "BUY", 10, "MIS")
-
         self.assertEqual(order_id, "DHAN-1")
+
+        engine.order_worker.submit.reset_mock()
+        with patch.dict("os.environ", {"APP_TESTING": "", "APP_ENV": "production", "ALLOW_DHAN_MARKET_FALLBACK": "1"}):
+            with patch("app.trade_engine.DHAN_INSTRUMENTS.security_id", AsyncMock(return_value="3045")):
+                engine._fetch_ltp.return_value = 100.0
+                engine.market_data_worker.submit = AsyncMock(return_value={})
+                engine.order_worker.submit.return_value = {"status": "success", "data": {"orderId": "DHAN-2"}}
+                order_id = await engine._place_order("SBIN", "BUY", 10, "MIS")
+
+        self.assertEqual(order_id, "DHAN-2")
         kwargs = engine.order_worker.submit.await_args.kwargs
         self.assertEqual(kwargs["security_id"], "3045")
         self.assertEqual(kwargs["exchange_segment"], "NSE_EQ")

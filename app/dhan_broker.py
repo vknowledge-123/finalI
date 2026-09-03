@@ -8,7 +8,35 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 
 import pandas as pd
 import pytz
-from dhanhq import DhanContext, MarketFeed, OrderUpdate, dhanhq
+
+try:  # Keep the app importable if the broker SDK changes or is temporarily broken.
+    from dhanhq import DhanContext, MarketFeed, OrderUpdate, dhanhq
+
+    DHAN_SDK_AVAILABLE = True
+    DHAN_SDK_IMPORT_ERROR = ""
+except Exception as exc:  # pragma: no cover - exercised only when SDK import fails
+    DHAN_SDK_AVAILABLE = False
+    DHAN_SDK_IMPORT_ERROR = compact_msg = str(exc)
+
+    class DhanContext:  # type: ignore[no-redef]
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            raise RuntimeError(f"DHAN_SDK_UNAVAILABLE:{compact_msg}")
+
+    class MarketFeed:  # type: ignore[no-redef]
+        NSE = 1
+        IDX = 0
+        NSE_FNO = 2
+        Full = 21
+
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            raise RuntimeError(f"DHAN_MARKET_FEED_UNAVAILABLE:{compact_msg}")
+
+    class OrderUpdate:  # type: ignore[no-redef]
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            raise RuntimeError(f"DHAN_ORDER_UPDATE_UNAVAILABLE:{compact_msg}")
+
+    def dhanhq(*_args: Any, **_kwargs: Any) -> Any:  # type: ignore[no-redef]
+        raise RuntimeError(f"DHAN_SDK_UNAVAILABLE:{compact_msg}")
 
 from .redis_store import norm_symbol
 
@@ -253,6 +281,67 @@ class DhanInstrumentRegistry:
 DHAN_INSTRUMENTS = DhanInstrumentRegistry()
 
 
+def compact_broker_error(value: Any, limit: int = 300) -> str:
+    text = str(value or "").replace("\r", " ").replace("\n", " ").strip()
+    return text[: max(20, int(limit))]
+
+
+def broker_error_message(response: Any) -> str:
+    keys = (
+        "omsErrorDescription",
+        "oms_error_description",
+        "rejectionReason",
+        "rejection_reason",
+        "errorMessage",
+        "error_message",
+        "message",
+        "remarks",
+        "remark",
+        "error",
+        "detail",
+    )
+    stack = [response]
+    seen = 0
+    while stack and seen < 200:
+        seen += 1
+        value = stack.pop()
+        if isinstance(value, dict):
+            for key in keys:
+                item = value.get(key)
+                if item not in (None, ""):
+                    return compact_broker_error(item)
+            stack.extend(value.values())
+        elif isinstance(value, list):
+            stack.extend(value)
+    return ""
+
+
+def broker_response_status(response: Any) -> str:
+    keys = ("status", "orderStatus", "order_status", "orderStatusText")
+    data = response_data(response)
+    if isinstance(data, list) and data:
+        data = data[0]
+    if isinstance(data, dict):
+        for key in keys:
+            value = data.get(key)
+            if value not in (None, ""):
+                return str(value).strip().upper().replace(" ", "_")
+    if isinstance(response, dict):
+        for key in keys:
+            value = response.get(key)
+            if value not in (None, ""):
+                return str(value).strip().upper().replace(" ", "_")
+    return ""
+
+
+def ensure_no_broker_error(response: Any, context: str) -> None:
+    status = broker_response_status(response)
+    message = broker_error_message(response)
+    if status in {"FAILURE", "FAILED", "ERROR", "REJECTED"} or message:
+        reason = message or status or "UNKNOWN_BROKER_ERROR"
+        raise RuntimeError(f"{context}:{reason}")
+
+
 def dhan_client(client_id: str, access_token: str) -> dhanhq:
     return dhanhq(DhanContext(str(client_id), str(access_token)))
 
@@ -271,23 +360,11 @@ def order_id_from_response(response: Any) -> str:
         value = data.get("orderId") or data.get("order_id") or data.get("orderNo")
         if value:
             return str(value)
-        message = (
-            data.get("errorMessage")
-            or data.get("remarks")
-            or data.get("remark")
-            or data.get("message")
-            or data.get("error")
-        )
+        message = broker_error_message(data)
         if message:
             raise RuntimeError(str(message))
     if isinstance(response, dict):
-        message = (
-            response.get("errorMessage")
-            or response.get("remarks")
-            or response.get("remark")
-            or response.get("message")
-            or response.get("error")
-        )
+        message = broker_error_message(response)
         if message:
             raise RuntimeError(str(message))
     if isinstance(response, (str, int)):

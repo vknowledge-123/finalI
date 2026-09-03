@@ -14,22 +14,60 @@ from .stock_sector import STOCK_INDEX_MAPPING
 configure_logging("market_feed_service")
 log = logging.getLogger("market_feed_service")
 
-REFRESH_SEC = float(os.getenv("MARKET_FEED_REFRESH_SEC", "60") or "60")
+REFRESH_SEC = float(os.getenv("MARKET_FEED_REFRESH_SEC", "10") or "10")
 SUBSCRIPTION_DRAIN_LIMIT = int(os.getenv("MARKET_SUBSCRIPTION_DRAIN_LIMIT", "200") or "200")
+FEED_HEALTH_REFRESH_SEC = float(os.getenv("FEED_HEALTH_REFRESH_SEC", "2") or "2")
+FEED_RESTART_AFTER_SEC = float(os.getenv("FEED_RESTART_AFTER_SEC", "30") or "30")
+FEED_RESTART_COOLDOWN_SEC = float(os.getenv("FEED_RESTART_COOLDOWN_SEC", "30") or "30")
+_DISCONNECTED_SINCE: Dict[int, float] = {}
+_LAST_RESTART: Dict[int, float] = {}
+
+
+async def _feed_started_with_current_credentials(main_app: Any, store: Any, user_id: int, broker: str) -> bool:
+    broker = str(broker or "").strip().upper()
+    if broker == "DHAN":
+        creds = await store.load_dhan_credentials(int(user_id))
+        access_token = str(creds.get("access_token") or "").strip()
+        return bool(
+            access_token
+            and main_app.DHAN_FEED is not None
+            and main_app.DHAN_USER_ID == int(user_id)
+            and getattr(main_app, "DHAN_ACCESS_TOKEN", "") == access_token
+        )
+
+    access_token = str(await store.load_access_token(int(user_id)) or "").strip()
+    return bool(
+        access_token
+        and main_app.KT is not None
+        and main_app.KT_USER_ID == int(user_id)
+        and main_app.KT_ACCESS_TOKEN == access_token
+    )
 
 
 async def _ensure_user_feed_started(main_app: Any, store: Any, started_users: Set[int], user_id: int) -> None:
     user_id = int(user_id)
-    if user_id in started_users:
+    broker = str(await store.load_broker(user_id) or "ZERODHA").strip().upper()
+    if user_id in started_users and await _feed_started_with_current_credentials(main_app, store, user_id, broker):
         return
+    started_users.discard(user_id)
     engine = await main_app.ensure_engine(user_id)
     await engine.configure_broker()
     await main_app.subscribe_symbols_for_user(user_id, list(STOCK_INDEX_MAPPING.keys()))
-    if await store.load_broker(user_id) == "DHAN":
+    if broker == "DHAN":
         await main_app.subscribe_dhan_sector_indices_for_user(user_id)
     await main_app.restart_selected_feed(user_id)
+    if not await _feed_started_with_current_credentials(main_app, store, user_id, broker):
+        await store.save_broker_feed_health(
+            user_id,
+            "DHAN" if broker == "DHAN" else "ZERODHA",
+            False,
+            ttl_sec=15,
+            detail="credentials_missing_or_feed_not_started",
+        )
+        log.warning("MARKET_FEED_NOT_STARTED | user=%s broker=%s", user_id, broker)
+        return
     started_users.add(user_id)
-    log.info("MARKET_FEED_STARTED | user=%s broker=%s", user_id, await store.load_broker(user_id))
+    log.info("MARKET_FEED_STARTED | user=%s broker=%s", user_id, broker)
 
 
 async def _drain_subscription_requests(main_app: Any, store: Any, started_users: Set[int]) -> None:
@@ -54,6 +92,41 @@ async def _drain_subscription_requests(main_app: Any, store: Any, started_users:
             log.exception("Market subscription request failed | user=%s symbols=%s", user_id, symbols)
 
 
+async def _publish_feed_health(main_app: Any, store: Any, started_users: Set[int]) -> None:
+    now = time.time()
+    for user_id in list(started_users):
+        try:
+            broker = str(await store.load_broker(int(user_id)) or "ZERODHA").strip().upper()
+            if broker == "DHAN":
+                connected = bool(main_app.DHAN_CONNECTED and main_app.DHAN_USER_ID == int(user_id))
+            else:
+                connected = bool(main_app.KT_CONNECTED and main_app.KT_USER_ID == int(user_id))
+            await store.save_broker_feed_health(
+                int(user_id),
+                "DHAN" if broker == "DHAN" else "ZERODHA",
+                connected,
+                ttl_sec=15,
+                detail="market_feed_service",
+            )
+            if connected:
+                _DISCONNECTED_SINCE.pop(int(user_id), None)
+                continue
+
+            since = _DISCONNECTED_SINCE.setdefault(int(user_id), now)
+            last_restart = _LAST_RESTART.get(int(user_id), 0.0)
+            if now - since >= FEED_RESTART_AFTER_SEC and now - last_restart >= FEED_RESTART_COOLDOWN_SEC:
+                _LAST_RESTART[int(user_id)] = now
+                log.warning("MARKET_FEED_WATCHDOG_RESTART | user=%s broker=%s", user_id, broker)
+                await main_app.restart_selected_feed(int(user_id))
+                if await _feed_started_with_current_credentials(main_app, store, int(user_id), broker):
+                    started_users.add(int(user_id))
+                else:
+                    started_users.discard(int(user_id))
+                _DISCONNECTED_SINCE.pop(int(user_id), None)
+        except Exception:
+            log.exception("Market feed health publish failed | user=%s", user_id)
+
+
 async def main() -> None:
     # Reuse existing feed wiring in app.main so Dhan/Kite websocket packet
     # handling remains exactly the same as the dashboard process.
@@ -68,6 +141,7 @@ async def main() -> None:
         log.info("Market feed service started")
         started_users = set()
         last_user_refresh = 0.0
+        last_health_refresh = 0.0
         while True:
             now = time.time()
             if now - last_user_refresh >= max(5.0, REFRESH_SEC):
@@ -78,6 +152,9 @@ async def main() -> None:
                     except Exception:
                         log.exception("Market feed start failed | user=%s", user_id)
             await _drain_subscription_requests(main_app, store, started_users)
+            if now - last_health_refresh >= max(1.0, FEED_HEALTH_REFRESH_SEC):
+                last_health_refresh = now
+                await _publish_feed_health(main_app, store, started_users)
             await asyncio.sleep(1.0)
     finally:
         await main_app._stop_dhan_feed()

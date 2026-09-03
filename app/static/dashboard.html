@@ -2317,7 +2317,12 @@
           headers,
           body: JSON.stringify({ user_id: USER_ID })
         });
-        const d = await r.json().catch(() => ({}));
+        let d = {};
+        try {
+          d = await readJsonResponse(r);
+        } catch (e) {
+          d = { ok: false, error: (e && e.message) ? e.message : String(e) };
+        }
         return { r, d };
       };
 
@@ -2361,7 +2366,13 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ user_id: USER_ID, enabled: enabled })
       });
-      const d = await resp.json().catch(() => ({}));
+      let d = {};
+      try {
+        d = await readJsonResponse(resp);
+      } catch (e) {
+        toast((e && e.message) ? e.message : "Kill switch request failed", "error");
+        return;
+      }
 
       if (!resp.ok || d.error) {
         toast(d.error || d.detail || "Kill switch request failed", "error");

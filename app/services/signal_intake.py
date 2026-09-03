@@ -9,6 +9,7 @@ from typing import Any, Awaitable, Callable, Dict, List
 from fastapi import Request
 
 from ..chartink_client import normalize_alert_name, normalize_symbol, normalize_symbols, parse_chartink_payload
+from ..dhan_broker import compact_broker_error
 from .contracts import ChartinkSignalJob
 from .job_queue import AsyncJobQueue
 from .notification_service import NotificationService
@@ -168,7 +169,10 @@ class SignalIntakeService:
         except Exception as exc:
             log.exception("WEBHOOK_PANIC | user=%s alert=%s", user_id, job.alert_name)
             await self.notification.store.set_kill(user_id, True)
-            result = [{"symbol": symbol, "status": "ERROR", "reason": f"CRITICAL_FAIL:{exc}"} for symbol in symbols]
+            result = [
+                {"symbol": symbol, "status": "ERROR", "reason": f"CRITICAL_FAIL:{compact_broker_error(exc)}"}
+                for symbol in symbols
+            ]
 
         execution_symbols = [
             normalize_symbol(str(row.get("execution_symbol") or ""))

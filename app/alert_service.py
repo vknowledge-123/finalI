@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
+import uuid
 from typing import Any, Dict
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from .chartink_client import normalize_alert_name, normalize_symbol, normalize_symbols, parse_chartink_payload
 from .service_bootstrap import configure_logging, init_store
 from .service_queues import ALERT_QUEUE, MARKET_SUBSCRIPTION_QUEUE
 
 configure_logging("alert_service")
+log = logging.getLogger("alert_service")
 
 app = FastAPI(title="AlgoEdge Alert Service")
 app.add_middleware(
@@ -23,6 +28,55 @@ app.add_middleware(
 )
 
 store = None
+
+
+def _json_error_response(
+    request: Request,
+    status_code: int,
+    error: str,
+    detail: Any = "",
+    *,
+    request_id: str = "",
+) -> JSONResponse:
+    rid = request_id or request.headers.get("x-request-id") or uuid.uuid4().hex[:12]
+    return JSONResponse(
+        status_code=int(status_code),
+        content={
+            "ok": False,
+            "error": str(error or "ERROR"),
+            "detail": detail if isinstance(detail, (str, int, float, bool, list, dict)) else str(detail),
+            "request_id": rid,
+        },
+    )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    detail = exc.detail if exc.detail is not None else "HTTP_ERROR"
+    return _json_error_response(request, exc.status_code, str(detail), detail)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    return _json_error_response(request, 422, "REQUEST_VALIDATION_ERROR", exc.errors())
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    request_id = request.headers.get("x-request-id") or uuid.uuid4().hex[:12]
+    log.exception(
+        "UNHANDLED_ALERT_EXCEPTION | request_id=%s method=%s path=%s",
+        request_id,
+        request.method,
+        request.url.path,
+    )
+    return _json_error_response(
+        request,
+        500,
+        "INTERNAL_SERVER_ERROR",
+        "Unexpected server error. Check alert-service logs with request_id.",
+        request_id=request_id,
+    )
 
 
 async def _read_payload(request: Request) -> Dict[str, Any]:
@@ -75,8 +129,9 @@ async def shutdown() -> None:
 
 @app.get("/health")
 async def health() -> Dict[str, Any]:
-    depth = await store.redis.llen(ALERT_QUEUE) if store is not None else -1
-    sub_depth = await store.redis.llen(MARKET_SUBSCRIPTION_QUEUE) if store is not None else -1
+    redis_client = getattr(store, "redis", None) if store is not None else None
+    depth = await redis_client.llen(ALERT_QUEUE) if redis_client is not None else -1
+    sub_depth = await redis_client.llen(MARKET_SUBSCRIPTION_QUEUE) if redis_client is not None else -1
     return {
         "ok": True,
         "service": "alert",

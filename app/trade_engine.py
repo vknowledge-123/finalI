@@ -14,7 +14,6 @@ from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 from typing import Any, Dict, Optional, Literal, List, Tuple, Set
 from dataclasses import fields as _dc_fields
 from kiteconnect import KiteConnect  # type: ignore
-from dhanhq import MarketFeed, dhanhq  # type: ignore
 
 # Keep dependencies intact (same modules you already use)
 from .redis_store import RedisStore, norm_alert_name, norm_symbol
@@ -42,7 +41,10 @@ from .custom_strategy import (
 )
 from .dhan_broker import (
     DHAN_INSTRUMENTS,
+    MarketFeed,
+    broker_error_message,
     dhan_client,
+    ensure_no_broker_error,
     normalize_dhan_candles,
     normalize_dhan_holdings,
     normalize_dhan_positions,
@@ -395,17 +397,19 @@ def _depth_execution_price(response: Any, side: Side, qty: int) -> float:
 
 def _order_rejection_reason(snapshot: Dict[str, Any]) -> str:
     raw = snapshot.get("raw") if isinstance(snapshot, dict) else {}
-    reason = _order_field(
-        raw if isinstance(raw, dict) else {},
-        "omsErrorDescription",
-        "oms_error_description",
-        "rejectionReason",
-        "rejection_reason",
-        "errorMessage",
-        "error_message",
-        "message",
-        "remarks",
-    )
+    reason = broker_error_message(raw if isinstance(raw, dict) else {})
+    if not reason:
+        reason = _order_field(
+            raw if isinstance(raw, dict) else {},
+            "omsErrorDescription",
+            "oms_error_description",
+            "rejectionReason",
+            "rejection_reason",
+            "errorMessage",
+            "error_message",
+            "message",
+            "remarks",
+        )
     return str(reason or "").strip()
 
 
@@ -519,6 +523,34 @@ def _short_repr(value: Any, limit: int = 500) -> str:
     if len(text) <= limit:
         return text
     return text[: max(0, limit - 3)] + "..."
+
+
+def _safe_error(value: Any, limit: int = 240) -> str:
+    reason = broker_error_message(value)
+    if not reason:
+        reason = _short_repr(value, limit).replace("\n", " ").replace("\r", " ")
+    return str(reason or "UNKNOWN_ERROR")[: max(20, int(limit))]
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float((os.getenv(name) or str(default)).strip() or default)
+    except Exception:
+        return float(default)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = (os.getenv(name) or "").strip().lower()
+    if not value:
+        return bool(default)
+    return value in {"1", "true", "yes", "on"}
+
+
+def _is_test_mode() -> bool:
+    value = (os.getenv("APP_TESTING") or "").strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    return (os.getenv("APP_ENV") or "").strip().lower() == "test"
 
 
 def _is_broker_validation_error(exc: Any) -> bool:
@@ -1502,6 +1534,9 @@ class TradeEngine:
                     price_source,
                 )
             else:
+                allow_market_fallback = _is_test_mode() or _env_bool("ALLOW_DHAN_MARKET_FALLBACK", False)
+                if not allow_market_fallback:
+                    raise RuntimeError(f"DHAN_EXECUTABLE_PRICE_UNAVAILABLE:{price_source}")
                 order_type = self.dhan.MARKET
                 order_price = 0
                 log.warning(
@@ -1523,6 +1558,7 @@ class TradeEngine:
                 product_type=self.dhan.CNC if product == "CNC" else self.dhan.INTRA,
                 price=order_price,
             )
+            ensure_no_broker_error(response, "DHAN_PLACE_ORDER_REJECTED")
             order_id = order_id_from_response(response)
             if order_symbol != norm_symbol(symbol):
                 return {
@@ -1537,7 +1573,7 @@ class TradeEngine:
         ok = await self._ensure_kite_ready()
         if not ok or not self.kite:
             raise RuntimeError("ZERODHA_NOT_CONNECTED")
-        return await self.order_worker.submit(
+        response = await self.order_worker.submit(
             self.kite.place_order,
             variety="regular",
             exchange="NSE",
@@ -1548,6 +1584,9 @@ class TradeEngine:
             order_type="MARKET",
             market_protection=-1
         )
+        if isinstance(response, dict):
+            ensure_no_broker_error(response, "ZERODHA_PLACE_ORDER_REJECTED")
+        return response
 
     def _order_confirm_settings(self, cfg: Optional[Dict[str, Any]] = None) -> Tuple[float, int]:
         cfg = cfg or {}
@@ -1972,6 +2011,56 @@ class TradeEngine:
             avg = float(r.get("average_price") or r.get("buy_price") or 0.0)
             return avg
         return 0.0
+
+    async def _wait_for_entry_feed_ready(self, symbol: str) -> Tuple[bool, str, float]:
+        """
+        Entry orders are only safe when the broker market feed is alive and the
+        exact alert symbol has a fresh websocket tick. REST auth/LTP can place
+        orders, but target/SL/TSL exits depend on the live feed.
+        """
+        if _is_test_mode() or not _env_bool("REQUIRE_BROKER_FEED_FOR_ENTRY", True):
+            return True, "", 0.0
+
+        symbol = norm_symbol(symbol)
+        broker = str(self.broker or "").strip().upper()
+        if broker not in {"DHAN", "ZERODHA"}:
+            return False, "BROKER_NOT_CONFIGURED", 0.0
+
+        timeout_sec = max(0.0, _env_float("ENTRY_FEED_READY_TIMEOUT_SEC", 5.0))
+        fresh_sec = max(0.5, _env_float("ENTRY_FRESH_TICK_MAX_AGE_SEC", 5.0))
+        deadline = time.time() + timeout_sec
+        last_reason = "BROKER_FEED_NOT_CONNECTED"
+
+        while True:
+            health: Dict[str, Any] = {}
+            try:
+                health_fn = getattr(self.store, "load_broker_feed_health", None)
+                if callable(health_fn):
+                    health = await health_fn(self.user_id, broker)
+            except Exception as exc:
+                health = {"connected": False, "reason": f"BROKER_FEED_HEALTH_ERROR:{exc}"}
+
+            if not bool(health.get("connected", False)):
+                detail = str(health.get("reason") or health.get("detail") or "").strip()
+                last_reason = "BROKER_FEED_NOT_CONNECTED" + (f":{detail}" if detail else "")
+            else:
+                latest: Dict[str, Any] = {}
+                try:
+                    tick_fn = getattr(self.store, "load_latest_tick", None)
+                    if callable(tick_fn):
+                        latest = await tick_fn(self.user_id, symbol)
+                except Exception:
+                    latest = {}
+
+                age = float(latest.get("age_sec", 999999.0) or 999999.0)
+                ltp = float(latest.get("ltp") or latest.get("last_price") or 0.0)
+                if ltp > 0 and age <= fresh_sec:
+                    return True, "", ltp
+                last_reason = f"NO_FRESH_LIVE_TICK:{symbol}:age={age:.1f}s"
+
+            if time.time() >= deadline:
+                return False, last_reason, 0.0
+            await asyncio.sleep(0.25)
 
     async def _fetch_ltp(self, symbol: str) -> float:
         symbol = norm_symbol(symbol)
@@ -2428,7 +2517,7 @@ class TradeEngine:
                             candles = await self._fetch_historical_candles(sym, interval, lookback_days)
                             custom_signal, custom_meta = custom_signal_fn(candles, cfg.custom_settings or {})
                     except Exception as e:
-                        results.append({"symbol": sym, "status": "ERROR", "reason": f"CUSTOM_DATA_FAIL:{e}"})
+                        results.append({"symbol": sym, "status": "ERROR", "reason": f"CUSTOM_DATA_FAIL:{_safe_error(e)}"})
                         continue
 
                     if not custom_signal:
@@ -2461,7 +2550,12 @@ class TradeEngine:
                     results.append({"symbol": sym, "status": "SKIPPED", "reason": "ALREADY_OPEN"})
                     continue
 
-                ltp = await self._fetch_ltp(sym)
+                feed_ok, feed_reason, live_ltp = await self._wait_for_entry_feed_ready(sym)
+                if not feed_ok:
+                    results.append({"symbol": sym, "status": "SKIPPED", "reason": feed_reason})
+                    continue
+
+                ltp = live_ltp if live_ltp > 0 else await self._fetch_ltp(sym)
                 if ltp <= 0:
                     results.append({"symbol": sym, "status": "ERROR", "reason": "NO_LTP"})
                     continue
@@ -2502,7 +2596,7 @@ class TradeEngine:
                 try:
                     execution = await self._place_order_with_execution(sym, side, qty, cfg.product, cfg.custom_settings)
                 except Exception as e:
-                    results.append({"symbol": sym, "status": "ERROR", "reason": f"ORDER_FAIL:{e}"})
+                    results.append({"symbol": sym, "status": "ERROR", "reason": f"ORDER_FAIL:{_safe_error(e)}"})
                     continue
                 execution_symbol = execution.symbol or sym
                 execution_side = execution.side
@@ -2871,7 +2965,7 @@ class TradeEngine:
             return True
         except Exception as e:
             pos.status = "ERROR"
-            pos.exit_reason = f"{target}_PARTIAL_ORDER_FAIL:{e}"
+            pos.exit_reason = f"{target}_PARTIAL_ORDER_FAIL:{_safe_error(e)}"
             pos.updated_ts = time.time()
             try:
                 await self._persist_position_state(pos)
@@ -3701,7 +3795,7 @@ class TradeEngine:
             data = await self._broker_positions()
         except Exception as e:
             log.error("❌ POSITIONS_FETCH_FAIL | user=%s symbol=%s err=%s", self.user_id, symbol, e)
-            return {"status": "ERROR", "reason": f"POSITIONS_FETCH_FAIL:{e}"}
+            return {"status": "ERROR", "reason": f"POSITIONS_FETCH_FAIL:{_safe_error(e)}"}
 
         rows = []
         try:
@@ -3771,7 +3865,7 @@ class TradeEngine:
             }
         except Exception as e:
             log.error("❌ MANUAL_EXIT_ZERODHA_FAIL | user=%s symbol=%s err=%s", self.user_id, symbol, e)
-            return {"status": "ERROR", "reason": f"EXIT_ORDER_FAIL:{e}", "symbol": symbol}
+            return {"status": "ERROR", "reason": f"EXIT_ORDER_FAIL:{_safe_error(e)}", "symbol": symbol}
 
 
     # =========================
@@ -3906,7 +4000,7 @@ class TradeEngine:
 
                 except Exception as e:
                     pos.status = "ERROR"
-                    pos.exit_reason = f"EXIT_ORDER_FAIL:{e}"
+                    pos.exit_reason = f"EXIT_ORDER_FAIL:{_safe_error(e)}"
                     pos.updated_ts = time.time()
 
                     log.error(

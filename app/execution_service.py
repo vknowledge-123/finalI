@@ -7,6 +7,7 @@ from typing import Any, Dict, List
 
 from .service_bootstrap import EngineRegistry, configure_logging, init_store
 from .service_queues import ALERT_QUEUE
+from .dhan_broker import compact_broker_error
 
 configure_logging("execution_service")
 log = logging.getLogger("execution_service")
@@ -25,7 +26,10 @@ async def _process_job(store, registry: EngineRegistry, job: Dict[str, Any]) -> 
     except Exception as exc:
         log.exception("Alert execution failed | user=%s alert=%s", user_id, alert_name)
         await store.set_kill(user_id, True)
-        result = [{"symbol": symbol, "status": "ERROR", "reason": f"CRITICAL_FAIL:{exc}"} for symbol in symbols]
+        result = [
+            {"symbol": symbol, "status": "ERROR", "reason": f"CRITICAL_FAIL:{compact_broker_error(exc)}"}
+            for symbol in symbols
+        ]
 
     await store.save_alert(user_id, {"alert_name": alert_name, "time": ts, "result": result})
     log.info("EXECUTED_ALERT | user=%s alert=%s symbols=%s result=%s", user_id, alert_name, symbols, result)
@@ -54,4 +58,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-

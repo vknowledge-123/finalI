@@ -8,18 +8,19 @@ import pytz
 import datetime
 import subprocess
 import sys
+import uuid
 from urllib.parse import urlparse
 
 from typing import Any, Dict, List, Optional, Set, Tuple
 import httpx
 from fastapi import HTTPException
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, Query, Header
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from jinja2 import Template
 from kiteconnect import KiteConnect, KiteTicker 
-from dhanhq import DhanContext, MarketFeed, dhanhq
 from .redis_store import RedisStore, now_ist, now_ist_date
 from .chartink_client import (
     parse_chartink_payload,
@@ -49,9 +50,10 @@ from .custom_strategy import (
 )
 from .websocket_manager import WebSocketManager
 from .stock_sector import SECTOR_INDEX_INSTRUMENTS, STOCK_INDEX_MAPPING
-from .dhan_broker import DHAN_INSTRUMENTS, DhanFeedService
+from .dhan_broker import DHAN_INSTRUMENTS, DhanContext, DhanFeedService, MarketFeed, dhanhq
 from .backtest import run_custom_strategy_backtest
 from .services.runtime import ServiceRuntime
+from .service_queues import MARKET_SUBSCRIPTION_QUEUE
 from .auth import AuthService
 from .middleware import AuthMiddleware, get_current_user, SecurityHeadersMiddleware
 from .custom_middleware import SelectiveHostMiddleware
@@ -230,6 +232,48 @@ app = FastAPI(title="AlgoEdge Ultra-Low Latency")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+
+def _json_error_response(
+    request: Request,
+    status_code: int,
+    error: str,
+    detail: Any = "",
+    *,
+    request_id: Optional[str] = None,
+) -> JSONResponse:
+    rid = request_id or request.headers.get("x-request-id") or uuid.uuid4().hex[:12]
+    payload: Dict[str, Any] = {
+        "ok": False,
+        "error": str(error or "ERROR"),
+        "detail": detail if isinstance(detail, (str, int, float, bool, list, dict)) else str(detail),
+        "request_id": rid,
+    }
+    return JSONResponse(status_code=int(status_code), content=payload)
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    detail = exc.detail if exc.detail is not None else "HTTP_ERROR"
+    return _json_error_response(request, exc.status_code, str(detail), detail)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    return _json_error_response(request, 422, "REQUEST_VALIDATION_ERROR", exc.errors())
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    request_id = request.headers.get("x-request-id") or uuid.uuid4().hex[:12]
+    log.exception(
+        "UNHANDLED_API_EXCEPTION | request_id=%s method=%s path=%s",
+        request_id,
+        request.method,
+        request.url.path,
+    )
+    detail = str(exc) if _is_test_mode() else "Unexpected server error. Check server logs with request_id."
+    return _json_error_response(request, 500, "INTERNAL_SERVER_ERROR", detail, request_id=request_id)
+
 # 1. Selective Host Middleware (Strict for dashboard, permissive for webhooks)
 app.add_middleware(
     SelectiveHostMiddleware,
@@ -321,6 +365,7 @@ KT_ACCESS_TOKEN: str = ""
 DHAN_FEED: Optional[DhanFeedService] = None
 DHAN_CONNECTED: bool = False
 DHAN_USER_ID: Optional[int] = None
+DHAN_ACCESS_TOKEN: str = ""
 
 APP_LOOP: Optional[asyncio.AbstractEventLoop] = None
 
@@ -340,6 +385,61 @@ _SESSION_CACHE_TTL = 30.0  # seconds
 # Throttle Redis position writes (per symbol)
 _LAST_POS_SAVE: Dict[Tuple[int, str], float] = {}
 _POS_SAVE_THROTTLE_SEC = 0.8
+
+
+def _save_feed_health_nowait(user_id: int, broker: str, connected: bool, detail: str = "") -> None:
+    loop = APP_LOOP
+    app_store = store
+    if loop is None or app_store is None:
+        return
+
+    async def _save() -> None:
+        try:
+            await app_store.save_broker_feed_health(
+                int(user_id),
+                broker,
+                bool(connected),
+                ttl_sec=15,
+                detail=detail,
+            )
+        except Exception as exc:
+            print(f"[FEED] health save failed broker={broker} user={user_id}: {exc}")
+
+    try:
+        asyncio.run_coroutine_threadsafe(_save(), loop)
+    except Exception as exc:
+        print(f"[FEED] health schedule failed broker={broker} user={user_id}: {exc}")
+
+
+async def _load_shared_feed_connected(user_id: int, broker: str) -> Tuple[bool, Dict[str, Any]]:
+    try:
+        health = await store.load_broker_feed_health(int(user_id), broker)
+    except Exception as exc:
+        health = {"connected": False, "reason": f"BROKER_FEED_HEALTH_ERROR:{exc}"}
+    age = float(health.get("age_sec", 999999.0) or 999999.0)
+    return bool(health.get("connected", False)) and age <= 15.0, health
+
+
+async def _poke_market_feed_service(user_id: int, symbols: Optional[List[str]] = None, source: str = "broker_auth") -> None:
+    app_store = store
+    redis_client = getattr(app_store, "redis", None)
+    if redis_client is None:
+        return
+    try:
+        await redis_client.rpush(
+            MARKET_SUBSCRIPTION_QUEUE,
+            json.dumps(
+                {
+                    "user_id": int(user_id),
+                    "symbols": list(symbols or []),
+                    "source": source,
+                    "timestamp": time.time(),
+                },
+                separators=(",", ":"),
+            ),
+        )
+    except Exception as exc:
+        log.warning("Market feed poke failed | user=%s source=%s err=%s", user_id, source, exc)
 
 # Throttle instrument reload
 _LAST_INSTR_RELOAD = 0.0
@@ -468,6 +568,7 @@ async def _activate_dhan_token(
 
     eng = await ensure_engine(user_id)
     await eng.configure_broker()
+    await _poke_market_feed_service(user_id, list(STOCK_INDEX_MAPPING.keys()), "dhan_token_activated")
 
     warning = ""
     if not _is_test_mode():
@@ -655,7 +756,8 @@ async def ensure_service_runtime() -> ServiceRuntime:
             stop_dhan_feed=lambda: _stop_dhan_feed(),
             stop_kite_feed=lambda: _stop_kite_ticker(),
         )
-        await SERVICE_RUNTIME.start()
+        if not _is_test_mode():
+            await SERVICE_RUNTIME.start()
     return SERVICE_RUNTIME
 
 
@@ -1073,6 +1175,7 @@ async def subscribe_symbols_for_user(user_id: int, symbols: List[str]) -> None:
 # -----------------------------
 async def _stop_kite_ticker() -> None:
     global KT, KT_CONNECTED, KT_TASK, KT_USER_ID, KT_ACCESS_TOKEN
+    old_user_id = KT_USER_ID
     try:
         if KT is not None:
             try:
@@ -1080,6 +1183,8 @@ async def _stop_kite_ticker() -> None:
             except Exception:
                 pass
     finally:
+        if old_user_id is not None:
+            _save_feed_health_nowait(int(old_user_id), "ZERODHA", False, "stopped")
         KT = None
         KT_CONNECTED = False
         KT_TASK = None
@@ -1088,19 +1193,23 @@ async def _stop_kite_ticker() -> None:
 
 
 async def _stop_dhan_feed() -> None:
-    global DHAN_FEED, DHAN_CONNECTED, DHAN_USER_ID
+    global DHAN_FEED, DHAN_CONNECTED, DHAN_USER_ID, DHAN_ACCESS_TOKEN
+    old_user_id = DHAN_USER_ID
     if DHAN_FEED:
         try:
             await DHAN_FEED.stop()
         except Exception:
             pass
+    if old_user_id is not None:
+        _save_feed_health_nowait(int(old_user_id), "DHAN", False, "stopped")
     DHAN_FEED = None
     DHAN_CONNECTED = False
     DHAN_USER_ID = None
+    DHAN_ACCESS_TOKEN = ""
 
 
 async def start_dhan_feed(user_id: int) -> None:
-    global DHAN_FEED, DHAN_CONNECTED, DHAN_USER_ID
+    global DHAN_FEED, DHAN_CONNECTED, DHAN_USER_ID, DHAN_ACCESS_TOKEN
     if _is_test_mode():
         return
     creds = await store.load_dhan_credentials(user_id)
@@ -1109,13 +1218,14 @@ async def start_dhan_feed(user_id: int) -> None:
     if not client_id or not access_token:
         return
     await _stop_kite_ticker()
-    if DHAN_FEED and DHAN_USER_ID == user_id:
+    if DHAN_FEED and DHAN_USER_ID == user_id and DHAN_ACCESS_TOKEN == access_token:
         return
     await _stop_dhan_feed()
 
     def on_state(connected: bool) -> None:
         global DHAN_CONNECTED
         DHAN_CONNECTED = connected
+        _save_feed_health_nowait(user_id, "DHAN", connected, "websocket_state")
 
     def on_tick(packet: Dict[str, Any]) -> None:
         loop = APP_LOOP
@@ -1143,6 +1253,21 @@ async def start_dhan_feed(user_id: int) -> None:
                 tsq = float(pick("total_sell_quantity", "totalSellQuantity", default=0.0) or 0.0)
                 if ltp <= 0:
                     return
+                await store.save_broker_feed_health(user_id, "DHAN", True, ttl_sec=15, detail="tick")
+                await store.save_latest_tick(
+                    user_id,
+                    symbol,
+                    {
+                        "broker": "DHAN",
+                        "ltp": ltp,
+                        "close": close,
+                        "high": high,
+                        "low": low,
+                        "tbq": tbq,
+                        "tsq": tsq,
+                    },
+                    ttl_sec=30,
+                )
                 eng = await ensure_engine(user_id)
                 pos = await eng.on_tick(symbol, ltp, close, high, low, tbq, tsq)
                 ws_mgr.broadcast_nowait(
@@ -1198,6 +1323,7 @@ async def start_dhan_feed(user_id: int) -> None:
         on_state=on_state,
     )
     DHAN_USER_ID = user_id
+    DHAN_ACCESS_TOKEN = access_token
     await DHAN_FEED.start([str(token) for token in SUB_TOKENS])
 
 
@@ -1253,6 +1379,7 @@ async def start_kite_ticker(user_id: int) -> None:
         def on_connect(ws, response):
             global KT_CONNECTED
             KT_CONNECTED = True
+            _save_feed_health_nowait(user_id, "ZERODHA", True, "websocket_connect")
             try:
                 if SUB_TOKENS:
                     ws.subscribe(list(SUB_TOKENS))
@@ -1264,6 +1391,7 @@ async def start_kite_ticker(user_id: int) -> None:
         def on_close(ws, code, reason):
             global KT_CONNECTED
             KT_CONNECTED = False
+            _save_feed_health_nowait(user_id, "ZERODHA", False, f"closed:{code}:{reason}")
             print("[KT] closed", code, reason)
 
         def on_error(ws, code, reason):
@@ -1291,6 +1419,8 @@ async def start_kite_ticker(user_id: int) -> None:
                             continue
 
                         ltp = float(t.get("last_price") or 0.0)
+                        if ltp <= 0:
+                            continue
 
                         ohlc = t.get("ohlc") or {}
                         close = float(ohlc.get("close") or 0.0)
@@ -1299,6 +1429,21 @@ async def start_kite_ticker(user_id: int) -> None:
 
                         tbq = float(t.get("buy_quantity") or 0.0)
                         tsq = float(t.get("sell_quantity") or 0.0)
+                        await store.save_broker_feed_health(user_id, "ZERODHA", True, ttl_sec=15, detail="tick")
+                        await store.save_latest_tick(
+                            user_id,
+                            sym,
+                            {
+                                "broker": "ZERODHA",
+                                "ltp": ltp,
+                                "close": close,
+                                "high": high,
+                                "low": low,
+                                "tbq": tbq,
+                                "tsq": tsq,
+                            },
+                            ttl_sec=30,
+                        )
                         # ✅ PROPER PER-STOCK LOG
                         # Feed engine with proper OHLC (important for sector ranking)
                         pos = await eng.on_tick(sym, ltp, close, high, low, tbq, tsq)
@@ -1429,7 +1574,6 @@ async def startup():
             stop_dhan_feed=lambda: _stop_dhan_feed(),
             stop_kite_feed=lambda: _stop_kite_ticker(),
         )
-        await SERVICE_RUNTIME.start()
         return
 
     # Initialize encryption
@@ -1680,6 +1824,8 @@ async def save_broker_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         warning = ""
         saved_dhan_creds = await store.load_dhan_credentials(user_id) if broker == "DHAN" else {}
         has_dhan_access_token = bool(str(saved_dhan_creds.get("access_token") or "").strip())
+        if broker == "DHAN" and has_dhan_access_token:
+            await _poke_market_feed_service(user_id, list(STOCK_INDEX_MAPPING.keys()), "dhan_broker_config_saved")
         if broker == "DHAN" and has_dhan_access_token and not _is_test_mode():
             try:
                 await _stop_kite_ticker()
@@ -1693,6 +1839,7 @@ async def save_broker_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         elif broker == "ZERODHA":
             try:
                 await _stop_dhan_feed()
+                await _poke_market_feed_service(user_id, list(STOCK_INDEX_MAPPING.keys()), "zerodha_broker_config_saved")
             except Exception:
                 log.exception("Dhan feed stop failed while switching broker | user=%s", user_id)
 
@@ -1947,6 +2094,7 @@ async def zerodha_callback(request: Request, user_id: Optional[int] = None):
 
     # Start / restart ticker
     await start_kite_ticker(user_id)
+    await _poke_market_feed_service(user_id, list(STOCK_INDEX_MAPPING.keys()), "zerodha_callback")
     # Ensure engine has latest access token
     eng = await ensure_engine(user_id)
     await eng.configure_kite()
@@ -1963,14 +2111,18 @@ async def zerodha_status(user_id: int = 1):
     broker = await store.load_broker(user_id)
 
     if broker == "DHAN":
+        shared_connected, feed_health = await _load_shared_feed_connected(user_id, "DHAN")
+        ticker_connected = bool(DHAN_CONNECTED and DHAN_USER_ID == user_id) or shared_connected
         return {
             "connected": bool(session_ok),
-            "ticker_connected": bool(DHAN_CONNECTED and DHAN_USER_ID == user_id),
+            "ticker_connected": ticker_connected,
             "kill_switch": kill,
             "broker": broker,
+            "feed_health": feed_health,
         }
 
-    ticker_connected = bool(KT_CONNECTED and KT_USER_ID == user_id)
+    shared_connected, feed_health = await _load_shared_feed_connected(user_id, "ZERODHA")
+    ticker_connected = bool(KT_CONNECTED and KT_USER_ID == user_id) or shared_connected
 
     # A valid auth session means Kite login succeeded, even if the background
     # ticker thread is still reconnecting. When that happens, try to self-heal.
@@ -1983,12 +2135,14 @@ async def zerodha_status(user_id: int = 1):
         except Exception as e:
             print(f"[KT] status self-heal failed for user={user_id}: {e}")
 
-        ticker_connected = bool(KT_CONNECTED and KT_USER_ID == user_id)
+        shared_connected, feed_health = await _load_shared_feed_connected(user_id, "ZERODHA")
+        ticker_connected = bool(KT_CONNECTED and KT_USER_ID == user_id) or shared_connected
 
     return {
         "connected": bool(session_ok),
         "ticker_connected": ticker_connected,
-        "kill_switch": kill
+        "kill_switch": kill,
+        "feed_health": feed_health,
     }
 
 
@@ -1998,16 +2152,19 @@ async def broker_status(user_id: int = 1) -> Dict[str, Any]:
     broker = await store.load_broker(user_id)
     session_ok = await is_session_valid(user_id)
     kill = await store.is_kill(user_id)
+    broker_key = "DHAN" if broker == "DHAN" else "ZERODHA"
+    shared_connected, feed_health = await _load_shared_feed_connected(user_id, broker_key)
     ticker_connected = (
-        bool(DHAN_CONNECTED and DHAN_USER_ID == user_id)
+        bool(DHAN_CONNECTED and DHAN_USER_ID == user_id) or shared_connected
         if broker == "DHAN"
-        else bool(KT_CONNECTED and KT_USER_ID == user_id)
+        else bool(KT_CONNECTED and KT_USER_ID == user_id) or shared_connected
     )
     return {
         "broker": broker,
         "connected": bool(session_ok),
         "ticker_connected": ticker_connected,
         "kill_switch": kill,
+        "feed_health": feed_health,
     }
 
 

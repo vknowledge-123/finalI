@@ -1,4 +1,5 @@
 import os
+import asyncio
 import unittest
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, patch
@@ -11,6 +12,11 @@ from fastapi.testclient import TestClient
 
 from app import main as main_module
 from app.main import app
+
+
+@app.get("/__test__/explode")
+async def _test_explode():
+    raise RuntimeError("test boom")
 
 
 class IntegrationTests(unittest.TestCase):
@@ -78,6 +84,26 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn('id="dhan_api_secret"', r.text)
         self.assertIn('id="dhan_redirect_url"', r.text)
         self.assertIn("const displayName = c.alert_name_raw || c.alert_name || name;", r.text)
+
+    def test_unhandled_api_exception_returns_json(self) -> None:
+        old_store = main_module.store
+        old_auth_service = main_module.auth_service
+        old_service_runtime = main_module.SERVICE_RUNTIME
+        old_engine = dict(main_module.ENGINE)
+        try:
+            with TestClient(app, raise_server_exceptions=False) as client:
+                r = client.get("/__test__/explode")
+        finally:
+            main_module.store = old_store
+            main_module.auth_service = old_auth_service
+            main_module.SERVICE_RUNTIME = old_service_runtime
+            main_module.ENGINE.clear()
+            main_module.ENGINE.update(old_engine)
+        self.assertEqual(r.status_code, 500)
+        body = r.json()
+        self.assertEqual(body["ok"], False)
+        self.assertEqual(body["error"], "INTERNAL_SERVER_ERROR")
+        self.assertIn("request_id", body)
 
     def test_broker_config_supports_dhan_and_zerodha(self) -> None:
         missing = self.client.post(
@@ -273,12 +299,17 @@ class IntegrationTests(unittest.TestCase):
             main_module.ENGINE.clear()
 
             client = TestClient(app)
-            response = client.get("/api/sectors/top", params={"user_id": 1, "limit": 3})
+            try:
+                response = client.get("/api/sectors/top", params={"user_id": 1, "limit": 3})
+            finally:
+                client.close()
 
             self.assertEqual(response.status_code, 200)
             self.assertIn("application/json", response.headers.get("content-type", ""))
             self.assertEqual(response.json()["reason"], "SECTOR_RANK_NOT_READY")
         finally:
+            for engine in list(main_module.ENGINE.values()):
+                asyncio.run(engine.close())
             main_module.store = old_store
             main_module.auth_service = old_auth_service
             main_module.SERVICE_RUNTIME = old_service_runtime
@@ -292,6 +323,22 @@ class IntegrationTests(unittest.TestCase):
         import app.reconciliation_service
 
         self.assertEqual(app.alert_service.app.title, "AlgoEdge Alert Service")
+
+    def test_alert_service_unhandled_exception_returns_json(self) -> None:
+        import app.alert_service
+
+        @app.alert_service.app.get("/__test__/alert-explode")
+        async def _test_alert_explode():
+            raise RuntimeError("alert boom")
+
+        with TestClient(app.alert_service.app, raise_server_exceptions=False) as client:
+            response = client.get("/__test__/alert-explode")
+
+        self.assertEqual(response.status_code, 500)
+        body = response.json()
+        self.assertEqual(body["ok"], False)
+        self.assertEqual(body["error"], "INTERNAL_SERVER_ERROR")
+        self.assertIn("request_id", body)
 
     def test_auto_squareoff_toggle(self) -> None:
         r = self.client.get("/api/auto-sq-off/status", params={"user_id": 1})
