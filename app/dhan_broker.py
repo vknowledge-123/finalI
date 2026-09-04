@@ -599,6 +599,12 @@ class DhanFeedService:
             (DHAN_INSTRUMENTS.feed_segment(security_id), security_id, MarketFeed.Full)
             for security_id in sorted(self.security_ids)
         ]
+        log.info(
+            "DHAN_FEED_START | user=%s instruments=%s sample=%s",
+            self.user_id,
+            len(instruments),
+            instruments[:10],
+        )
 
         def connected(_feed: MarketFeed) -> None:
             if self.on_state:
@@ -647,9 +653,17 @@ class DhanFeedService:
             return
         self.security_ids.update(new_ids)
         if self.feed:
-            self.feed.subscribe_symbols(
-                [(DHAN_INSTRUMENTS.feed_segment(security_id), security_id, MarketFeed.Full) for security_id in new_ids]
+            instruments = [
+                (DHAN_INSTRUMENTS.feed_segment(security_id), security_id, MarketFeed.Full)
+                for security_id in sorted(new_ids)
+            ]
+            log.info(
+                "DHAN_FEED_SUBSCRIBE | user=%s instruments=%s sample=%s",
+                self.user_id,
+                len(instruments),
+                instruments[:20],
             )
+            self.feed.subscribe_symbols(instruments)
 
     async def stop(self) -> None:
         feed = self.feed

@@ -8,6 +8,7 @@ from typing import Any, Dict, Tuple
 
 from .service_bootstrap import EngineRegistry, configure_logging, init_store, load_user_ids
 from .redis_store import norm_symbol
+from .trade_engine import Position
 
 configure_logging("reconciliation_service")
 log = logging.getLogger("reconciliation_service")
@@ -120,7 +121,27 @@ async def _rest_exit_fallback_position(store, registry: EngineRegistry, user_id:
         rest_ltp,
         age,
     )
-    await engine.on_tick(symbol, rest_ltp, 0.0, rest_ltp, rest_ltp, 0.0, 0.0)
+    if symbol not in getattr(engine, "positions", {}):
+        try:
+            data = {}
+            for key, field_info in Position.__dataclass_fields__.items():  # type: ignore[attr-defined]
+                data[key] = row.get(key, field_info.default)
+            data["user_id"] = int(user_id)
+            data["symbol"] = symbol
+            engine.positions[symbol] = Position(**data)
+        except Exception as exc:
+            log.warning("REST_EXIT_POSITION_HYDRATE_FAIL | user=%s symbol=%s err=%s", user_id, symbol, exc)
+            return
+    pos = await engine.on_tick(symbol, rest_ltp, 0.0, rest_ltp, rest_ltp, 0.0, 0.0)
+    if pos and str(pos.status).upper() == "OPEN":
+        current_reason = str(pos.pending_reason or "")
+        if not current_reason or current_reason.startswith("WS_TICK_MISSING"):
+            pos.pending_reason = "WS_TICK_MISSING_REST_FALLBACK"
+            pos.updated_ts = time.time()
+            try:
+                await store.upsert_position(int(user_id), symbol, pos.to_public())
+            except Exception:
+                pass
 
 
 async def main() -> None:

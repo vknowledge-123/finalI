@@ -78,6 +78,34 @@ class ReconciliationServiceTests(unittest.IsolatedAsyncioTestCase):
 
         engine._fetch_ltp.assert_not_awaited()
 
+    async def test_rest_exit_fallback_marks_open_position_with_ws_warning(self) -> None:
+        store = InMemoryStore()
+        position = Position(
+            trade_id="rest-monitor",
+            user_id=1,
+            symbol="SBIN",
+            alert_name="classic",
+            side="BUY",
+            product="MIS",
+            qty=1,
+            initial_qty=1,
+            entry_price=100.0,
+            target_price=120.0,
+            sl_price=95.0,
+            status="OPEN",
+        )
+        await store.upsert_position(1, "SBIN", position.to_public())
+        engine = TradeEngine(1, store)
+        engine.broker = "DHAN"
+        engine._fetch_ltp = AsyncMock(return_value=105.0)
+
+        await _rest_exit_fallback_position(store, _Registry(engine), 1, position.to_public())
+
+        stored = [row for row in await store.list_positions(1) if row.get("symbol") == "SBIN"][0]
+        self.assertEqual(stored["pending_reason"], "WS_TICK_MISSING_REST_FALLBACK")
+        self.assertEqual(stored["ltp"], 105.0)
+        self.assertEqual(stored["pnl"], 5.0)
+
 
 if __name__ == "__main__":
     unittest.main()

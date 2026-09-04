@@ -1311,6 +1311,7 @@ async def subscribe_symbols_for_user(user_id: int, symbols: List[str]) -> None:
 
     changed = False
     missing_syms: List[str] = []
+    resolved_dhan: List[Dict[str, Any]] = []
     for sym in norm_syms:
         tok = SYMBOL_TOKEN.get(sym)
         if not tok and "-" not in sym:
@@ -1329,6 +1330,14 @@ async def subscribe_symbols_for_user(user_id: int, symbols: List[str]) -> None:
         else:
              # Already subscribed
              pass
+        resolved_dhan.append(
+            {
+                "symbol": sym,
+                "security_id": str(tok),
+                "segment": str(DHAN_INSTRUMENTS.feed_segment(tok)),
+                "mode": str(MarketFeed.Full),
+            }
+        )
              
         # Validation Log
         if tok:
@@ -1350,6 +1359,8 @@ async def subscribe_symbols_for_user(user_id: int, symbols: List[str]) -> None:
 
     broker = await store.load_broker(user_id)
     if broker == "DHAN":
+        if resolved_dhan:
+            log.info("DHAN_SUBSCRIBE_RESOLVED | user=%s instruments=%s", user_id, resolved_dhan[:50])
         if changed and DHAN_FEED and DHAN_USER_ID == user_id:
             await DHAN_FEED.subscribe([str(token) for token in SUB_TOKENS])
         return
@@ -1463,6 +1474,7 @@ async def start_dhan_feed(user_id: int) -> None:
                         "low": low,
                         "tbq": tbq,
                         "tsq": tsq,
+                        "source": "DHAN_WS",
                     },
                     ttl_sec=30,
                 )

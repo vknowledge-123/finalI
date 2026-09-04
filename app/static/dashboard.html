@@ -3530,6 +3530,7 @@
               statusReason = livePos.exit_reason || livePos.exit_note || 'Exit completed';
             } else if (livePos.status === 'OPEN') {
               statusLabel = livePos.tp2_booked ? 'LIVE • TP2 BOOKED' : livePos.tp1_booked ? 'LIVE • TP1 BOOKED' : 'LIVE';
+              if (livePos.pending_reason) statusReason = livePos.pending_reason;
             } else if (livePos.status === 'ERROR') {
               statusLabel = 'ERROR';
             }
