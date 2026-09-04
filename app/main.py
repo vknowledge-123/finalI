@@ -161,6 +161,13 @@ if _SUPPRESS_MW:
 OFFICIAL_DHAN_AUTH_BASE_URL = "https://auth.dhan.co"
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _normalise_dhan_auth_base_url(raw: str | None) -> str:
     """
     Dhan individual API-key auth must start from auth.dhan.co.
@@ -182,7 +189,8 @@ def _normalise_dhan_auth_base_url(raw: str | None) -> str:
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
 DHAN_AUTH_BASE_URL = _normalise_dhan_auth_base_url(os.getenv("DHAN_AUTH_BASE_URL"))
-ENABLE_SERVICE_RESTART = (os.getenv("ENABLE_SERVICE_RESTART") or "").strip().lower() in {"1", "true", "yes", "on"}
+ENABLE_SERVICE_RESTART = _env_bool("ENABLE_SERVICE_RESTART", False)
+API_OWNS_MARKET_FEED = _env_bool("API_OWNS_MARKET_FEED", True)
 SERVICE_RESTART_TOKEN = (os.getenv("SERVICE_RESTART_TOKEN") or "").strip()
 TRADING_SYSTEMD_UNIT = (os.getenv("TRADING_SYSTEMD_UNIT") or "trading").strip()
 TRADING_RESTART_CMD = (os.getenv("TRADING_RESTART_CMD") or f"systemctl restart --no-block {TRADING_SYSTEMD_UNIT}").strip()
@@ -753,7 +761,7 @@ async def _activate_dhan_token(
     await _poke_market_feed_service(user_id, list(STOCK_INDEX_MAPPING.keys()), "dhan_token_activated")
 
     warning = ""
-    if not _is_test_mode():
+    if API_OWNS_MARKET_FEED and not _is_test_mode():
         try:
             await _stop_kite_ticker()
             await build_symbol_token_map_from_dhan(user_id)
@@ -1818,11 +1826,13 @@ async def startup():
 
                     base_symbols = list(STOCK_INDEX_MAPPING.keys())
                     await subscribe_symbols_for_user(uid, base_symbols)
-                    if broker == "DHAN":
-                        await subscribe_dhan_sector_indices_for_user(uid)
-                        await start_dhan_feed(uid)
-                    else:
-                        await start_kite_ticker(uid)
+                    await _poke_market_feed_service(uid, base_symbols, "api_startup_rehydrate")
+                    if API_OWNS_MARKET_FEED:
+                        if broker == "DHAN":
+                            await subscribe_dhan_sector_indices_for_user(uid)
+                            await start_dhan_feed(uid)
+                        else:
+                            await start_kite_ticker(uid)
 
                     eng = await ensure_engine(uid)
                     await eng.configure_broker()
@@ -2308,7 +2318,7 @@ async def save_broker_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         has_dhan_access_token = bool(str(saved_dhan_creds.get("access_token") or "").strip())
         if broker == "DHAN" and has_dhan_access_token:
             await _poke_market_feed_service(user_id, list(STOCK_INDEX_MAPPING.keys()), "dhan_broker_config_saved")
-        if broker == "DHAN" and has_dhan_access_token and not _is_test_mode():
+        if broker == "DHAN" and has_dhan_access_token and API_OWNS_MARKET_FEED and not _is_test_mode():
             try:
                 await _stop_kite_ticker()
                 await build_symbol_token_map_from_dhan(user_id)
@@ -2574,8 +2584,10 @@ async def zerodha_callback(request: Request, user_id: Optional[int] = None):
         await subscribe_symbols_for_user(user_id, pending)
         PENDING_SYMBOLS[user_id] = set()
 
-    # Start / restart ticker
-    await start_kite_ticker(user_id)
+    # Start / restart ticker only in single-process mode. Split deployments
+    # let ashuchart-market-feed own broker websockets.
+    if API_OWNS_MARKET_FEED:
+        await start_kite_ticker(user_id)
     await _poke_market_feed_service(user_id, list(STOCK_INDEX_MAPPING.keys()), "zerodha_callback")
     # Ensure engine has latest access token
     eng = await ensure_engine(user_id)
@@ -2608,7 +2620,7 @@ async def zerodha_status(user_id: int = 1):
 
     # A valid auth session means Kite login succeeded, even if the background
     # ticker thread is still reconnecting. When that happens, try to self-heal.
-    if session_ok and not ticker_connected and not _is_test_mode():
+    if API_OWNS_MARKET_FEED and session_ok and not ticker_connected and not _is_test_mode():
         try:
             eng = await ensure_engine(user_id)
             await eng.configure_kite()

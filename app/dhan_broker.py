@@ -652,9 +652,30 @@ class DhanFeedService:
             )
 
     async def stop(self) -> None:
-        if self.feed:
-            await asyncio.to_thread(self.feed.close_connection)
+        feed = self.feed
+        feed_thread = self.feed_thread
         self.feed = None
+        self.feed_thread = None
+
+        if feed:
+            try:
+                await asyncio.to_thread(feed.close_connection)
+            except Exception as exc:
+                log.debug("Dhan market feed close failed: %s", exc)
+
+            try:
+                if feed_thread and getattr(feed_thread, "is_alive", lambda: False)():
+                    await asyncio.to_thread(feed_thread.join, 3)
+            except Exception as exc:
+                log.debug("Dhan market feed thread join failed: %s", exc)
+
+            try:
+                loop = getattr(feed, "loop", None)
+                if loop is not None and not loop.is_closed() and not loop.is_running():
+                    loop.close()
+            except Exception as exc:
+                log.debug("Dhan market feed loop close failed: %s", exc)
+
         if self.order_task:
             self.order_task.cancel()
             try:

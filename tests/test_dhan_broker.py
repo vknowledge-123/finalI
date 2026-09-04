@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -5,6 +6,7 @@ import pandas as pd
 
 from app.dhan_broker import (
     DhanInstrumentRegistry,
+    DhanFeedService,
     MarketFeed,
     broker_error_message,
     ensure_no_broker_error,
@@ -200,6 +202,36 @@ class DhanBrokerTests(unittest.TestCase):
 
 
 class DhanTradeEngineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_dhan_feed_stop_closes_sdk_event_loop(self) -> None:
+        class FakeFeed:
+            def __init__(self) -> None:
+                self.loop = asyncio.new_event_loop()
+                self.closed = False
+
+            def close_connection(self) -> None:
+                self.closed = True
+
+        class FakeThread:
+            def is_alive(self) -> bool:
+                return False
+
+        states = []
+        feed = FakeFeed()
+        service = DhanFeedService.__new__(DhanFeedService)
+        service.feed = feed
+        service.feed_thread = FakeThread()
+        service.order_task = None
+        service.order_update = None
+        service.on_state = states.append
+
+        await service.stop()
+
+        self.assertTrue(feed.closed)
+        self.assertTrue(feed.loop.is_closed())
+        self.assertIsNone(service.feed)
+        self.assertIsNone(service.feed_thread)
+        self.assertEqual(states, [False])
+
     async def test_dhan_market_order_fallback_is_opt_in(self) -> None:
         store = InMemoryStore()
         await store.save_broker(1, "DHAN")

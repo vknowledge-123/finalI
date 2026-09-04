@@ -303,6 +303,28 @@ class IntegrationTests(unittest.TestCase):
         )
         self.assertEqual(restored.json()["broker"], "ZERODHA")
 
+    def test_dhan_token_activation_does_not_start_feed_when_api_is_not_owner(self) -> None:
+        with patch.object(main_module, "API_OWNS_MARKET_FEED", False), patch.object(
+            main_module, "_is_test_mode", return_value=False
+        ), patch.object(main_module, "_poke_market_feed_service", AsyncMock()) as poke_feed, patch.object(
+            main_module, "start_dhan_feed", AsyncMock()
+        ) as start_feed, patch.object(
+            main_module, "_stop_kite_ticker", AsyncMock()
+        ) as stop_kite:
+            result = asyncio.run(main_module._activate_dhan_token(1, "test-client", "test-token"))
+
+        self.assertEqual(result["ok"], True)
+        self.assertEqual(result["broker"], "DHAN")
+        poke_feed.assert_awaited_once()
+        start_feed.assert_not_awaited()
+        stop_kite.assert_not_awaited()
+
+        restored = self.client.post(
+            "/api/broker-config",
+            json={"user_id": 1, "broker": "ZERODHA"},
+        )
+        self.assertEqual(restored.json()["broker"], "ZERODHA")
+
     def test_zerodha_status_and_kill_switch(self) -> None:
         r = self.client.get("/api/zerodha-status")
         self.assertEqual(r.status_code, 200)
