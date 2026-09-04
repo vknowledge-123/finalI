@@ -8,6 +8,7 @@ class _FakeStore:
     def __init__(self, latest_tick=None) -> None:
         self.latest_tick = latest_tick or {}
         self.health_updates = []
+        self.feed_health = {"connected": True, "detail": "tick"}
 
     async def load_broker(self, _user_id: int) -> str:
         return "DHAN"
@@ -26,6 +27,9 @@ class _FakeStore:
             }
         )
 
+    async def load_broker_feed_health(self, _user_id: int, _broker: str):
+        return dict(self.feed_health)
+
 
 class _FakeMain:
     def __init__(self) -> None:
@@ -39,8 +43,31 @@ class MarketFeedServiceTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         mfs._DHAN_NO_TICK_RESTART.clear()
 
-    async def test_dhan_alert_symbol_without_tick_restarts_feed_once(self) -> None:
+    async def test_dhan_alert_symbol_without_tick_keeps_connected_feed_running(self) -> None:
         store = _FakeStore()
+        main_app = _FakeMain()
+        started_users = {1}
+
+        with patch.object(mfs, "DHAN_SUBSCRIBE_TICK_CONFIRM_SEC", 0.01), patch.object(
+            mfs,
+            "DHAN_SUBSCRIBE_RESTART_COOLDOWN_SEC",
+            0.0,
+        ), patch.object(mfs, "_feed_started_with_current_credentials", AsyncMock(return_value=True)):
+            await mfs._confirm_dhan_alert_symbol_ticks(
+                main_app,
+                store,
+                started_users,
+                1,
+                ["VENUSREM"],
+                "chartink_alert",
+            )
+
+        main_app.restart_selected_feed.assert_not_awaited()
+        self.assertTrue(any("ws_tick_pending:VENUSREM" == item["detail"] for item in store.health_updates))
+
+    async def test_dhan_alert_symbol_without_tick_restarts_disconnected_feed_once(self) -> None:
+        store = _FakeStore()
+        store.feed_health = {"connected": False, "detail": "websocket_state"}
         main_app = _FakeMain()
         started_users = {1}
 

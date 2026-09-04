@@ -22,6 +22,12 @@ FEED_RESTART_AFTER_SEC = float(os.getenv("FEED_RESTART_AFTER_SEC", "30") or "30"
 FEED_RESTART_COOLDOWN_SEC = float(os.getenv("FEED_RESTART_COOLDOWN_SEC", "30") or "30")
 DHAN_SUBSCRIBE_TICK_CONFIRM_SEC = float(os.getenv("DHAN_SUBSCRIBE_TICK_CONFIRM_SEC", "2") or "2")
 DHAN_SUBSCRIBE_RESTART_COOLDOWN_SEC = float(os.getenv("DHAN_SUBSCRIBE_RESTART_COOLDOWN_SEC", "60") or "60")
+DHAN_SUBSCRIBE_RESTART_ON_NO_TICK = str(os.getenv("DHAN_SUBSCRIBE_RESTART_ON_NO_TICK", "0")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 DHAN_SUBSCRIBE_CONFIRM_SOURCES = {
     "chartink_alert",
     "api_signal_intake",
@@ -90,6 +96,55 @@ async def _confirm_dhan_alert_symbol_ticks(
         log.info("MARKET_SUBSCRIBE_TICK_OK | user=%s symbols=%s", user_id, symbols)
         return
 
+    try:
+        health = await store.load_broker_feed_health(int(user_id), "DHAN")
+    except Exception:
+        health = {}
+    connected = bool(health.get("connected")) if isinstance(health, dict) else False
+
+    if not connected:
+        now = time.time()
+        restart_symbols = [
+            symbol
+            for symbol in missing
+            if now - float(_DHAN_NO_TICK_RESTART.get((int(user_id), symbol), 0.0)) >= DHAN_SUBSCRIBE_RESTART_COOLDOWN_SEC
+        ]
+        if not restart_symbols:
+            log.warning("MARKET_SUBSCRIBE_NO_TICK_COOLDOWN | user=%s symbols=%s", user_id, missing)
+            return
+        for symbol in restart_symbols:
+            _DHAN_NO_TICK_RESTART[(int(user_id), symbol)] = now
+
+        log.warning("MARKET_SUBSCRIBE_NO_TICK_RESTART | user=%s symbols=%s detail=feed_disconnected", user_id, restart_symbols)
+        await main_app.restart_selected_feed(int(user_id))
+        if await _feed_started_with_current_credentials(main_app, store, int(user_id), "DHAN"):
+            started_users.add(int(user_id))
+        else:
+            started_users.discard(int(user_id))
+            await store.save_broker_feed_health(
+                int(user_id),
+                "DHAN",
+                False,
+                ttl_sec=15,
+                detail="restart_after_subscribe_no_tick_failed",
+            )
+            return
+
+        still_missing = await _wait_for_fresh_ws_ticks(store, user_id, restart_symbols, DHAN_SUBSCRIBE_TICK_CONFIRM_SEC)
+        if still_missing:
+            detail = "ws_tick_missing:" + ",".join(still_missing[:5])
+            await store.save_broker_feed_health(int(user_id), "DHAN", True, ttl_sec=15, detail=detail)
+            log.warning("MARKET_SUBSCRIBE_STILL_NO_TICK | user=%s symbols=%s", user_id, still_missing)
+        else:
+            log.info("MARKET_SUBSCRIBE_TICK_OK_AFTER_RESTART | user=%s symbols=%s", user_id, restart_symbols)
+        return
+
+    if not DHAN_SUBSCRIBE_RESTART_ON_NO_TICK:
+        detail = "ws_tick_pending:" + ",".join(missing[:5])
+        await store.save_broker_feed_health(int(user_id), "DHAN", True, ttl_sec=15, detail=detail)
+        log.warning("MARKET_SUBSCRIBE_NO_TICK_WAITING | user=%s symbols=%s detail=event_based_feed_rest_fallback_active", user_id, missing)
+        return
+
     now = time.time()
     restart_symbols = [
         symbol
@@ -102,7 +157,7 @@ async def _confirm_dhan_alert_symbol_ticks(
     for symbol in restart_symbols:
         _DHAN_NO_TICK_RESTART[(int(user_id), symbol)] = now
 
-    log.warning("MARKET_SUBSCRIBE_NO_TICK_RESTART | user=%s symbols=%s", user_id, restart_symbols)
+    log.warning("MARKET_SUBSCRIBE_NO_TICK_RESTART | user=%s symbols=%s detail=no_tick_override_enabled", user_id, restart_symbols)
     await main_app.restart_selected_feed(int(user_id))
     if await _feed_started_with_current_credentials(main_app, store, int(user_id), "DHAN"):
         started_users.add(int(user_id))
