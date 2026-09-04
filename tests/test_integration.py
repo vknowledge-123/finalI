@@ -523,6 +523,26 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(job["symbols"], ["HESTERBIO"])
         self.assertEqual(job["source"], "api_signal_intake")
 
+    def test_dhan_sector_tokens_do_not_count_as_equity_token_map_ready(self) -> None:
+        old_symbol_token = dict(main_module.SYMBOL_TOKEN)
+        old_registry_symbols = dict(main_module.DHAN_INSTRUMENTS.symbol_to_security)
+        old_loaded_at = main_module.DHAN_INSTRUMENTS.loaded_at
+        try:
+            main_module.SYMBOL_TOKEN.clear()
+            main_module.SYMBOL_TOKEN["NIFTY AUTO"] = 14
+            main_module.DHAN_INSTRUMENTS.symbol_to_security.clear()
+            main_module.DHAN_INSTRUMENTS.register_instrument("NIFTY AUTO", "14", main_module.MarketFeed.IDX)
+            main_module.DHAN_INSTRUMENTS.loaded_at = None
+
+            self.assertFalse(main_module._symbol_token_map_ready_for_broker("DHAN"))
+            self.assertTrue(main_module._symbol_token_map_ready_for_broker("ZERODHA"))
+        finally:
+            main_module.SYMBOL_TOKEN.clear()
+            main_module.SYMBOL_TOKEN.update(old_symbol_token)
+            main_module.DHAN_INSTRUMENTS.symbol_to_security.clear()
+            main_module.DHAN_INSTRUMENTS.symbol_to_security.update(old_registry_symbols)
+            main_module.DHAN_INSTRUMENTS.loaded_at = old_loaded_at
+
     def test_ws_feed_http_returns_upgrade_required(self) -> None:
         r = self.client.get("/ws/feed", params={"user_id": 1})
         self.assertEqual(r.status_code, 426)

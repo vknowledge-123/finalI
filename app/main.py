@@ -1134,6 +1134,20 @@ async def build_symbol_token_map_from_dhan(user_id: int) -> bool:
     return bool(SYMBOL_TOKEN)
 
 
+def _dhan_symbol_token_map_ready() -> bool:
+    return bool(
+        SYMBOL_TOKEN
+        and DHAN_INSTRUMENTS.loaded_at is not None
+        and len(DHAN_INSTRUMENTS.symbol_to_security) > len(SECTOR_INDEX_INSTRUMENTS)
+    )
+
+
+def _symbol_token_map_ready_for_broker(broker: str) -> bool:
+    if str(broker or "").strip().upper() == "DHAN":
+        return _dhan_symbol_token_map_ready()
+    return bool(SYMBOL_TOKEN)
+
+
 async def subscribe_dhan_sector_indices_for_user(user_id: int) -> None:
     if _is_test_mode():
         return
@@ -1239,19 +1253,20 @@ async def _ensure_token_map_ready(user_id: int) -> None:
     If webhook comes early, we build map in background and then subscribe pending symbols.
     """
     user_id = int(user_id)
+    broker = await store.load_broker(user_id)
 
-    if SYMBOL_TOKEN:
+    if _symbol_token_map_ready_for_broker(broker):
         # already ready
         return
 
     async with INSTR_LOCK:
         # double-check after acquiring lock
-        if SYMBOL_TOKEN:
+        broker = await store.load_broker(user_id)
+        if _symbol_token_map_ready_for_broker(broker):
             return
         ok = await is_session_valid(user_id)
         if not ok:
             return
-        broker = await store.load_broker(user_id)
         built = (
             await build_symbol_token_map_from_dhan(user_id)
             if broker == "DHAN"
@@ -1302,8 +1317,10 @@ async def subscribe_symbols_for_user(user_id: int, symbols: List[str]) -> None:
     if not norm_syms:
         return
 
+    broker = await store.load_broker(user_id)
+
     # If token map is not ready, queue and kick off background build (non-blocking).
-    if not SYMBOL_TOKEN:
+    if not _symbol_token_map_ready_for_broker(broker):
         PENDING_SYMBOLS.setdefault(user_id, set()).update(norm_syms)
         asyncio.create_task(_ensure_token_map_ready(user_id))
         # Do not block webhook here.
@@ -1357,7 +1374,6 @@ async def subscribe_symbols_for_user(user_id: int, symbols: List[str]) -> None:
             else:
                 asyncio.create_task(build_symbol_token_map_from_kite(user_id))
 
-    broker = await store.load_broker(user_id)
     if broker == "DHAN":
         if resolved_dhan:
             log.info("DHAN_SUBSCRIBE_RESOLVED | user=%s instruments=%s", user_id, resolved_dhan[:50])
@@ -1543,7 +1559,7 @@ async def restart_selected_feed(user_id: int) -> None:
     await eng.configure_broker()
     if broker == "DHAN":
         await _stop_dhan_feed()
-        if not SYMBOL_TOKEN:
+        if not _dhan_symbol_token_map_ready():
             await build_symbol_token_map_from_dhan(user_id)
         await subscribe_dhan_sector_indices_for_user(user_id)
         await start_dhan_feed(user_id)
