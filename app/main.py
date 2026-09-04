@@ -6,6 +6,7 @@ import base64
 import hashlib
 import hmac
 import io
+import json
 import os
 import re
 import secrets
@@ -631,6 +632,13 @@ async def _poke_market_feed_service(user_id: int, symbols: Optional[List[str]] =
     except Exception as exc:
         log.warning("Market feed poke failed | user=%s source=%s err=%s", user_id, source, exc)
 
+
+async def _runtime_subscribe_symbols(user_id: int, symbols: List[str]) -> None:
+    if API_OWNS_MARKET_FEED:
+        await subscribe_symbols_for_user(int(user_id), symbols)
+        return
+    await _poke_market_feed_service(int(user_id), symbols, "api_signal_intake")
+
 # Throttle instrument reload
 _LAST_INSTR_RELOAD = 0.0
 _INSTR_RELOAD_INTERVAL = 300.0  # 5 minutes
@@ -941,7 +949,7 @@ async def ensure_service_runtime() -> ServiceRuntime:
             store_provider=lambda: store,
             ws_manager=ws_mgr,
             ensure_engine=lambda uid: ensure_engine(uid),
-            subscribe_symbols=lambda uid, symbols: subscribe_symbols_for_user(uid, symbols),
+            subscribe_symbols=lambda uid, symbols: _runtime_subscribe_symbols(uid, symbols),
             start_feed=lambda uid: restart_selected_feed(uid),
             stop_dhan_feed=lambda: _stop_dhan_feed(),
             stop_kite_feed=lambda: _stop_kite_ticker(),
@@ -1759,7 +1767,7 @@ async def startup():
             store_provider=lambda: store,
             ws_manager=ws_mgr,
             ensure_engine=lambda uid: ensure_engine(uid),
-            subscribe_symbols=lambda uid, symbols: subscribe_symbols_for_user(uid, symbols),
+            subscribe_symbols=lambda uid, symbols: _runtime_subscribe_symbols(uid, symbols),
             start_feed=lambda uid: restart_selected_feed(uid),
             stop_dhan_feed=lambda: _stop_dhan_feed(),
             stop_kite_feed=lambda: _stop_kite_ticker(),
@@ -1787,7 +1795,7 @@ async def startup():
         store_provider=lambda: store,
         ws_manager=ws_mgr,
         ensure_engine=lambda uid: ensure_engine(uid),
-        subscribe_symbols=lambda uid, symbols: subscribe_symbols_for_user(uid, symbols),
+        subscribe_symbols=lambda uid, symbols: _runtime_subscribe_symbols(uid, symbols),
         start_feed=lambda uid: restart_selected_feed(uid),
         stop_dhan_feed=lambda: _stop_dhan_feed(),
         stop_kite_feed=lambda: _stop_kite_ticker(),

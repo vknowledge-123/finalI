@@ -979,7 +979,7 @@ class TradeEngine:
     Includes:
     - Unified alert-name normalization
     - Lazy ensure Zerodha connected
-    - No REST LTP: waits for tick (CAPITAL mode)
+    - Entry feed safety with live tick first, REST LTP fallback when feed is alive
     - mark_open AFTER successful order placement
     - Always releases locks
     - Exit de-bounced + lock-based safe exit
@@ -2020,8 +2020,9 @@ class TradeEngine:
     async def _wait_for_entry_feed_ready(self, symbol: str) -> Tuple[bool, str, float]:
         """
         Entry orders are only safe when the broker market feed is alive and the
-        exact alert symbol has a fresh websocket tick. REST auth/LTP can place
-        orders, but target/SL/TSL exits depend on the live feed.
+        exact alert symbol has a fresh websocket tick. If the feed is alive but
+        the first tick for a newly subscribed alert symbol is late, callers may
+        use a REST quote/LTP fallback for entry sizing and execution.
         """
         if _is_test_mode() or not _env_bool("REQUIRE_BROKER_FEED_FOR_ENTRY", True):
             return True, "", 0.0
@@ -2035,6 +2036,7 @@ class TradeEngine:
         fresh_sec = max(0.5, _env_float("ENTRY_FRESH_TICK_MAX_AGE_SEC", 5.0))
         deadline = time.time() + timeout_sec
         last_reason = "BROKER_FEED_NOT_CONNECTED"
+        feed_seen = False
 
         while True:
             health: Dict[str, Any] = {}
@@ -2049,6 +2051,7 @@ class TradeEngine:
                 detail = str(health.get("reason") or health.get("detail") or "").strip()
                 last_reason = "BROKER_FEED_NOT_CONNECTED" + (f":{detail}" if detail else "")
             else:
+                feed_seen = True
                 latest: Dict[str, Any] = {}
                 try:
                     tick_fn = getattr(self.store, "load_latest_tick", None)
@@ -2064,15 +2067,18 @@ class TradeEngine:
                 last_reason = f"NO_FRESH_LIVE_TICK:{symbol}:age={age:.1f}s"
 
             if time.time() >= deadline:
+                if feed_seen and last_reason.startswith("NO_FRESH_LIVE_TICK:"):
+                    return True, last_reason, 0.0
                 return False, last_reason, 0.0
             await asyncio.sleep(0.25)
 
-    async def _fetch_ltp(self, symbol: str) -> float:
+    async def _fetch_ltp(self, symbol: str, *, prefer_cache: bool = True) -> float:
         symbol = norm_symbol(symbol)
         for _ in range(3):
-            tick = self.ticks.get(symbol)
-            if tick and float(tick.get("ltp", 0.0)) > 0:
-                return float(tick["ltp"])
+            if prefer_cache:
+                tick = self.ticks.get(symbol)
+                if tick and float(tick.get("ltp", 0.0)) > 0:
+                    return float(tick["ltp"])
             if self.broker == "DHAN":
                 if await self._ensure_dhan_ready() and self.dhan:
                     try:
@@ -2724,10 +2730,23 @@ class TradeEngine:
                     results.append({"symbol": sym, "status": "SKIPPED", "reason": feed_reason})
                     continue
 
-                ltp = live_ltp if live_ltp > 0 else await self._fetch_ltp(sym)
+                ltp = live_ltp if live_ltp > 0 else await self._fetch_ltp(
+                    sym,
+                    prefer_cache=not feed_reason.startswith("NO_FRESH_LIVE_TICK:"),
+                )
                 if ltp <= 0:
-                    results.append({"symbol": sym, "status": "ERROR", "reason": "NO_LTP"})
+                    reason = feed_reason if feed_reason.startswith("NO_FRESH_LIVE_TICK:") else "NO_LTP"
+                    results.append({"symbol": sym, "status": "SKIPPED", "reason": reason})
                     continue
+                if feed_reason.startswith("NO_FRESH_LIVE_TICK:"):
+                    log.warning(
+                        "ENTRY_REST_LTP_FALLBACK | user=%s broker=%s symbol=%s ltp=%.2f reason=%s",
+                        self.user_id,
+                        self.broker,
+                        sym,
+                        float(ltp),
+                        feed_reason,
+                    )
 
                 qty = 0
                 if cfg.qty_mode == "QTY":

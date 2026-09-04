@@ -1,5 +1,6 @@
 import os
 import asyncio
+import json
 import unittest
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, patch
@@ -497,6 +498,30 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(r2.status_code, 200)
         self.assertEqual(r2.json()["ok"], True)
         self.assertEqual(r2.json()["count"], 1)
+
+    def test_runtime_subscription_queues_symbols_when_api_does_not_own_feed(self) -> None:
+        class FakeRedis:
+            def __init__(self) -> None:
+                self.jobs = []
+
+            async def rpush(self, key: str, payload: str) -> None:
+                self.jobs.append((key, payload))
+
+        class FakeStore:
+            def __init__(self) -> None:
+                self.redis = FakeRedis()
+
+        fake_store = FakeStore()
+        with patch.object(main_module, "API_OWNS_MARKET_FEED", False), patch.object(main_module, "store", fake_store):
+            asyncio.run(main_module._runtime_subscribe_symbols(1, ["HESTERBIO"]))
+
+        self.assertEqual(len(fake_store.redis.jobs), 1)
+        key, payload = fake_store.redis.jobs[0]
+        self.assertEqual(key, main_module.MARKET_SUBSCRIPTION_QUEUE)
+        job = json.loads(payload)
+        self.assertEqual(job["user_id"], 1)
+        self.assertEqual(job["symbols"], ["HESTERBIO"])
+        self.assertEqual(job["source"], "api_signal_intake")
 
     def test_ws_feed_http_returns_upgrade_required(self) -> None:
         r = self.client.get("/ws/feed", params={"user_id": 1})

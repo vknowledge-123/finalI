@@ -150,7 +150,12 @@ class SignalIntakeService:
                 "content_type": job.content_type,
             }
 
-        asyncio.create_task(self.subscribe_symbols(user_id, symbols), name=f"subscribe_alert_{user_id}")
+        try:
+            await asyncio.wait_for(self.subscribe_symbols(user_id, symbols), timeout=1.0)
+        except asyncio.TimeoutError:
+            log.warning("ALERT_SUBSCRIBE_TIMEOUT | user=%s symbols=%s", user_id, symbols)
+        except Exception as exc:
+            log.warning("ALERT_SUBSCRIBE_FAIL | user=%s symbols=%s err=%s", user_id, symbols, exc)
 
         initial_result = [{"symbol": symbol, "status": "RECEIVED"} for symbol in symbols]
         initial_save_task = asyncio.create_task(

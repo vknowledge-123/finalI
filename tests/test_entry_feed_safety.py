@@ -84,6 +84,29 @@ class EntryFeedSafetyTests(unittest.IsolatedAsyncioTestCase):
         engine._fetch_ltp.assert_not_awaited()
         engine._place_order_with_execution.assert_awaited_once()
 
+    async def test_entry_uses_rest_ltp_when_feed_alive_but_first_tick_is_late(self) -> None:
+        store, engine = await self._engine_with_config()
+        await store.save_broker_feed_health(1, "DHAN", True, ttl_sec=15, detail="test")
+        engine._fetch_ltp = AsyncMock(return_value=100.0)
+        engine._place_order_with_execution = AsyncMock(
+            return_value=OrderExecution(
+                order_id="OID2",
+                symbol="SBIN",
+                side="BUY",
+                qty=1,
+                status="COMPLETE",
+                avg_price=100.0,
+                filled_qty=1,
+            )
+        )
+
+        result = await engine.on_chartink_alert("FEED_TEST", ["SBIN"])
+
+        self.assertEqual(result[0]["status"], "ENTERED")
+        self.assertIn(result[0]["reason"], {"ORDER_OK", "ORDER_EXECUTED"})
+        engine._fetch_ltp.assert_awaited_once_with("SBIN", prefer_cache=False)
+        engine._place_order_with_execution.assert_awaited_once()
+
 
 if __name__ == "__main__":
     unittest.main()
