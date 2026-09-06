@@ -2,13 +2,44 @@
 
 Date: 2026-09-06
 
-Final result: **165 tests passed**, 9 deprecation warnings, in 18.74 seconds.
+Final result: **179 tests passed**, 9 deprecation warnings, in 19.47 seconds.
 Python compilation passed. No live orders were placed.
+
+## Sunday Feed Recovery Follow-up
+
+- Replaced the SDK's order-login printing path with the documented SELF JSON
+  handshake. No credentials, raw response bodies or authenticated URLs are logged
+  by the new feed error/retry handlers.
+- Market-feed reconnects now have one owner. The external watchdog and symbol
+  confirmation cannot bypass a running receiver's cooldown or authentication block.
+- Added exponential backoff with jitter, a minimum 60-second HTTP 429 cooldown,
+  Retry-After handling, and a minimum 300-second retry delay outside the configured
+  equity connection window. Broker rate limits may still occur for external reasons.
+- Locally expired JWT metadata prevents socket startup. HTTP authentication rejection
+  and SDK disconnect codes for invalid/expired credentials or missing entitlement
+  block further market reconnects until credentials are replaced. Metadata checks
+  are not signature verification; Dhan remains responsible for authentication.
+- Idle market sockets are not restarted merely because no ticks arrived. Symbol
+  tick confirmation is disabled outside weekday 09:15-15:30 IST. The connection
+  retry window is weekday 08:00-16:00 IST. Optional comma-separated ISO dates in
+  DHAN_MARKET_HOLIDAYS and DHAN_MARKET_EXTRA_SESSIONS adjust the trading days;
+  exchange holidays/special session times are not automatically downloaded.
+- Malformed order frames are rejected atomically, the socket is closed, and the
+  receiver backs off. This prevents unsafe state updates; it cannot repair a bad
+  broker response. Reconciliation remains the fallback for missing order events.
+- Added capitalized documented order fields and preserved explicit zero remaining
+  quantity. The callback is awaited instead of creating an unobserved future.
+- v2 disconnect sends JSON only, without the SDK's additional legacy binary header.
+- Added 14 recovery regressions including credential replacement, expired startup,
+  rate limits, session closure, malformed frames, secret-free output and shutdown.
+
+Protocol references: [Dhan order updates](https://dhanhq.co/docs/v2/order-update/)
+and [Dhan live market feed](https://dhanhq.co/docs/v2/live-market-feed/).
 
 ## Checks
 
 - Compiled all application and test Python files.
-- Scanned all 46 application Python files with Pyflakes. Fixed the undefined
+- Scanned all 47 application Python files with Pyflakes. Fixed the undefined
   `dhanhq` annotation. Unused imports/locals and an existing duplicate helper
   remain; the scan is not a clean lint certification.
 - Ran the Python suite with test mode enabled and unhandled thread exceptions

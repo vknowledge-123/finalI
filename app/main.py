@@ -1445,14 +1445,17 @@ async def start_dhan_feed(user_id: int) -> None:
     if not client_id or not access_token:
         return
     await _stop_kite_ticker()
-    if DHAN_FEED and DHAN_USER_ID == user_id and DHAN_ACCESS_TOKEN == access_token:
+    if (DHAN_FEED and DHAN_USER_ID == user_id and DHAN_ACCESS_TOKEN == access_token
+            and getattr(DHAN_FEED, "client_id", "") == client_id):
         return
     await _stop_dhan_feed()
 
     def on_state(connected: bool) -> None:
         global DHAN_CONNECTED
         DHAN_CONNECTED = connected
-        _save_feed_health_nowait(user_id, "DHAN", connected, "websocket_state")
+        detail = (getattr(getattr(DHAN_FEED, "feed", None), "health_detail", None)
+                  or getattr(DHAN_FEED, "health_detail", "websocket_state"))
+        _save_feed_health_nowait(user_id, "DHAN", connected, detail)
 
     previous_closes: Dict[int, float] = {}
     last_health_write = 0.0
@@ -1531,27 +1534,26 @@ async def start_dhan_feed(user_id: int) -> None:
 
         await handle()
 
-    def on_order_update(message: Dict[str, Any]) -> None:
-        loop = APP_LOOP
-        if loop is None:
-            return
+    async def on_order_update(message: Dict[str, Any]) -> None:
         raw = message.get("Data") if isinstance(message, dict) else {}
         raw = raw if isinstance(raw, dict) else {}
+        def pick(*names):
+            return next((raw[name] for name in names if raw.get(name) not in (None, "")), None)
+
         normalized = {
-            "order_id": raw.get("orderNo") or raw.get("orderId"),
-            "status": raw.get("status") or raw.get("orderStatus"),
-            "tradingsymbol": raw.get("tradingSymbol") or raw.get("symbol"),
-            "average_price": raw.get("avgTradedPrice") or raw.get("averagePrice"),
-            "filledQuantity": raw.get("filledQuantity") or raw.get("tradedQuantity") or raw.get("tradedQty"),
-            "remainingQuantity": raw.get("remainingQuantity") or raw.get("pendingQuantity"),
-            "quantity": raw.get("quantity") or raw.get("orderQuantity"),
+            "order_id": pick("OrderNo", "orderNo", "orderId"),
+            "status": pick("Status", "status", "orderStatus"),
+            "tradingsymbol": pick("Symbol", "tradingSymbol", "symbol"),
+            "average_price": pick("AvgTradedPrice", "avgTradedPrice", "averagePrice"),
+            "filledQuantity": pick("TradedQty", "filledQuantity", "tradedQuantity", "tradedQty"),
+            "remainingQuantity": pick("RemainingQuantity", "remainingQuantity", "pendingQuantity"),
+            "quantity": pick("Quantity", "quantity", "orderQuantity"),
+            "omsErrorDescription": pick("ReasonDescription", "omsErrorDescription"),
         }
-
-        async def handle() -> None:
-            eng = await ensure_engine(user_id)
-            await eng.on_order_update(normalized)
-
-        asyncio.run_coroutine_threadsafe(handle(), loop)
+        if not normalized["order_id"] or not normalized["status"]:
+            return
+        eng = await ensure_engine(user_id)
+        await eng.on_order_update(normalized)
 
     DHAN_FEED = DhanFeedService(
         user_id=user_id,

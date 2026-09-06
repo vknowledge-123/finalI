@@ -29,7 +29,7 @@ class DhanFeedContractTests(unittest.IsolatedAsyncioTestCase):
 
         service = DhanFeedService(1, "client", "token", lambda p: None, lambda p: None, states.append)
         with patch.object(_QueuedDhanMarketFeed, "_run_async", receiver), \
-             patch("app.dhan_broker.OrderUpdate", return_value=SimpleNamespace(connect_order_update=order_receiver)):
+             patch("app.dhan_broker._SafeDhanOrderUpdate", return_value=SimpleNamespace(connect_order_update=order_receiver)):
             await service.start(["3045"])
             feed = service.feed
             thread = service.feed_thread
@@ -168,7 +168,7 @@ class DhanFeedContractTests(unittest.IsolatedAsyncioTestCase):
             captured.update(kwargs)
             return SimpleNamespace(start=AsyncMock())
 
-        engine = SimpleNamespace(on_tick=AsyncMock(return_value=None))
+        engine = SimpleNamespace(on_tick=AsyncMock(return_value=None), on_order_update=AsyncMock())
         with patch.object(main_app, "store", memory), patch.object(main_app, "_is_test_mode", return_value=False), \
              patch.object(main_app, "_stop_kite_ticker", AsyncMock()), \
              patch.object(main_app, "_stop_dhan_feed", AsyncMock()), \
@@ -191,3 +191,12 @@ class DhanFeedContractTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(tick["depth"], [{"bid_price": "101"}])
             self.assertEqual(engine.on_tick.await_args.args[:3], ("NIFTY AUTO", 102, 100))
             self.assertEqual(broadcast.call_args.args[1]["close"], 100)
+            await captured["on_order_update"]({"Type": "order_alert", "Data": {
+                "OrderNo": "O1", "Status": "TRADED", "Symbol": "SBIN", "Quantity": 2,
+                "TradedQty": 2, "RemainingQuantity": 0, "AvgTradedPrice": 100,
+            }})
+            order = engine.on_order_update.await_args.args[0]
+            self.assertEqual(order["order_id"], "O1")
+            self.assertEqual(order["status"], "TRADED")
+            self.assertEqual(order["filledQuantity"], 2)
+            self.assertEqual(order["remainingQuantity"], 0)

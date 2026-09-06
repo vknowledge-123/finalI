@@ -43,6 +43,9 @@ class _FakeMain:
 class MarketFeedServiceTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         mfs._DHAN_NO_TICK_RESTART.clear()
+        session = patch.object(mfs, "equity_session_open", return_value=True)
+        session.start()
+        self.addCleanup(session.stop)
 
     async def asyncTearDown(self) -> None:
         mfs._DHAN_NO_TICK_RESTART.clear()

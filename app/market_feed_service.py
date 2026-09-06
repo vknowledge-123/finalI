@@ -11,6 +11,7 @@ from .redis_store import norm_symbol
 from .service_bootstrap import configure_logging, init_store, load_user_ids
 from .service_queues import MARKET_SUBSCRIPTION_QUEUE
 from .stock_sector import STOCK_INDEX_MAPPING
+from .dhan_feed_policy import equity_session_open
 
 configure_logging("market_feed_service")
 log = logging.getLogger("market_feed_service")
@@ -55,6 +56,11 @@ def _dhan_connected(main_app: Any, user_id: int) -> bool:
     return bool(getattr(main_app, "DHAN_CONNECTED", False) and getattr(main_app, "DHAN_USER_ID", None) == user_id)
 
 
+def _dhan_manages_reconnect(main_app: Any, user_id: int) -> bool:
+    return bool(getattr(main_app, "DHAN_USER_ID", None) == user_id
+                and getattr(getattr(main_app, "DHAN_FEED", None), "reconnect_managed", False))
+
+
 async def _wait_for_fresh_ws_ticks(store: Any, user_id: int, symbols: List[str], timeout_sec: float) -> List[str]:
     watched = [norm_symbol(symbol) for symbol in symbols]
     watched = [symbol for symbol in watched if symbol]
@@ -92,6 +98,9 @@ async def _confirm_dhan_alert_symbol_ticks(
         return
     if DHAN_SUBSCRIBE_TICK_CONFIRM_SEC <= 0:
         return
+    if not equity_session_open():
+        log.info("MARKET_SUBSCRIBE_SESSION_CLOSED | user=%s", user_id)
+        return
 
     missing = await _wait_for_fresh_ws_ticks(store, user_id, symbols, DHAN_SUBSCRIBE_TICK_CONFIRM_SEC)
     if not missing:
@@ -103,6 +112,10 @@ async def _confirm_dhan_alert_symbol_ticks(
     except Exception:
         health = {}
     connected = bool(health.get("connected")) if isinstance(health, dict) else False
+
+    if not connected and _dhan_manages_reconnect(main_app, user_id):
+        log.info("MARKET_SUBSCRIBE_RECOVERY_PENDING | user=%s", user_id)
+        return
 
     if not connected:
         now = time.time()
@@ -193,6 +206,7 @@ async def _feed_started_with_current_credentials(main_app: Any, store: Any, user
             and main_app.DHAN_FEED is not None
             and main_app.DHAN_USER_ID == int(user_id)
             and getattr(main_app, "DHAN_ACCESS_TOKEN", "") == access_token
+            and getattr(main_app.DHAN_FEED, "client_id", "") == str(creds.get("client_id") or "").strip()
         )
 
     access_token = str(await store.load_access_token(int(user_id)) or "").strip()
@@ -273,14 +287,23 @@ async def _publish_feed_health(main_app: Any, store: Any, started_users: Set[int
                 connected = bool(main_app.DHAN_CONNECTED and main_app.DHAN_USER_ID == int(user_id))
             else:
                 connected = bool(main_app.KT_CONNECTED and main_app.KT_USER_ID == int(user_id))
+            detail = "market_feed_service"
+            if broker == "DHAN":
+                service = getattr(main_app, "DHAN_FEED", None)
+                detail = getattr(getattr(service, "feed", None), "health_detail", None) or getattr(service, "health_detail", detail)
             await store.save_broker_feed_health(
                 int(user_id),
                 "DHAN" if broker == "DHAN" else "ZERODHA",
                 connected,
                 ttl_sec=15,
-                detail="market_feed_service",
+                detail=detail,
             )
             if connected:
+                _DISCONNECTED_SINCE.pop(int(user_id), None)
+                continue
+            # Dhan's receiver owns recovery/backoff. A second watchdog must not
+            # recreate it and reset its cooldown or expired-token block.
+            if broker == "DHAN" and (_dhan_manages_reconnect(main_app, user_id) or not equity_session_open(connection_window=True)):
                 _DISCONNECTED_SINCE.pop(int(user_id), None)
                 continue
 

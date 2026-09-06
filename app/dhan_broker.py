@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
+import struct
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -10,6 +12,9 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 
 import pandas as pd
 import pytz
+import websockets
+
+from .dhan_feed_policy import FeedBackoff, error_status, safe_feed_error, token_expired
 
 try:  # Keep the app importable if the broker SDK changes or is temporarily broken.
     from dhanhq import DhanContext, MarketFeed, OrderUpdate, dhanhq
@@ -582,7 +587,94 @@ def resample_intraday_candles(candles: List[Dict[str, Any]], interval_minutes: i
     return sorted(buckets.values(), key=lambda item: item.get("date") or datetime.min)
 
 
+class _DhanFeedDisconnect(Exception):
+    def __init__(self, code):
+        super().__init__(f"DHAN_DISCONNECT_{code}")
+        self.status_code = 401 if code in (806, 807, 808, 809) else (429 if code == 805 else None)
+
+
+class _SafeDhanOrderUpdate(OrderUpdate):
+    async def connect_order_update(self):
+        # Preserve Dhan's SELF protocol without the SDK's credential-printing path.
+        async with websockets.connect(self.order_feed_wss, open_timeout=15, close_timeout=5) as ws:
+            await ws.send(json.dumps({"LoginReq": {
+                "MsgCode": 42, "ClientId": str(self.client_id), "Token": str(self.access_token),
+            }, "UserType": "SELF"}))
+            while not token_expired(self.access_token):
+                try:
+                    message = await asyncio.wait_for(ws.recv(), timeout=60)
+                except asyncio.TimeoutError:
+                    continue
+                # Reject malformed frames as a whole: never infer an order/fill
+                # from a truncated, concatenated or non-JSON error response.
+                data = json.loads(message)
+                if not isinstance(data, dict):
+                    raise ValueError("DHAN_ORDER_UPDATE_INVALID_SHAPE")
+                if data.get("Type") == "order_alert":
+                    if not isinstance(data.get("Data"), dict):
+                        raise ValueError("DHAN_ORDER_UPDATE_INVALID_DATA")
+                    result = self.on_update(data) if callable(self.on_update) else None
+                    if inspect.isawaitable(result):
+                        await result
+                elif str(data.get("Type", "")).lower() in {"error", "auth_error"}:
+                    raise ValueError("DHAN_ORDER_UPDATE_SERVER_ERROR")
+
+
 class _QueuedDhanMarketFeed(MarketFeed):
+    def server_disconnection(self, data):
+        code = struct.unpack("<BHBIH", data[:10])[4]
+        raise _DhanFeedDisconnect(code)
+
+    async def disconnect(self):
+        if self.ws:
+            try:
+                # v2 disconnect is JSON only; don't send the SDK's v1 header too.
+                await self.ws.send(json.dumps({"RequestCode": 12}))
+            finally:
+                await self.ws.close()
+                self.ws = None
+        if self.on_close:
+            self.on_close(self)
+
+    async def _run_async(self):
+        backoff = FeedBackoff()
+        while self._running:
+            if token_expired(self.access_token):
+                self.health_detail = "token_expired_reauthenticate"
+                if self.on_close:
+                    self.on_close(self)
+                return
+            connected_at = time.monotonic()
+            try:
+                await self.connect()
+                self.health_detail = "websocket_connected"
+                while self._running and not token_expired(self.access_token):
+                    try:
+                        await asyncio.wait_for(self.get_instrument_data(), timeout=60)
+                    except asyncio.TimeoutError:
+                        # An idle event-based feed is not a disconnected socket.
+                        continue
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if time.monotonic() - connected_at >= 60:
+                    backoff.reset()
+                self.health_detail = safe_feed_error(exc)
+                if self.on_error:
+                    self.on_error(self, exc)
+                if error_status(exc) in (401, 403):
+                    self.health_detail = "authentication_rejected_reauthenticate"
+                    return
+                delay = backoff.delay(exc)
+                log.warning("DHAN_MARKET_RETRY | error=%s delay_sec=%.1f", self.health_detail, delay)
+                if self.ws:
+                    try:
+                        await self.ws.close()
+                    except Exception:
+                        pass
+                    self.ws = None
+                await asyncio.sleep(delay)
+
     def run(self):
         asyncio.set_event_loop(self.loop)
         self._running = True
@@ -591,9 +683,14 @@ class _QueuedDhanMarketFeed(MarketFeed):
             self.loop.run_until_complete(self._runner_task)
         except asyncio.CancelledError:
             pass
-        except Exception:
-            log.exception("DHAN_FEED_RECEIVER_STOPPED")
+        except Exception as exc:
+            log.error("DHAN_FEED_RECEIVER_STOPPED | error=%s", safe_feed_error(exc))
         finally:
+            if self.ws:
+                try:
+                    self.loop.run_until_complete(asyncio.wait_for(self.ws.close(), timeout=5))
+                except Exception:
+                    pass
             pending = asyncio.all_tasks(self.loop)
             for task in pending:
                 task.cancel()
@@ -642,7 +739,7 @@ class DhanFeedService:
     client_id: str
     access_token: str
     on_tick: Callable[[Dict[str, Any]], Any]
-    on_order_update: Callable[[Dict[str, Any]], None]
+    on_order_update: Callable[[Dict[str, Any]], Any]
     on_state: Optional[Callable[[bool], None]] = None
 
     def __post_init__(self) -> None:
@@ -657,6 +754,14 @@ class DhanFeedService:
         self._tick_tasks: List[asyncio.Task] = []
         self._tick_queues: List[asyncio.Queue] = []
         self._stopping = False
+        self.health_detail = "starting"
+        self.order_health_detail = "starting"
+
+    @property
+    def reconnect_managed(self):
+        detail = getattr(self.feed, "health_detail", self.health_detail)
+        return bool(token_expired(self.access_token) or detail == "authentication_rejected_reauthenticate"
+                    or (self.feed_thread and self.feed_thread.is_alive()))
 
     async def _deliver_tick(self, packet: Dict[str, Any]) -> None:
         if self._stopping:
@@ -678,6 +783,16 @@ class DhanFeedService:
                 queue.task_done()
 
     async def start(self, security_ids: Iterable[str]) -> None:
+        if self.feed is not None or self.order_task is not None:
+            await self.subscribe(security_ids)
+            return
+        if token_expired(self.access_token):
+            self.health_detail = "token_expired_reauthenticate"
+            self.order_health_detail = self.health_detail
+            if self.on_state:
+                self.on_state(False)
+            log.warning("DHAN_FEED_AUTH_EXPIRED | user=%s", self.user_id)
+            return
         self.security_ids.update(str(item) for item in security_ids if item)
         if len(self.security_ids) > 5000:
             raise ValueError("DHAN_SUBSCRIPTION_LIMIT_EXCEEDED")
@@ -714,7 +829,6 @@ class DhanFeedService:
             delivery_loop.call_soon_threadsafe(self.sent_security_ids.clear)
             if self.on_state:
                 self.on_state(False)
-            log.warning("Dhan market feed error: %s", exc)
 
         self.feed = _QueuedDhanMarketFeed(
             self.context,
@@ -728,7 +842,7 @@ class DhanFeedService:
         self.feed.delivery_loop = delivery_loop
         self.feed_thread = self.feed.start()
 
-        self.order_update = OrderUpdate(self.context)
+        self.order_update = _SafeDhanOrderUpdate(self.context)
         self.order_update.on_update = self.on_order_update
         self.order_task = asyncio.create_task(
             self._run_order_updates(),
@@ -736,14 +850,32 @@ class DhanFeedService:
         )
 
     async def _run_order_updates(self) -> None:
-        while self.order_update is not None:
+        backoff = FeedBackoff()
+        while self.order_update is not None and not self._stopping:
+            if token_expired(self.access_token):
+                self.order_health_detail = "token_expired_reauthenticate"
+                return
+            connected_at = time.monotonic()
             try:
                 await self.order_update.connect_order_update()
+                failure = ConnectionError("Order stream closed")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                log.warning("Dhan order update feed error: %s", exc)
-            await asyncio.sleep(5)
+                failure = exc
+            if token_expired(self.access_token):
+                self.order_health_detail = "token_expired_reauthenticate"
+                return
+            if time.monotonic() - connected_at >= 60:
+                backoff.reset()
+            self.order_health_detail = safe_feed_error(failure)
+            if error_status(failure) in (401, 403):
+                self.order_health_detail = "authentication_rejected_reauthenticate"
+                return
+            delay = backoff.delay(failure)
+            log.warning("DHAN_ORDER_RETRY | user=%s error=%s delay_sec=%.1f",
+                        self.user_id, self.order_health_detail, delay)
+            await asyncio.sleep(delay)
 
     async def subscribe(self, security_ids: Iterable[str]) -> bool:
         async with self._subscription_lock:
@@ -775,7 +907,7 @@ class DhanFeedService:
                 sent = await asyncio.wait_for(asyncio.wrap_future(future), timeout=10)
             except Exception:
                 self.sent_security_ids.difference_update(new_ids)
-                log.exception("DHAN_FEED_SUBSCRIBE_FAILED | user=%s", self.user_id)
+                log.warning("DHAN_FEED_SUBSCRIBE_FAILED | user=%s", self.user_id)
                 raise
             if sent:
                 self.sent_security_ids.update(desired)
@@ -793,20 +925,20 @@ class DhanFeedService:
             try:
                 await asyncio.wait_for(asyncio.to_thread(feed.close_connection), timeout=10)
             except Exception as exc:
-                log.debug("Dhan market feed close failed: %s", exc)
+                log.debug("Dhan market feed close failed: %s", safe_feed_error(exc))
 
             try:
                 if feed_thread and getattr(feed_thread, "is_alive", lambda: False)():
                     await asyncio.to_thread(feed_thread.join, 3)
             except Exception as exc:
-                log.debug("Dhan market feed thread join failed: %s", exc)
+                log.debug("Dhan market feed thread join failed: %s", safe_feed_error(exc))
 
             try:
                 loop = getattr(feed, "loop", None)
                 if loop is not None and not loop.is_closed() and not loop.is_running():
                     loop.close()
             except Exception as exc:
-                log.debug("Dhan market feed loop close failed: %s", exc)
+                log.debug("Dhan market feed loop close failed: %s", safe_feed_error(exc))
 
         if self.order_task:
             self.order_task.cancel()
