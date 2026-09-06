@@ -26,6 +26,12 @@ _REST_FALLBACK_LAST: Dict[Tuple[int, str], float] = {}
 
 
 async def _reconcile_position(store, registry: EngineRegistry, user_id: int, row: Dict[str, Any]) -> None:
+    if str(row.get("status") or "").upper() not in {"OPEN", "EXIT_CONDITIONS_MET"}:
+        return
+    # Delivery carry is reconciled against holdings by the carry-position path.
+    # A flat intraday positions book does not establish that holdings were sold.
+    if str(row.get("product") or "").upper() == "CNC":
+        return
     symbol = str(row.get("symbol") or "").strip().upper()
     if not symbol:
         return
@@ -33,14 +39,20 @@ async def _reconcile_position(store, registry: EngineRegistry, user_id: int, row
     if local_qty <= 0:
         return
     engine = await registry.get(user_id)
-    broker_qty_signed = await engine._fetch_broker_symbol_qty(symbol)
+    broker_qty_signed = await engine._fetch_broker_symbol_qty(symbol, product=str(row.get("product") or "MIS"))
     if broker_qty_signed is None:
         return
     broker_qty = abs(int(broker_qty_signed))
+    expected_sign = -1 if str(row.get("side") or "BUY").upper() == "SELL" else 1
+    if int(broker_qty_signed) * expected_sign < 0:
+        await store.set_kill(user_id, True)
+        log.error("RECON_DIRECTION_MISMATCH | user=%s symbol=%s", user_id, symbol)
+        return
     if broker_qty == local_qty:
         return
     if broker_qty <= 0:
-        await store.delete_position(user_id, symbol)
+        row.update(qty=0, status="CLOSED", exit_reason="BROKER_POSITION_CLOSED", updated_ts=time.time())
+        await store.upsert_position(user_id, symbol, row)
         await store.clear_open(user_id, symbol)
         engine.positions.pop(symbol, None)
         log.warning("RECON_POSITION_CLOSED | user=%s symbol=%s local_qty=%s broker_qty=0", user_id, symbol, local_qty)
@@ -79,10 +91,10 @@ async def _rest_exit_fallback_position(store, registry: EngineRegistry, user_id:
         latest = await store.load_latest_tick(int(user_id), symbol)
     except Exception:
         latest = {}
-    age = float(latest.get("age_sec", 999999.0) or 999999.0)
+    age = float(latest.get("age_sec", 999999.0))
     ltp = float(latest.get("ltp") or latest.get("last_price") or 0.0)
     latest_source = str(latest.get("source") or "").strip().upper()
-    if ltp > 0 and latest_source != "REST_EXIT_FALLBACK" and age <= max(0.5, EXIT_FRESH_TICK_MAX_AGE_SEC):
+    if ltp > 0 and latest_source in {"DHAN_WS", "ZERODHA_WS"} and 0 <= age <= max(0.5, EXIT_FRESH_TICK_MAX_AGE_SEC):
         return
 
     now = time.time()

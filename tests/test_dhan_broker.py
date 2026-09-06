@@ -328,7 +328,9 @@ class DhanTradeEngineTests(unittest.IsolatedAsyncioTestCase):
         engine.order_worker.submit = fake_order_submit
         engine.market_data_worker.submit = fake_market_submit
 
-        with patch("app.trade_engine.DHAN_INSTRUMENTS.security_id", AsyncMock(return_value="3045")):
+        with patch("app.trade_engine.DHAN_INSTRUMENTS.security_id", AsyncMock(return_value="3045")), patch(
+            "app.trade_engine.DHAN_INSTRUMENTS.tick_size", return_value=0.05
+        ):
             order_id = await engine._place_order(
                 "SBIN",
                 "BUY",
@@ -445,7 +447,7 @@ class DhanTradeEngineTests(unittest.IsolatedAsyncioTestCase):
                 return {
                     "data": {
                         "orderId": order_id,
-                        "orderStatus": "PENDING",
+                        "orderStatus": "CANCELLED" if order_id in cancelled else "PENDING",
                         "quantity": 10,
                         "remainingQuantity": 10,
                     }
@@ -533,7 +535,7 @@ class DhanTradeEngineTests(unittest.IsolatedAsyncioTestCase):
                     return {
                         "data": {
                             "orderId": order_id,
-                            "orderStatus": "PARTIALLY_TRADED",
+                            "orderStatus": "CANCELLED" if order_id in cancelled else "PARTIALLY_TRADED",
                             "quantity": 10,
                             "filledQuantity": 4,
                             "remainingQuantity": 6,
@@ -726,7 +728,7 @@ class DhanTradeEngineTests(unittest.IsolatedAsyncioTestCase):
                 return {
                     "data": {
                         "orderId": "DHAN-PENDING",
-                        "orderStatus": "PENDING",
+                        "orderStatus": "CANCELLED" if "DHAN-PENDING" in cancelled else "PENDING",
                         "quantity": 10,
                         "remainingQuantity": 10,
                         "tradingSymbol": "SBIN",

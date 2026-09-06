@@ -1986,6 +1986,12 @@
     /* ================= ADMIN SESSION ================= */
 
     /* ================= UI HELPERS ================= */
+    function escapeHtml(value) {
+      return String(value ?? '').replace(/[&<>"']/g, c => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+      })[c]);
+    }
+
     function toast(msg, type = 'success') {
       const container = document.getElementById('toast-container');
       const el = document.createElement('div');
@@ -1997,7 +2003,7 @@
       const icon = type === 'error' ? '⚠️' : '✅';
 
       el.className = `bg-slate-900 px-4 py-3 rounded-xl border flex items-center gap-3 shadow-xl backdrop-blur-xl animate-enter ${colors}`;
-      el.innerHTML = `<span class="text-lg">${icon}</span><span class="text-sm font-medium">${msg}</span>`;
+      el.innerHTML = `<span class="text-lg">${icon}</span><span class="text-sm font-medium">${escapeHtml(msg)}</span>`;
 
       container.appendChild(el);
       setTimeout(() => {
@@ -2135,7 +2141,7 @@
           list.innerHTML = d.sectors.map((s, i) => `
                     <div class="px-2 py-1 rounded bg-slate-800 border border-slate-700 flex items-center gap-2">
                         <span class="font-bold text-slate-400">#${i + 1}</span>
-                        <span class="font-mono text-cyan-300">${s.name}</span>
+                        <span class="font-mono text-cyan-300">${escapeHtml(s.name)}</span>
                         <span class="${s.pct >= 0 ? 'text-emerald-400' : 'text-rose-400'} font-bold">${s.pct > 0 ? '+' : ''}${s.pct.toFixed(2)}%</span>
                     </div>
                 `).join('');
@@ -2571,7 +2577,7 @@
           ${activeStrip}
           <div class="pl-3">
             <div class="flex items-center gap-2">
-               <div class="text-sm font-bold text-white group-hover:text-cyan-400 transition-colors">${k}</div>
+               <div class="text-sm font-bold text-white group-hover:text-cyan-400 transition-colors">${escapeHtml(k)}</div>
                ${c.enabled ? '<span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">ACTIVE</span>' : '<span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-slate-700/30 text-slate-500 border border-white/5">PAUSED</span>'}
             </div>
             <div class="text-[10px] text-slate-400 mt-1 font-mono flex flex-wrap gap-x-3 gap-y-1">
@@ -2583,7 +2589,7 @@
               <span>Mode: <span class="text-slate-200">${c.tsl_stepwise ? 'STEP' : 'CONT'}</span></span>
               ${c.cost_sl_enabled ? `<span>Cost SL: <span class="text-emerald-300">1:${c.cost_sl_rr ?? 2}</span></span>` : ''}
               <span>Limit: <span class="text-yellow-200">${c.trade_limit_per_day}/day</span></span>
-              ${c.exit_alert_enabled ? `<span>Exit Alert: <span class="text-rose-300">${c.exit_alert_name_raw || c.exit_alert_name}</span></span>` : ''}
+              ${c.exit_alert_enabled ? `<span>Exit Alert: <span class="text-rose-300">${escapeHtml(c.exit_alert_name_raw || c.exit_alert_name)}</span></span>` : ''}
               ${c.pyramid_enabled ? `<span>Pyramid: <span class="text-fuchsia-300">${c.pyramid_step_pct ?? 0.8}% x ${c.pyramid_max_adds ?? 3}</span></span>` : ''}
               ${c.custom_partial_profit_enabled ? `<span>Partial: <span class="text-emerald-300">${c.custom_partial_tp1_pct ?? 50}%/${c.custom_partial_tp2_pct ?? 25}%/${c.custom_partial_tp3_pct ?? 25}%</span></span>` : ''}
               ${c.sector_filter_on ? `<span>Sector: <span class="text-fuchsia-300">Top ${c.top_n_sector}</span></span>` : ''}
@@ -3447,9 +3453,9 @@
           const msg = d.message || d.error;
           document.getElementById("bt_summary").innerHTML = "";
           document.getElementById("bt_params").classList.add("hidden");
-          document.getElementById("bt_body").innerHTML = `<tr><td colspan="8" class="px-3 py-6 text-center text-rose-300 italic">${msg}</td></tr>`;
+          document.getElementById("bt_body").innerHTML = `<tr><td colspan="8" class="px-3 py-6 text-center text-rose-300 italic">${escapeHtml(msg)}</td></tr>`;
           document.getElementById("bt_detail_count").textContent = "0 rows";
-          document.getElementById("bt_detail_body").innerHTML = `<tr><td colspan="11" class="px-3 py-6 text-center text-rose-300 italic">${msg}</td></tr>`;
+          document.getElementById("bt_detail_body").innerHTML = `<tr><td colspan="11" class="px-3 py-6 text-center text-rose-300 italic">${escapeHtml(msg)}</td></tr>`;
           throw new Error(d.error);
         }
         renderBacktest(d.result || {});
@@ -3556,7 +3562,7 @@
           };
 
           const isEntered = statusLabel === 'ENTERED';
-          const displayStatus = isEntered && sideLabel ? `ENTERED ${sideLabel}` : statusLabel;
+          const displayStatus = escapeHtml(isEntered && sideLabel ? `ENTERED ${sideLabel}` : statusLabel);
           const rowBg =
             statusLabel === 'EXITED'
               ? 'bg-emerald-500/[0.06]'
@@ -3627,17 +3633,17 @@
           return `
             <tr class="${rowBg} transition-all duration-300 border-b border-white/5 last:border-0 group">
               <td data-label="Alert" class="px-3 py-3">
-                <span class="text-xs font-bold text-blue-300 tracking-wide">${a.alert_name}</span>
+                <span class="text-xs font-bold text-blue-300 tracking-wide">${escapeHtml(a.alert_name)}</span>
               </td>
               <td data-label="Time" class="px-3 py-3 whitespace-nowrap text-xs ${timeClass} font-mono">${timeStr}</td>
               <td data-label="Symbol" class="px-3 py-3 whitespace-nowrap text-sm ${symbolClass}">
                 <div class="flex flex-col">
-                  <span>${symLabel}</span>
-                  ${sector ? `<span class="inline-flex items-center px-2 py-0.5 mt-1 rounded text-[9px] font-black uppercase tracking-widest bg-cyan-500/15 text-cyan-300 border border-cyan-500/25 w-fit">${sector}</span>` : ''}
+                  <span>${escapeHtml(symLabel)}</span>
+                  ${sector ? `<span class="inline-flex items-center px-2 py-0.5 mt-1 rounded text-[9px] font-black uppercase tracking-widest bg-cyan-500/15 text-cyan-300 border border-cyan-500/25 w-fit">${escapeHtml(sector)}</span>` : ''}
                 </div>
               </td>
-              <td data-label="LTP" class="px-3 py-3 whitespace-nowrap text-right font-mono font-bold text-5xl text-cyan-400" data-symbol="${sym}" data-field="ltp">
-                ${p && p.ltp ? Number(p.ltp).toFixed(2) : (r.ltp ? r.ltp.toFixed(2) : '--')}
+              <td data-label="LTP" class="px-3 py-3 whitespace-nowrap text-right font-mono font-bold text-5xl text-cyan-400" data-symbol="${escapeHtml(sym)}" data-field="ltp">
+                ${p && p.ltp ? Number(p.ltp).toFixed(2) : (r.ltp ? Number(r.ltp).toFixed(2) : '--')}
               </td>
               <td data-label="Type" class="px-3 py-3 text-center ${p ? 'text-slate-200' : 'text-slate-300'}">${prod || '--'}</td>
               <td data-label="Side" class="px-3 py-3 text-center">
@@ -3651,7 +3657,7 @@
               <td data-label="Target" class="px-3 py-3 text-right ${p ? 'text-emerald-400 font-bold' : 'text-slate-600'}">${tgt ?? '--'}</td>
               <td data-label="SL" class="px-3 py-3 text-right ${p ? 'text-rose-400 font-bold' : 'text-slate-600'}">${sl ?? '--'}</td>
               <td data-label="TSL" class="px-3 py-3 text-right ${p ? 'text-amber-400 font-bold' : 'text-slate-600'} atsl-${safeId(sym)}">${tslVal ?? '--'}</td>
-              <td data-label="P&L" class="px-3 py-3 text-right ${p ? pnlClass : 'text-slate-600'}" data-symbol="${sym}" data-field="pnl">${pnl ?? '--'}</td>
+              <td data-label="P&L" class="px-3 py-3 text-right ${p ? pnlClass : 'text-slate-600'}" data-symbol="${escapeHtml(sym)}" data-field="pnl">${pnl ?? '--'}</td>
               <td data-label="Status" class="px-3 py-3 text-center">
                 <div class="flex flex-col items-center gap-1">
                   <span class="px-2.5 py-1 rounded-full ${statusLabel === 'LIVE' ? 'text-[10px]' : 'text-[8px]'} font-black tracking-widest ${getStatusClass(statusLabel)}">
@@ -3659,11 +3665,11 @@
                   </span>
                   ${statusLabel === 'ENTERED' && sideLabel
               ? ``
-              : (statusReason ? `<div class="text-[9px] text-slate-500 mt-0.5 max-w-[140px] truncate mx-auto" title="${statusReason}">${statusReason}</div>` : '')}
+              : (statusReason ? `<div class="text-[9px] text-slate-500 mt-0.5 max-w-[140px] truncate mx-auto" title="${escapeHtml(statusReason)}">${escapeHtml(statusReason)}</div>` : '')}
                 </div>
               </td>
               <td data-label="Action" class="px-3 py-3 text-center">
-                ${canSquareOff ? `<button onclick="squareoff('${p.symbol}')" class="px-3 py-1 text-[10px] font-black uppercase tracking-widest bg-rose-500/10 text-rose-400 border border-rose-500/20 rounded-lg hover:bg-rose-500/20 hover:text-white hover:border-rose-500/40 transition-all duration-300">SQ OFF</button>` : '<span class="text-slate-600">--</span>'}
+                ${canSquareOff ? `<button data-squareoff="${escapeHtml(p.symbol)}" onclick="squareoff(this.dataset.squareoff)" class="px-3 py-1 text-[10px] font-black uppercase tracking-widest bg-rose-500/10 text-rose-400 border border-rose-500/20 rounded-lg hover:bg-rose-500/20 hover:text-white hover:border-rose-500/40 transition-all duration-300">SQ OFF</button>` : '<span class="text-slate-600">--</span>'}
               </td>
             </tr>
           `;
@@ -3737,6 +3743,7 @@
       const activePos = pos.filter(p => ['PENDING_ENTRY', 'OPEN', 'EXITING', 'EXIT_CONDITIONS_MET', 'ERROR'].includes(p.status));
       activePos.sort((a, b) => a.symbol.localeCompare(b.symbol));
       POS_MAP = {};
+      Object.keys(POS_SNAPSHOT).forEach(symbol => delete POS_SNAPSHOT[symbol]);
       pos.forEach(p => {
         POS_MAP[p.symbol] = p;
         if (p && p.symbol) POS_SNAPSHOT[p.symbol] = { ...p };

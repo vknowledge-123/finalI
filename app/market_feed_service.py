@@ -44,13 +44,15 @@ def _real_ws_tick_seen(tick: Dict[str, Any], max_age_sec: float = 5.0) -> bool:
         return False
     try:
         ltp = float(tick.get("ltp") or tick.get("last_price") or 0.0)
-        age = float(tick.get("age_sec", 999999.0) or 999999.0)
+        age = float(tick.get("age_sec", 999999.0))
     except Exception:
         return False
     source = str(tick.get("source") or "").strip().upper()
-    if source == "REST_EXIT_FALLBACK":
-        return False
-    return ltp > 0 and age <= max(0.5, max_age_sec)
+    return source == "DHAN_WS" and ltp > 0 and 0 <= age <= max(0.5, max_age_sec)
+
+
+def _dhan_connected(main_app: Any, user_id: int) -> bool:
+    return bool(getattr(main_app, "DHAN_CONNECTED", False) and getattr(main_app, "DHAN_USER_ID", None) == user_id)
 
 
 async def _wait_for_fresh_ws_ticks(store: Any, user_id: int, symbols: List[str], timeout_sec: float) -> List[str]:
@@ -133,7 +135,7 @@ async def _confirm_dhan_alert_symbol_ticks(
         still_missing = await _wait_for_fresh_ws_ticks(store, user_id, restart_symbols, DHAN_SUBSCRIBE_TICK_CONFIRM_SEC)
         if still_missing:
             detail = "ws_tick_missing:" + ",".join(still_missing[:5])
-            await store.save_broker_feed_health(int(user_id), "DHAN", True, ttl_sec=15, detail=detail)
+            await store.save_broker_feed_health(int(user_id), "DHAN", _dhan_connected(main_app, user_id), ttl_sec=15, detail=detail)
             log.warning("MARKET_SUBSCRIBE_STILL_NO_TICK | user=%s symbols=%s", user_id, still_missing)
         else:
             log.info("MARKET_SUBSCRIBE_TICK_OK_AFTER_RESTART | user=%s symbols=%s", user_id, restart_symbols)
@@ -141,7 +143,7 @@ async def _confirm_dhan_alert_symbol_ticks(
 
     if not DHAN_SUBSCRIBE_RESTART_ON_NO_TICK:
         detail = "ws_tick_pending:" + ",".join(missing[:5])
-        await store.save_broker_feed_health(int(user_id), "DHAN", True, ttl_sec=15, detail=detail)
+        await store.save_broker_feed_health(int(user_id), "DHAN", _dhan_connected(main_app, user_id), ttl_sec=15, detail=detail)
         log.warning("MARKET_SUBSCRIBE_NO_TICK_WAITING | user=%s symbols=%s detail=event_based_feed_rest_fallback_active", user_id, missing)
         return
 
@@ -175,7 +177,7 @@ async def _confirm_dhan_alert_symbol_ticks(
     still_missing = await _wait_for_fresh_ws_ticks(store, user_id, restart_symbols, DHAN_SUBSCRIBE_TICK_CONFIRM_SEC)
     if still_missing:
         detail = "ws_tick_missing:" + ",".join(still_missing[:5])
-        await store.save_broker_feed_health(int(user_id), "DHAN", True, ttl_sec=15, detail=detail)
+        await store.save_broker_feed_health(int(user_id), "DHAN", _dhan_connected(main_app, user_id), ttl_sec=15, detail=detail)
         log.warning("MARKET_SUBSCRIBE_STILL_NO_TICK | user=%s symbols=%s", user_id, still_missing)
     else:
         log.info("MARKET_SUBSCRIBE_TICK_OK_AFTER_RESTART | user=%s symbols=%s", user_id, restart_symbols)
@@ -235,21 +237,31 @@ async def _drain_subscription_requests(main_app: Any, store: Any, started_users:
             return
         try:
             job: Dict[str, Any] = json.loads(raw)
+            if not isinstance(job, dict) or not isinstance(job.get("symbols"), list):
+                raise ValueError("Invalid subscription job")
+            user_id = int(job.get("user_id") or 1)
+            if user_id <= 0:
+                raise ValueError("Invalid subscription user")
+            symbols = [norm_symbol(symbol) for symbol in job["symbols"] if isinstance(symbol, str) and symbol.strip()]
+            source = str(job.get("source") or "").strip()
         except Exception:
             log.warning("Bad market subscription job: %r", raw)
             continue
-        user_id = int(job.get("user_id") or 1)
-        symbols = [str(symbol) for symbol in (job.get("symbols") or []) if symbol]
-        source = str(job.get("source") or "").strip()
         if not symbols:
             continue
         try:
             await _ensure_user_feed_started(main_app, store, started_users, user_id)
-            await main_app.subscribe_symbols_for_user(user_id, symbols)
-            log.info("MARKET_SUBSCRIBED_ALERT_SYMBOLS | user=%s symbols=%s", user_id, symbols)
+            result = await main_app.subscribe_symbols_for_user(user_id, symbols)
+            if isinstance(result, dict) and not result.get("sent"):
+                log.warning("MARKET_SUBSCRIPTION_PENDING | user=%s symbols=%s result=%s", user_id, symbols, result)
+                await store.redis.rpush(MARKET_SUBSCRIPTION_QUEUE, raw)
+                return
+            log.info("MARKET_SUBSCRIPTION_SENT | user=%s symbols=%s", user_id, symbols)
             await _confirm_dhan_alert_symbol_ticks(main_app, store, started_users, user_id, symbols, source)
         except Exception:
             log.exception("Market subscription request failed | user=%s symbols=%s", user_id, symbols)
+            await store.redis.rpush(MARKET_SUBSCRIPTION_QUEUE, raw)
+            return
 
 
 async def _publish_feed_health(main_app: Any, store: Any, started_users: Set[int]) -> None:
@@ -287,6 +299,12 @@ async def _publish_feed_health(main_app: Any, store: Any, started_users: Set[int
             log.exception("Market feed health publish failed | user=%s", user_id)
 
 
+async def _health_loop(main_app: Any, store: Any, started_users: Set[int]) -> None:
+    while True:
+        await _publish_feed_health(main_app, store, started_users)
+        await asyncio.sleep(max(1.0, FEED_HEALTH_REFRESH_SEC))
+
+
 async def main() -> None:
     # Reuse existing feed wiring in app.main so Dhan/Kite websocket packet
     # handling remains exactly the same as the dashboard process.
@@ -297,11 +315,11 @@ async def main() -> None:
     main_app.store = store
     main_app.APP_LOOP = loop
     main_app.ws_mgr.set_loop(loop)
+    started_users: Set[int] = set()
+    health_task = asyncio.create_task(_health_loop(main_app, store, started_users), name="feed_health")
     try:
         log.info("Market feed service started")
-        started_users = set()
         last_user_refresh = 0.0
-        last_health_refresh = 0.0
         while True:
             now = time.time()
             if now - last_user_refresh >= max(5.0, REFRESH_SEC):
@@ -312,11 +330,10 @@ async def main() -> None:
                     except Exception:
                         log.exception("Market feed start failed | user=%s", user_id)
             await _drain_subscription_requests(main_app, store, started_users)
-            if now - last_health_refresh >= max(1.0, FEED_HEALTH_REFRESH_SEC):
-                last_health_refresh = now
-                await _publish_feed_health(main_app, store, started_users)
             await asyncio.sleep(1.0)
     finally:
+        health_task.cancel()
+        await asyncio.gather(health_task, return_exceptions=True)
         await main_app._stop_dhan_feed()
         await main_app._stop_kite_ticker()
         for engine in list(main_app.ENGINE.values()):

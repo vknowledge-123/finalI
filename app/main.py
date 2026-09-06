@@ -554,6 +554,7 @@ KT_USER_ID: Optional[int] = None
 KT_ACCESS_TOKEN: str = ""
 
 DHAN_FEED: Optional[DhanFeedService] = None
+DHAN_RESTART_LOCK = asyncio.Lock()
 DHAN_CONNECTED: bool = False
 DHAN_USER_ID: Optional[int] = None
 DHAN_ACCESS_TOKEN: str = ""
@@ -1293,7 +1294,7 @@ async def _ensure_token_map_ready(user_id: int) -> None:
 # -----------------------------
 # Subscriptions
 # -----------------------------
-async def subscribe_symbols_for_user(user_id: int, symbols: List[str]) -> None:
+async def subscribe_symbols_for_user(user_id: int, symbols: List[str]) -> Optional[Dict[str, Any]]:
     """
     Adds tokens to SUB_TOKENS and subscribes if KiteTicker is running.
 
@@ -1324,7 +1325,7 @@ async def subscribe_symbols_for_user(user_id: int, symbols: List[str]) -> None:
         PENDING_SYMBOLS.setdefault(user_id, set()).update(norm_syms)
         asyncio.create_task(_ensure_token_map_ready(user_id))
         # Do not block webhook here.
-        return
+        return {"sent": False, "pending": norm_syms}
 
     changed = False
     missing_syms: List[str] = []
@@ -1377,9 +1378,10 @@ async def subscribe_symbols_for_user(user_id: int, symbols: List[str]) -> None:
     if broker == "DHAN":
         if resolved_dhan:
             log.info("DHAN_SUBSCRIBE_RESOLVED | user=%s instruments=%s", user_id, resolved_dhan[:50])
-        if changed and DHAN_FEED and DHAN_USER_ID == user_id:
-            await DHAN_FEED.subscribe([str(token) for token in SUB_TOKENS])
-        return
+        sent = False
+        if resolved_dhan and DHAN_FEED and DHAN_USER_ID == user_id:
+            sent = await DHAN_FEED.subscribe([str(token) for token in SUB_TOKENS])
+        return {"sent": bool(sent) and not missing_syms, "missing": missing_syms}
 
     # Update live ticker subscriptions if running
     if changed:
@@ -1452,10 +1454,10 @@ async def start_dhan_feed(user_id: int) -> None:
         DHAN_CONNECTED = connected
         _save_feed_health_nowait(user_id, "DHAN", connected, "websocket_state")
 
-    def on_tick(packet: Dict[str, Any]) -> None:
-        loop = APP_LOOP
-        if loop is None:
-            return
+    previous_closes: Dict[int, float] = {}
+    last_health_write = 0.0
+
+    async def on_tick(packet: Dict[str, Any]) -> None:
 
         def pick(*keys: str, default: Any = 0) -> Any:
             for key in keys:
@@ -1465,6 +1467,7 @@ async def start_dhan_feed(user_id: int) -> None:
             return default
 
         async def handle() -> None:
+            nonlocal last_health_write
             try:
                 security_id = int(pick("security_id", "securityId", "SecurityId", "SECURITY_ID", default=0) or 0)
                 symbol = TOKEN_TO_SYMBOL.get(security_id) or DHAN_INSTRUMENTS.symbol(security_id)
@@ -1472,13 +1475,21 @@ async def start_dhan_feed(user_id: int) -> None:
                     return
                 ltp = float(pick("LTP", "ltp", "last_price", "lastPrice", "last_traded_price", default=0.0) or 0.0)
                 close = float(pick("close", "Close", "prev_close", "previous_close", default=0.0) or 0.0)
+                if packet.get("type") == "Previous Close":
+                    if close > 0:
+                        previous_closes[security_id] = close
+                    return
+                # Full/Quote 'close' is the day's close, not yesterday's close.
+                close = previous_closes.get(security_id, 0.0)
                 high = float(pick("high", "High", "day_high", default=ltp) or ltp)
                 low = float(pick("low", "Low", "day_low", default=ltp) or ltp)
                 tbq = float(pick("total_buy_quantity", "totalBuyQuantity", default=0.0) or 0.0)
                 tsq = float(pick("total_sell_quantity", "totalSellQuantity", default=0.0) or 0.0)
                 if ltp <= 0:
                     return
-                await store.save_broker_feed_health(user_id, "DHAN", True, ttl_sec=15, detail="tick")
+                if API_OWNS_MARKET_FEED and time.monotonic() - last_health_write >= 2:
+                    last_health_write = time.monotonic()
+                    await store.save_broker_feed_health(user_id, "DHAN", DHAN_CONNECTED, ttl_sec=15, detail="tick")
                 await store.save_latest_tick(
                     user_id,
                     symbol,
@@ -1491,6 +1502,8 @@ async def start_dhan_feed(user_id: int) -> None:
                         "tbq": tbq,
                         "tsq": tsq,
                         "source": "DHAN_WS",
+                        "received_at": packet.get("received_at", time.time()),
+                        "depth": packet.get("depth", []),
                     },
                     ttl_sec=30,
                 )
@@ -1516,7 +1529,7 @@ async def start_dhan_feed(user_id: int) -> None:
             except Exception as exc:
                 print("[DHAN] tick handle error:", exc)
 
-        asyncio.run_coroutine_threadsafe(handle(), loop)
+        await handle()
 
     def on_order_update(message: Dict[str, Any]) -> None:
         loop = APP_LOOP
@@ -1558,11 +1571,12 @@ async def restart_selected_feed(user_id: int) -> None:
     eng = await ensure_engine(user_id)
     await eng.configure_broker()
     if broker == "DHAN":
-        await _stop_dhan_feed()
-        if not _dhan_symbol_token_map_ready():
-            await build_symbol_token_map_from_dhan(user_id)
-        await subscribe_dhan_sector_indices_for_user(user_id)
-        await start_dhan_feed(user_id)
+        async with DHAN_RESTART_LOCK:
+            await _stop_dhan_feed()
+            if not _dhan_symbol_token_map_ready():
+                await build_symbol_token_map_from_dhan(user_id)
+            await subscribe_dhan_sector_indices_for_user(user_id)
+            await start_dhan_feed(user_id)
     else:
         await _stop_kite_ticker()
         await start_kite_ticker(user_id)
@@ -1661,6 +1675,7 @@ async def start_kite_ticker(user_id: int) -> None:
                             sym,
                             {
                                 "broker": "ZERODHA",
+                                "source": "ZERODHA_WS",
                                 "ltp": ltp,
                                 "close": close,
                                 "high": high,

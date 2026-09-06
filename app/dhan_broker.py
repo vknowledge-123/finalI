@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Callable, Dict, Iterable, List, Optional
@@ -79,10 +81,10 @@ class DhanInstrumentRegistry:
     }
 
     async def ensure_loaded(self, force: bool = False) -> bool:
-        if self.symbol_to_security and not force:
+        if self.loaded_at is not None and self.symbol_to_security and not force:
             return True
         async with self._lock:
-            if self.symbol_to_security and not force:
+            if self.loaded_at is not None and self.symbol_to_security and not force:
                 return True
             try:
                 frame = await self._load_master_frame(force=force)
@@ -139,6 +141,8 @@ class DhanInstrumentRegistry:
         normalized = norm_symbol(symbol)
         if normalized in self.INDEX_SECURITY_IDS:
             return self.INDEX_SECURITY_IDS.get(normalized)
+        if normalized in self.symbol_to_security:
+            return self.symbol_to_security[normalized]
         await self.ensure_loaded()
         return self.symbol_to_security.get(normalized)
 
@@ -251,7 +255,7 @@ class DhanInstrumentRegistry:
             return
         self.symbol_to_security[normalized] = security_id
         self.security_to_symbol[security_id] = normalized
-        self.security_to_feed_segment[security_id] = feed_segment or MarketFeed.NSE
+        self.security_to_feed_segment[security_id] = MarketFeed.NSE if feed_segment is None else feed_segment
         if tick_size is not None:
             self.security_to_tick_size[security_id] = self._normalise_tick_size(tick_size)
 
@@ -373,14 +377,15 @@ def order_id_from_response(response: Any) -> str:
 
 
 def normalize_dhan_positions(response: Any) -> Dict[str, Any]:
+    ensure_no_broker_error(response, "DHAN_POSITIONS_FAILED")
     rows = response_data(response)
     if not isinstance(rows, list):
-        rows = []
+        raise ValueError("DHAN_POSITIONS_INVALID_RESPONSE")
     normalized: List[Dict[str, Any]] = []
     for row in rows:
         if not isinstance(row, dict):
             continue
-        qty = int(float(row.get("netQty") or row.get("quantity") or 0))
+        qty = int(float(row["netQty"] if row.get("netQty") is not None else row.get("quantity") or 0))
         normalized.append(
             {
                 "tradingsymbol": norm_symbol(
@@ -409,6 +414,7 @@ def normalize_dhan_positions(response: Any) -> Dict[str, Any]:
 
 
 def normalize_dhan_holdings(response: Any) -> List[Dict[str, Any]]:
+    ensure_no_broker_error(response, "DHAN_HOLDINGS_FAILED")
     data = response_data(response)
     if isinstance(data, dict):
         for key in ("holdings", "data", "result"):
@@ -576,12 +582,66 @@ def resample_intraday_candles(candles: List[Dict[str, Any]], interval_minutes: i
     return sorted(buckets.values(), key=lambda item: item.get("date") or datetime.min)
 
 
+class _QueuedDhanMarketFeed(MarketFeed):
+    def run(self):
+        asyncio.set_event_loop(self.loop)
+        self._running = True
+        self._runner_task = self.loop.create_task(self._run_async())
+        try:
+            self.loop.run_until_complete(self._runner_task)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("DHAN_FEED_RECEIVER_STOPPED")
+        finally:
+            pending = asyncio.all_tasks(self.loop)
+            for task in pending:
+                task.cancel()
+            self.loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            self.loop.close()
+            asyncio.set_event_loop(None)
+
+    def close_connection(self):
+        self._running = False
+        if self.loop.is_closed() or not self.loop.is_running():
+            return
+
+        async def shutdown():
+            try:
+                await asyncio.wait_for(self.disconnect(), timeout=5)
+            finally:
+                # Also release a receiver waiting for delivery queue capacity.
+                runner = getattr(self, "_runner_task", None)
+                if runner:
+                    runner.cancel()
+
+        future = asyncio.run_coroutine_threadsafe(shutdown(), self.loop)
+        future.result(timeout=8)
+
+    async def subscribe_instruments(self):
+        if not hasattr(self, "_send_lock"):
+            self._send_lock = asyncio.Lock()
+        async with self._send_lock:
+            snapshot = list(self.instruments)
+            await super().subscribe_instruments()
+            self.last_sent_instruments = snapshot
+
+    async def get_instrument_data(self):
+        packet = await super().get_instrument_data()
+        if isinstance(packet, dict):
+            packet = dict(packet, received_at=time.time())
+            # Awaiting queue capacity keeps the SDK loop free to answer ping/pong.
+            future = asyncio.run_coroutine_threadsafe(self.deliver(packet), self.delivery_loop)
+            await asyncio.wrap_future(future)
+        return packet
+
+
 @dataclass
 class DhanFeedService:
     user_id: int
     client_id: str
     access_token: str
-    on_tick: Callable[[Dict[str, Any]], None]
+    on_tick: Callable[[Dict[str, Any]], Any]
     on_order_update: Callable[[Dict[str, Any]], None]
     on_state: Optional[Callable[[bool], None]] = None
 
@@ -592,9 +652,42 @@ class DhanFeedService:
         self.security_ids: set[str] = set()
         self.feed_thread: Any = None
         self.order_task: Optional[asyncio.Task[None]] = None
+        self.sent_security_ids: set[str] = set()
+        self._subscription_lock = asyncio.Lock()
+        self._tick_tasks: List[asyncio.Task] = []
+        self._tick_queues: List[asyncio.Queue] = []
+        self._stopping = False
+
+    async def _deliver_tick(self, packet: Dict[str, Any]) -> None:
+        if self._stopping:
+            return
+        key = str(packet.get("security_id") or packet.get("securityId") or "")
+        queue = self._tick_queues[hash(key) % len(self._tick_queues)]
+        await queue.put(packet)
+
+    async def _consume_ticks(self, queue: asyncio.Queue) -> None:
+        while True:
+            packet = await queue.get()
+            try:
+                result = self.on_tick(packet)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                log.exception("DHAN_TICK_HANDLER_FAILED | user=%s", self.user_id)
+            finally:
+                queue.task_done()
 
     async def start(self, security_ids: Iterable[str]) -> None:
         self.security_ids.update(str(item) for item in security_ids if item)
+        if len(self.security_ids) > 5000:
+            raise ValueError("DHAN_SUBSCRIPTION_LIMIT_EXCEEDED")
+        delivery_loop = asyncio.get_running_loop()
+        self._stopping = False
+        self._tick_queues = [asyncio.Queue(maxsize=256) for _ in range(4)]
+        self._tick_tasks = [
+            asyncio.create_task(self._consume_ticks(queue), name=f"dhan_ticks_{self.user_id}_{i}")
+            for i, queue in enumerate(self._tick_queues)
+        ]
         instruments = [
             (DHAN_INSTRUMENTS.feed_segment(security_id), security_id, MarketFeed.Full)
             for security_id in sorted(self.security_ids)
@@ -607,27 +700,32 @@ class DhanFeedService:
         )
 
         def connected(_feed: MarketFeed) -> None:
+            sent = {str(item[1]) for item in _feed.last_sent_instruments}
+            delivery_loop.call_soon_threadsafe(self.sent_security_ids.update, sent)
             if self.on_state:
                 self.on_state(True)
 
         def closed(_feed: MarketFeed) -> None:
+            delivery_loop.call_soon_threadsafe(self.sent_security_ids.clear)
             if self.on_state:
                 self.on_state(False)
 
         def errored(_feed: MarketFeed, exc: Exception) -> None:
+            delivery_loop.call_soon_threadsafe(self.sent_security_ids.clear)
             if self.on_state:
                 self.on_state(False)
             log.warning("Dhan market feed error: %s", exc)
 
-        self.feed = MarketFeed(
+        self.feed = _QueuedDhanMarketFeed(
             self.context,
             instruments,
             "v2",
             on_connect=connected,
-            on_message=lambda _feed, packet: self.on_tick(packet or {}),
             on_close=closed,
             on_error=errored,
         )
+        self.feed.deliver = self._deliver_tick
+        self.feed.delivery_loop = delivery_loop
         self.feed_thread = self.feed.start()
 
         self.order_update = OrderUpdate(self.context)
@@ -647,25 +745,45 @@ class DhanFeedService:
                 log.warning("Dhan order update feed error: %s", exc)
             await asyncio.sleep(5)
 
-    async def subscribe(self, security_ids: Iterable[str]) -> None:
-        new_ids = {str(item) for item in security_ids if item} - self.security_ids
-        if not new_ids:
-            return
-        self.security_ids.update(new_ids)
-        if self.feed:
-            instruments = [
-                (DHAN_INSTRUMENTS.feed_segment(security_id), security_id, MarketFeed.Full)
-                for security_id in sorted(new_ids)
-            ]
-            log.info(
-                "DHAN_FEED_SUBSCRIBE | user=%s instruments=%s sample=%s",
-                self.user_id,
-                len(instruments),
-                instruments[:20],
-            )
-            self.feed.subscribe_symbols(instruments)
+    async def subscribe(self, security_ids: Iterable[str]) -> bool:
+        async with self._subscription_lock:
+            desired = self.security_ids | {str(item) for item in security_ids if item}
+            if len(desired) > 5000:
+                raise ValueError("DHAN_SUBSCRIPTION_LIMIT_EXCEEDED")
+            self.security_ids = desired
+            new_ids = desired - self.sent_security_ids
+            if not new_ids:
+                return True
+            feed = self.feed
+            if feed is None or not feed.loop.is_running():
+                return False
+
+            async def send() -> bool:
+                # Mutate SDK subscription state only on its owning loop. The full
+                # desired list is retained for reconnect even when this send fails.
+                feed.instruments = [
+                    (DHAN_INSTRUMENTS.feed_segment(sid), sid, MarketFeed.Full)
+                    for sid in sorted(desired)
+                ]
+                if not feed.ws or feed._is_ws_closed():
+                    return False
+                await feed.subscribe_instruments()
+                return True
+
+            future = asyncio.run_coroutine_threadsafe(send(), feed.loop)
+            try:
+                sent = await asyncio.wait_for(asyncio.wrap_future(future), timeout=10)
+            except Exception:
+                self.sent_security_ids.difference_update(new_ids)
+                log.exception("DHAN_FEED_SUBSCRIBE_FAILED | user=%s", self.user_id)
+                raise
+            if sent:
+                self.sent_security_ids.update(desired)
+                log.info("DHAN_FEED_SUBSCRIBE_SENT | user=%s count=%s", self.user_id, len(desired))
+            return sent
 
     async def stop(self) -> None:
+        self._stopping = True
         feed = self.feed
         feed_thread = self.feed_thread
         self.feed = None
@@ -673,7 +791,7 @@ class DhanFeedService:
 
         if feed:
             try:
-                await asyncio.to_thread(feed.close_connection)
+                await asyncio.wait_for(asyncio.to_thread(feed.close_connection), timeout=10)
             except Exception as exc:
                 log.debug("Dhan market feed close failed: %s", exc)
 
@@ -698,5 +816,9 @@ class DhanFeedService:
                 pass
         self.order_task = None
         self.order_update = None
+        for task in getattr(self, "_tick_tasks", []):
+            task.cancel()
+        await asyncio.gather(*getattr(self, "_tick_tasks", []), return_exceptions=True)
+        self._tick_tasks = []
         if self.on_state:
             self.on_state(False)

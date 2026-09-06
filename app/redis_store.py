@@ -4,10 +4,12 @@ from __future__ import annotations
 import json
 import re
 import time
+import uuid
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import redis.asyncio as redis
+from .order_locks import OrderLockLeases
 
 if TYPE_CHECKING:
     from app.crypto import EncryptionManager
@@ -207,7 +209,7 @@ LUA_LOCK = r"""
 -- KEYS[1] = lock_key
 -- KEYS[2] = kill_key
 -- ARGV[1] = ttl_ms
--- ARGV[2] = now_ms
+-- ARGV[2] = unique owner token
 -- ARGV[3] = action (e.g. "entry", "exit")
 local action = tostring(ARGV[3] or "")
 if action ~= "exit" and redis.call('EXISTS', KEYS[2]) == 1 then
@@ -260,12 +262,14 @@ class RedisStore:
     """
 
     def __init__(self, redis_url: str, encryption_manager: Optional['EncryptionManager'] = None) -> None:
+        self._lock_leases = OrderLockLeases()
         self.redis = redis.from_url(redis_url, decode_responses=True)
         self._sha_lock: Optional[str] = None
         self._sha_limit: Optional[str] = None
         self.encryption = encryption_manager
 
     async def close(self) -> None:
+        await self._lock_leases.close()
         try:
             await self.redis.close()
         except Exception:
@@ -294,24 +298,38 @@ class RedisStore:
           -2 kill switch active
         """
         await self.init_scripts()
-        now_ms = int(time.time() * 1000)
-        return int(
+        token = uuid.uuid4().hex
+        key = k_lock(user_id, symbol, action)
+        result = int(
             await self.redis.evalsha(
                 self._sha_lock,  # type: ignore[arg-type]
                 2,
                 k_lock(user_id, symbol, action),
                 k_kill(user_id),
                 str(int(ttl_ms)),
-                str(int(now_ms)),
+                token,
                 str((action or "").strip().lower()),
             )
         )
+        if result == 1:
+            self._lock_leases.track(key, token, ttl_ms, self._renew_order_lock, self._release_order_lock,
+                                    lambda: self.set_kill(user_id, True))
+        return result
+
+    async def _renew_order_lock(self, key: str, token: str, ttl_ms: int) -> bool:
+        return bool(await self.redis.eval(
+            "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('PEXPIRE', KEYS[1], ARGV[2]) end return 0",
+            1, key, token, ttl_ms,
+        ))
+
+    async def _release_order_lock(self, key: str, token: str) -> None:
+        await self.redis.eval(
+            "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end return 0",
+            1, key, token,
+        )
 
     async def release_lock(self, user_id: int, symbol: str, action: str) -> None:
-        try:
-            await self.redis.delete(k_lock(user_id, symbol, action))
-        except Exception:
-            pass
+        await self._lock_leases.release(k_lock(user_id, symbol, action))
 
     async def allow_trade(self, user_id: int, alert_name: str, limit: int) -> bool:
         """
@@ -457,7 +475,7 @@ class RedisStore:
         data = dict(payload or {})
         data["user_id"] = int(user_id)
         data["symbol"] = sym
-        data["ts"] = time.time()
+        data["ts"] = min(time.time(), float(data.pop("received_at", time.time())))
         await self.redis.setex(
             k_latest_tick(user_id, sym),
             max(1, int(ttl_sec)),

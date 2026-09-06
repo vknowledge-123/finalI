@@ -909,7 +909,7 @@ class OrderExecution:
     qty: int
     status: str
     avg_price: float = 0.0
-    filled_qty: int = 0
+    filled_qty: Optional[int] = None
     remaining_qty: int = 0
     attempts: int = 1
     ltp: float = 0.0
@@ -1007,7 +1007,7 @@ class TradeEngine:
         self.broker: str = "ZERODHA"
         self.dhan_client_id: str = ""
         self.dhan_access_token: str = ""
-        self.dhan: Optional[dhanhq] = None
+        self.dhan: Optional[Any] = None
 
         self.ticks: Dict[str, Dict[str, float]] = {}
         self.positions: Dict[str, Position] = {}
@@ -1709,7 +1709,7 @@ class TradeEngine:
             "raw": rows,
         }
 
-    async def _fetch_broker_symbol_qty(self, symbol: str) -> Optional[int]:
+    async def _fetch_broker_symbol_qty(self, symbol: str, product: Optional[str] = None) -> Optional[int]:
         symbol = norm_symbol(symbol)
         if not symbol:
             return None
@@ -1718,11 +1718,15 @@ class TradeEngine:
         except Exception as e:
             log.debug("POSITION_QTY_FETCH_FAIL | user=%s symbol=%s err=%s", self.user_id, symbol, e)
             return None
-        rows = list(data.get("net") or []) + list(data.get("day") or [])
+        rows = data.get("net") if "net" in data else data.get("day")
+        if not isinstance(rows, list):
+            return None
         total = 0
         found = False
         for row in rows:
             if norm_symbol(str(row.get("tradingsymbol") or "")) != symbol:
+                continue
+            if product and str(row.get("product") or "").upper() != product.upper():
                 continue
             try:
                 total += int(float(row.get("quantity") or 0))
@@ -1746,14 +1750,20 @@ class TradeEngine:
 
         order_book = await self._fetch_dhan_order_list_snapshot(order_id)
         if order_book:
+            terminal = snapshot.get("status") if snapshot.get("status") in {"COMPLETE", "CANCELLED", "REJECTED"} else None
             snapshot = {**snapshot, **{k: v for k, v in order_book.items() if v not in (None, "", 0)}}
+            if terminal:
+                snapshot["status"] = terminal
 
         trade_book = await self._fetch_dhan_trade_snapshot(order_id)
         if trade_book:
             trade_filled = int(trade_book.get("filled_quantity") or 0)
             snap_filled = int(snapshot.get("filled_quantity") or 0)
             if trade_filled > snap_filled:
+                terminal = snapshot.get("status") if snapshot.get("status") in {"COMPLETE", "CANCELLED", "REJECTED"} else None
                 snapshot.update(trade_book)
+                if terminal:
+                    snapshot["status"] = terminal
 
         after_qty = await self._fetch_broker_symbol_qty(symbol)
         if before_qty is not None and after_qty is not None:
@@ -1782,7 +1792,8 @@ class TradeEngine:
                 fn = getattr(self.dhan, "cancel_order", None)
                 if not callable(fn):
                     return False
-                await self.order_worker.submit(fn, order_id)
+                response = await self.order_worker.submit(fn, order_id)
+                ensure_no_broker_error(response, "ORDER_CANCEL_FAILED")
                 return True
             ok = await self._ensure_kite_ready()
             if ok and self.kite:
@@ -1882,6 +1893,22 @@ class TradeEngine:
             )
             last_snapshot = snapshot
             status = str(snapshot.get("status") or "").upper()
+            cancel_requested = status not in {"COMPLETE", "REJECTED", "CANCELLED"}
+            if cancel_requested:
+                await self._cancel_order_if_pending(order_id)
+                # Cancellation acknowledgement is not final execution evidence.
+                # Re-read after cancellation to include fills racing with cancel.
+                final = await self._wait_for_order_execution(order_id, timeout_sec)
+                final, after_qty = await self._reconcile_dhan_execution_snapshot(
+                    order_id, exec_symbol, exec_side, attempt_qty, before_qty, final
+                )
+                final_status = str(final.get("status") or "").upper()
+                if final_status not in {"COMPLETE", "REJECTED", "CANCELLED"}:
+                    await self.store.set_kill(self.user_id, True)
+                    raise RuntimeError(f"ORDER_CANCEL_UNCONFIRMED:{order_id}")
+                snapshot = final
+                last_snapshot = snapshot
+                status = final_status
             filled_qty = int(snapshot.get("filled_quantity") or 0)
             filled_qty = min(max(0, filled_qty), attempt_qty)
             remaining_qty = int(snapshot.get("remaining_quantity") or max(0, attempt_qty - filled_qty))
@@ -1912,7 +1939,7 @@ class TradeEngine:
                 )
 
             if filled_qty > 0 and remaining_to_place > 0 and attempts > pending_retries:
-                if status in {"PENDING", "PARTIAL", "UNKNOWN", ""} or remaining_qty > 0:
+                if status not in {"COMPLETE", "REJECTED", "CANCELLED"}:
                     await self._cancel_order_if_pending(order_id)
                 return OrderExecution(
                     order_id=last_filled_order_id or order_id,
@@ -1929,6 +1956,8 @@ class TradeEngine:
 
             if status in {"REJECTED", "CANCELLED"}:
                 reason = _order_rejection_reason(snapshot)
+                if status == "CANCELLED" and cancel_requested and attempts <= pending_retries:
+                    continue
                 if (
                     status == "REJECTED"
                     and attempts <= pending_retries
@@ -2789,7 +2818,7 @@ class TradeEngine:
                 execution_symbol = execution.symbol or sym
                 execution_side = execution.side
                 execution_ltp = float(execution.avg_price or execution.ltp or ltp or 0.0)
-                executed_qty = int(execution.filled_qty or execution.qty or 0)
+                executed_qty = int(execution.filled_qty if execution.filled_qty is not None else execution.qty)
                 if executed_qty <= 0:
                     results.append({"symbol": sym, "status": "ERROR", "reason": "ORDER_ZERO_FILL"})
                     continue
@@ -3093,7 +3122,7 @@ class TradeEngine:
                 },
             )
             oid = execution.order_id
-            actual_exit_qty = min(exit_qty, max(0, int(execution.filled_qty or execution.qty or 0)))
+            actual_exit_qty = min(exit_qty, max(0, int(execution.filled_qty if execution.filled_qty is not None else execution.qty)))
             if actual_exit_qty <= 0:
                 raise RuntimeError(f"{target}_PARTIAL_ZERO_FILL:{oid}")
             target_fully_booked = actual_exit_qty >= exit_qty
@@ -3230,7 +3259,7 @@ class TradeEngine:
                 },
             )
             fill_price = float(execution.avg_price or execution.ltp or ltp)
-            actual_add_qty = max(0, int(execution.filled_qty or execution.qty or 0))
+            actual_add_qty = max(0, int(execution.filled_qty if execution.filled_qty is not None else execution.qty))
             if actual_add_qty <= 0:
                 raise RuntimeError(f"PYRAMID_ZERO_FILL:{execution.order_id}")
             old_qty = max(0, int(pos.qty))
@@ -4122,7 +4151,7 @@ class TradeEngine:
                         },
                     )
                     oid = execution.order_id
-                    filled_exit_qty = min(requested_exit_qty, max(0, int(execution.filled_qty or execution.qty or 0)))
+                    filled_exit_qty = min(requested_exit_qty, max(0, int(execution.filled_qty if execution.filled_qty is not None else execution.qty)))
                     if filled_exit_qty <= 0:
                         raise RuntimeError(f"EXIT_ZERO_FILL:{oid}")
                     pos.exit_order_id = str(oid)

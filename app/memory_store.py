@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from .models import OTP, Session, User, utc_now
 from .redis_store import norm_alert_name, norm_symbol
+from .order_locks import OrderLockLeases
 
 
 class InMemoryStore:
@@ -19,6 +21,8 @@ class InMemoryStore:
     """
 
     def __init__(self) -> None:
+        self._lock_leases = OrderLockLeases()
+        self._lock_tokens = {}
         self._credentials: Dict[int, Dict[str, str]] = {}
         self._access_tokens: Dict[int, str] = {}
         self._brokers: Dict[int, str] = {}
@@ -57,7 +61,7 @@ class InMemoryStore:
     # Compatibility / lifecycle
     # -------------------------
     async def close(self) -> None:
-        return
+        await self._lock_leases.close()
 
     async def ping(self) -> bool:
         return True
@@ -273,7 +277,7 @@ class InMemoryStore:
         data = dict(payload or {})
         data["user_id"] = int(user_id)
         data["symbol"] = sym
-        data["ts"] = time.time()
+        data["ts"] = min(time.time(), float(data.pop("received_at", time.time())))
         data["expires_at"] = time.time() + max(1, int(ttl_sec))
         self._latest_ticks[self._tick_key(user_id, sym)] = dict(data)
         return data
@@ -437,10 +441,25 @@ class InMemoryStore:
         if self._locks.get(key, 0.0) > now:
             return 0
         self._locks[key] = now + max(1, int(ttl_ms)) / 1000.0
+        token = uuid.uuid4().hex
+        self._lock_tokens[key] = token
+        self._lock_leases.track(key, token, ttl_ms, self._renew_order_lock, self._release_order_lock,
+                                lambda: self.set_kill(user_id, True))
         return 1
 
+    async def _renew_order_lock(self, key, token, ttl_ms):
+        if self._lock_tokens.get(key) != token or self._locks.get(key, 0) <= time.time():
+            return False
+        self._locks[key] = time.time() + ttl_ms / 1000
+        return True
+
+    async def _release_order_lock(self, key, token):
+        if self._lock_tokens.get(key) == token:
+            self._locks.pop(key, None)
+            self._lock_tokens.pop(key, None)
+
     async def release_lock(self, user_id: int, symbol: str, action: str) -> None:
-        self._locks.pop(self._guard_key(user_id, symbol, action), None)
+        await self._lock_leases.release(self._guard_key(user_id, symbol, action))
 
     async def allow_trade(self, user_id: int, alert_name: str, limit: int) -> bool:
         if int(limit) <= 0:
