@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse
 from .chartink_client import normalize_alert_name, normalize_symbol, normalize_symbols, parse_chartink_payload
 from .service_bootstrap import configure_logging, init_store
 from .service_queues import ALERT_QUEUE, MARKET_SUBSCRIPTION_QUEUE
+from .redis_store import now_ist
 
 configure_logging("alert_service")
 log = logging.getLogger("alert_service")
@@ -159,6 +160,7 @@ async def chartink_webhook(request: Request, user_id: int = 1) -> Dict[str, Any]
     started = time.perf_counter()
     payload = await _read_payload(request)
     alert_name_raw, symbols_raw, ts = parse_chartink_payload(payload)
+    ts = str(ts or now_ist().isoformat())
     alert_name = normalize_alert_name(alert_name_raw)
     symbols = []
     seen = set()
@@ -173,6 +175,7 @@ async def chartink_webhook(request: Request, user_id: int = 1) -> Dict[str, Any]
         initial_result = [{"symbol": "", "status": "ERROR", "reason": "NO_SYMBOLS_PARSED"}]
 
     job = {
+        "job_id": uuid.uuid4().hex,
         "user_id": int(user_id),
         "alert_name": alert_name,
         "symbols": symbols,

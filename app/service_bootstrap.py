@@ -9,6 +9,7 @@ from typing import Dict, List
 
 from .redis_store import RedisStore
 from .trade_engine import TradeEngine
+from .log_safety import install_access_log_filter
 
 try:
     from .crypto import init_encryption
@@ -21,6 +22,7 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
 
 
 def configure_logging(service_name: str) -> None:
+    install_access_log_filter()
     logging.basicConfig(
         level=logging.INFO,
         format=f"%(asctime)s [%(levelname)s] {service_name} | %(name)s | %(message)s",

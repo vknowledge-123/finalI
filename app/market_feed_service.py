@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import time
 from typing import Any, Dict, List, Set, Tuple
@@ -10,7 +11,6 @@ from typing import Any, Dict, List, Set, Tuple
 from .redis_store import norm_symbol
 from .service_bootstrap import configure_logging, init_store, load_user_ids
 from .service_queues import MARKET_SUBSCRIPTION_QUEUE
-from .stock_sector import STOCK_INDEX_MAPPING
 from .dhan_feed_policy import equity_session_open
 
 configure_logging("market_feed_service")
@@ -226,10 +226,14 @@ async def _ensure_user_feed_started(main_app: Any, store: Any, started_users: Se
     started_users.discard(user_id)
     engine = await main_app.ensure_engine(user_id)
     await engine.configure_broker()
-    await main_app.subscribe_symbols_for_user(user_id, list(STOCK_INDEX_MAPPING.keys()))
     if broker == "DHAN":
         await main_app.subscribe_dhan_sector_indices_for_user(user_id)
     await main_app.restart_selected_feed(user_id)
+    positions = await store.list_positions(user_id)
+    active = [row["symbol"] for row in positions if row.get("symbol")
+              and row.get("status") in {"OPEN", "EXITING", "EXIT_CONDITIONS_MET"}]
+    if active:
+        await main_app.subscribe_symbols_for_user(user_id, active)
     if not await _feed_started_with_current_credentials(main_app, store, user_id, broker):
         await store.save_broker_feed_health(
             user_id,
@@ -245,7 +249,9 @@ async def _ensure_user_feed_started(main_app: Any, store: Any, started_users: Se
 
 
 async def _drain_subscription_requests(main_app: Any, store: Any, started_users: Set[int]) -> None:
-    for _ in range(max(1, SUBSCRIPTION_DRAIN_LIMIT)):
+    # Each queued request is visited at most once per drain, including delayed jobs.
+    count = min(max(1, SUBSCRIPTION_DRAIN_LIMIT), await store.redis.llen(MARKET_SUBSCRIPTION_QUEUE))
+    for _ in range(count):
         raw = await store.redis.lpop(MARKET_SUBSCRIPTION_QUEUE)
         if not raw:
             return
@@ -258,24 +264,44 @@ async def _drain_subscription_requests(main_app: Any, store: Any, started_users:
                 raise ValueError("Invalid subscription user")
             symbols = [norm_symbol(symbol) for symbol in job["symbols"] if isinstance(symbol, str) and symbol.strip()]
             source = str(job.get("source") or "").strip()
+            not_before = float(job.get("not_before") or 0)
+            retry_count = int(job.get("retry_count") or 0)
+            if not math.isfinite(not_before) or not 0 <= retry_count <= 5:
+                raise ValueError("Invalid subscription retry")
         except Exception:
-            log.warning("Bad market subscription job: %r", raw)
+            log.warning("INVALID_MARKET_SUBSCRIPTION_JOB")
             continue
         if not symbols:
+            continue
+        if not_before > time.time():
+            await store.redis.rpush(MARKET_SUBSCRIPTION_QUEUE, raw)
             continue
         try:
             await _ensure_user_feed_started(main_app, store, started_users, user_id)
             result = await main_app.subscribe_symbols_for_user(user_id, symbols)
-            if isinstance(result, dict) and not result.get("sent"):
-                log.warning("MARKET_SUBSCRIPTION_PENDING | user=%s symbols=%s result=%s", user_id, symbols, result)
-                await store.redis.rpush(MARKET_SUBSCRIPTION_QUEUE, raw)
-                return
-            log.info("MARKET_SUBSCRIPTION_SENT | user=%s symbols=%s", user_id, symbols)
-            await _confirm_dhan_alert_symbol_ticks(main_app, store, started_users, user_id, symbols, source)
+            missing = result.get("missing", []) if isinstance(result, dict) else []
+            sent = not isinstance(result, dict) or result.get("sent")
+            if missing or not sent:
+                retries = retry_count + 1
+                retry_symbols = missing if sent else symbols
+                if retries <= 5:
+                    job.update(symbols=retry_symbols, retry_count=retries,
+                               not_before=time.time() + min(300, 10 * 2 ** (retries - 1)))
+                    await store.redis.rpush(MARKET_SUBSCRIPTION_QUEUE, json.dumps(job))
+                log.warning("MARKET_SUBSCRIPTION_%s | user=%s count=%s sample=%s attempt=%s",
+                            "DEFERRED" if retries <= 5 else "UNRESOLVED", user_id,
+                            len(retry_symbols), retry_symbols[:5], retries)
+            if sent:
+                resolved = [s for s in symbols if s not in missing]
+                if resolved:
+                    log.info("MARKET_SUBSCRIPTION_SENT | user=%s count=%s sample=%s", user_id, len(resolved), resolved[:5])
+                    await _confirm_dhan_alert_symbol_ticks(main_app, store, started_users, user_id, resolved, source)
         except Exception:
-            log.exception("Market subscription request failed | user=%s symbols=%s", user_id, symbols)
-            await store.redis.rpush(MARKET_SUBSCRIPTION_QUEUE, raw)
-            return
+            log.exception("Market subscription request failed | user=%s count=%s", user_id, len(symbols))
+            retries = retry_count + 1
+            if retries <= 5:
+                job.update(retry_count=retries, not_before=time.time() + min(300, 10 * 2 ** (retries - 1)))
+                await store.redis.rpush(MARKET_SUBSCRIPTION_QUEUE, json.dumps(job))
 
 
 async def _publish_feed_health(main_app: Any, store: Any, started_users: Set[int]) -> None:

@@ -1,9 +1,72 @@
 # Integration Test Report
 
-Date: 2026-09-06
+Date: 2026-09-10
 
-Final result: **179 tests passed**, 9 deprecation warnings, in 19.47 seconds.
+Final result: **197 tests passed**, 9 deprecation warnings, in 65.86 seconds.
 Python compilation passed. No live orders were placed.
+
+## Execution And Subscription Reliability Follow-up
+
+- Dhan instruments are keyed by exchange segment AND security ID throughout
+  subscriptions, tick routing, previous-close storage and tick-size lookup.
+  Regression tests keep ADANIENT (NSE_EQ, 25) separate from NIFTY BANK (IDX_I, 25).
+  Ambiguous legacy ID-only lookups cannot silently choose the index.
+- Equity-master filtering/parsing runs off the event loop. A successful refresh
+  replaces obsolete equity mappings while preserving registered other segments.
+  Entry preparation loads the master before acquiring the order lock. Custom
+  strategy computation also runs off the event loop.
+- Entry lock-acquisition failures now reject entry instead of proceeding unlocked.
+  Active task-owned leases are checked again before broker order submission.
+- Each execution job has its own task. Lock-loss cancellation records an explicit
+  error and sets kill without cancelling the entire worker. Worker shutdown still
+  propagates cancellation and leaves the claimed job for recovery.
+- Execution uses atomic FIFO BLMOVE into a processing list and acknowledges only
+  after the result is saved. A single renewable worker lease protects recovery.
+  Interrupted jobs are NOT replayed: recovery sets kill and records
+  EXECUTION_INTERRUPTED_RECONCILE_REQUIRED. Review broker orders, trades and
+  positions before manually resuming. A request already sent cannot be retracted
+  by cancelling a Python task.
+- Jobs older than MAX_ALERT_AGE_SEC (default 60 seconds), or with an invalid queue
+  timestamp, are skipped as ALERT_EXPIRED_IN_QUEUE. Malformed jobs are quarantined.
+  Intake supplies a stable timestamp and job ID. Older lost BLPOP jobs from before
+  this update cannot be reconstructed automatically.
+- Subscription retries have bounded exponential delays and at most five requeues;
+  successfully sent symbols are not retried because a sibling is unresolved.
+  Dhan login/startup restores sector indices and active positions, not the entire
+  sector constituent universe. Alert stocks remain subscribed on demand.
+- Redis alert-history upserts use WATCH/MULTI transactions instead of deleting
+  and rebuilding a list from a potentially stale snapshot. Concurrent updates
+  retain other alert rows and preserve JSON array types.
+- Uvicorn access logs omit query strings, including webhook secrets and callback
+  tokens. This does not redact nginx or historical logs. Previously exposed
+  webhook secrets should be rotated and nginx logging reviewed separately.
+
+Verification includes webhook authentication -> normalized queue job -> execution
+-> same persisted dashboard row, queue recovery/expiry/quarantine, failed result
+persistence, Redis transaction concurrency, wrong-owner Lua lock operations,
+stock/index collisions, off-loop parsing and bounded subscription retries.
+Redis tests used fakeredis 2.38.0 with Lua support and the pinned redis-py 5.0.8.
+WSL could not start because virtualization is unavailable, so no real Redis server
+or Linux process-failure test was run here. Existing FastAPI/frontend Node DOM
+contract tests passed; these are not real-browser visual tests.
+
+Test dependencies are in requirements-test.txt (not needed on the production VM).
+Run in test mode with:
+
+```bash
+python -m pip install -r requirements-test.txt
+APP_TESTING=1 python -m pytest tests -q -W error::pytest.PytestUnhandledThreadExceptionWarning
+python -m compileall -q app tests
+```
+
+The queue command requires Redis 6.2 or later; see the official
+[BLMOVE documentation](https://redis.io/docs/latest/commands/blmove/).
+Segment-aware routing follows the header described in the
+[Dhan live market feed documentation](https://dhanhq.co/docs/v2/live-market-feed/).
+Redis persistence/backups remain necessary: retaining an in-flight list protects
+against a worker crash, not loss of the Redis database. These changes have not been
+pushed or deployed. This is a targeted reliability pass, not certification that
+every feature is bug-free or that orders execute instantly.
 
 ## Sunday Feed Recovery Follow-up
 

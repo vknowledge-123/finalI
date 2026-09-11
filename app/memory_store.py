@@ -379,7 +379,14 @@ class InMemoryStore:
         sym = norm_symbol(symbol)
         if not sym:
             return
+        previous = self._positions.get(uid, {}).get(sym, {})
+        if (previous.get("trade_id") and previous.get("trade_id") == position.get("trade_id")
+                and previous.get("status") == "CLOSED" and position.get("status") != "CLOSED"):
+            raise RuntimeError("STALE_POSITION_REOPEN_BLOCKED")
         self._positions.setdefault(uid, {})[sym] = dict(position)
+
+    async def get_position(self, user_id: int, symbol: str) -> Dict[str, Any]:
+        return dict(self._positions.get(int(user_id), {}).get(norm_symbol(symbol), {}))
 
     async def list_positions(self, user_id: int) -> List[Dict[str, Any]]:
         uid = int(user_id)

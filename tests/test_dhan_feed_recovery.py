@@ -183,12 +183,12 @@ class FeedRecoveryTests(unittest.IsolatedAsyncioTestCase):
              patch.object(main, "_stop_kite_ticker", AsyncMock()), \
              patch.object(main, "DHAN_FEED", old), patch.object(main, "DHAN_USER_ID", 1), \
              patch.object(main, "DHAN_ACCESS_TOKEN", old.access_token), patch.object(main, "DHAN_CONNECTED", False), \
-             patch.object(main, "SUB_TOKENS", {14}), patch.object(main, "_save_feed_health_nowait"), \
+             patch.object(main, "DHAN_SUBSCRIPTIONS", {(0, "14")}), patch.object(main, "_save_feed_health_nowait"), \
              patch.object(main, "DhanFeedService", return_value=replacement) as factory:
             self.assertFalse(await mfs._feed_started_with_current_credentials(main, store, 1, "DHAN"))
             await main.start_dhan_feed(1)
             old.stop.assert_awaited_once()
-            replacement.start.assert_awaited_once_with(["14"])
+            replacement.start.assert_awaited_once_with({(0, "14")})
             self.assertEqual(factory.call_args.kwargs["access_token"], "replacement-token")
             self.assertTrue(await mfs._feed_started_with_current_credentials(main, store, 1, "DHAN"))
         await store.close()

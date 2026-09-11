@@ -105,6 +105,7 @@ class MarketFeedServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_health_refresh_continues_during_slow_subscription_confirmation(self) -> None:
         store = _FakeStore()
         store.redis = type("Redis", (), {})()
+        store.redis.llen = AsyncMock(return_value=1)
         store.redis.lpop = AsyncMock(side_effect=[json.dumps({
             "user_id": 1, "symbols": ["SBIN"], "source": "chartink_alert",
         }), None])
@@ -138,13 +139,18 @@ class MarketFeedServiceTests(unittest.IsolatedAsyncioTestCase):
         store = _FakeStore()
         raw = json.dumps({"user_id": 1, "symbols": ["SBIN"]})
         store.redis = type("Redis", (), {})()
+        store.redis.llen = AsyncMock(return_value=1)
         store.redis.lpop = AsyncMock(return_value=raw)
         store.redis.rpush = AsyncMock()
         main_app = _FakeMain()
         main_app.subscribe_symbols_for_user = AsyncMock(side_effect=OSError("send failed"))
         with patch.object(mfs, "_ensure_user_feed_started", AsyncMock()):
             await mfs._drain_subscription_requests(main_app, store, {1})
-        store.redis.rpush.assert_awaited_once_with(mfs.MARKET_SUBSCRIPTION_QUEUE, raw)
+        store.redis.rpush.assert_awaited_once()
+        retry = json.loads(store.redis.rpush.await_args.args[1])
+        self.assertEqual(retry["symbols"], ["SBIN"])
+        self.assertEqual(retry["retry_count"], 1)
+        self.assertGreater(retry["not_before"], 0)
         store.redis.lpop.assert_awaited_once()
 
     async def test_dhan_alert_symbol_with_fresh_ws_tick_does_not_restart_feed(self) -> None:

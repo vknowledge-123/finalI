@@ -65,6 +65,9 @@ from .auth import AuthService
 from .middleware import AuthMiddleware, get_current_user, SecurityHeadersMiddleware
 from .custom_middleware import SelectiveHostMiddleware
 import logging
+from .log_safety import install_access_log_filter
+
+install_access_log_filter()
 
 # Windows services and scheduled tasks often inherit a legacy console
 # encoding. Console output must never break request processing.
@@ -563,6 +566,7 @@ APP_LOOP: Optional[asyncio.AbstractEventLoop] = None
 
 # Subscriptions + token map
 SUB_TOKENS: Set[int] = set()
+DHAN_SUBSCRIPTIONS: Set[tuple] = set()
 TOKEN_TO_SYMBOL: Dict[int, str] = {}
 SYMBOL_TOKEN: Dict[str, int] = {}
 
@@ -639,6 +643,13 @@ async def _runtime_subscribe_symbols(user_id: int, symbols: List[str]) -> None:
         await subscribe_symbols_for_user(int(user_id), symbols)
         return
     await _poke_market_feed_service(int(user_id), symbols, "api_signal_intake")
+
+
+async def _dhan_monitor_symbols(user_id: int) -> List[str]:
+    positions = await store.list_positions(user_id)
+    active = {_sym_safe(row["symbol"]) for row in positions if row.get("symbol")
+              and row.get("status") in {"OPEN", "EXITING", "EXIT_CONDITIONS_MET"}}
+    return sorted(active | set(SECTOR_INDEX_INSTRUMENTS))
 
 # Throttle instrument reload
 _LAST_INSTR_RELOAD = 0.0
@@ -764,17 +775,19 @@ async def _activate_dhan_token(
     SYMBOL_TOKEN.clear()
     TOKEN_TO_SYMBOL.clear()
     SUB_TOKENS.clear()
+    DHAN_SUBSCRIPTIONS.clear()
 
     eng = await ensure_engine(user_id)
     await eng.configure_broker()
-    await _poke_market_feed_service(user_id, list(STOCK_INDEX_MAPPING.keys()), "dhan_token_activated")
+    monitor_symbols = await _dhan_monitor_symbols(user_id)
+    await _poke_market_feed_service(user_id, monitor_symbols, "dhan_token_activated")
 
     warning = ""
     if API_OWNS_MARKET_FEED and not _is_test_mode():
         try:
             await _stop_kite_ticker()
             await build_symbol_token_map_from_dhan(user_id)
-            await subscribe_symbols_for_user(user_id, list(STOCK_INDEX_MAPPING.keys()))
+            await subscribe_symbols_for_user(user_id, monitor_symbols)
             await subscribe_dhan_sector_indices_for_user(user_id)
             await start_dhan_feed(user_id)
         except Exception:
@@ -1122,14 +1135,12 @@ async def build_symbol_token_map_from_dhan(user_id: int) -> bool:
         except ValueError:
             continue
         SYMBOL_TOKEN[symbol] = numeric_id
-        TOKEN_TO_SYMBOL[numeric_id] = symbol
     for sector, instrument in SECTOR_INDEX_INSTRUMENTS.items():
         try:
             numeric_id = int(instrument["security_id"])
         except (KeyError, ValueError):
             continue
         SYMBOL_TOKEN[sector] = numeric_id
-        TOKEN_TO_SYMBOL[numeric_id] = sector
         DHAN_INSTRUMENTS.register_instrument(sector, str(numeric_id), MarketFeed.IDX)
     print(f"[DHAN INSTR] Loaded {len(SYMBOL_TOKEN)} NSE symbols")
     return bool(SYMBOL_TOKEN)
@@ -1158,11 +1169,10 @@ async def subscribe_dhan_sector_indices_for_user(user_id: int) -> None:
         except (KeyError, ValueError):
             continue
         SYMBOL_TOKEN[sector] = token
-        TOKEN_TO_SYMBOL[token] = sector
         DHAN_INSTRUMENTS.register_instrument(sector, str(token), MarketFeed.IDX)
-        SUB_TOKENS.add(token)
+        DHAN_SUBSCRIPTIONS.add((MarketFeed.IDX, str(token)))
     if DHAN_FEED and DHAN_USER_ID == int(user_id):
-        await DHAN_FEED.subscribe([str(item["security_id"]) for item in SECTOR_INDEX_INSTRUMENTS.values()])
+        await DHAN_FEED.subscribe([(MarketFeed.IDX, str(item["security_id"])) for item in SECTOR_INDEX_INSTRUMENTS.values()])
 
 
 async def load_sector_cache_for_user(user_id: int) -> Dict[str, Any]:
@@ -1338,11 +1348,16 @@ async def subscribe_symbols_for_user(user_id: int, symbols: List[str]) -> Option
             if tok:
                 sym = alt
         if not tok:
-            print(f"[TOKEN MISSING] {sym}  (common cause: symbol format like SBIN-EQ)")
             missing_syms.append(sym)
             continue
 
-        if tok not in SUB_TOKENS:
+        if broker == "DHAN":
+            key = DHAN_INSTRUMENTS.instrument_key(sym)
+            if key is None:
+                missing_syms.append(sym)
+                continue
+            DHAN_SUBSCRIPTIONS.add(key)
+        elif tok not in SUB_TOKENS:
             SUB_TOKENS.add(tok)
             changed = True
         else:
@@ -1352,7 +1367,7 @@ async def subscribe_symbols_for_user(user_id: int, symbols: List[str]) -> Option
             {
                 "symbol": sym,
                 "security_id": str(tok),
-                "segment": str(DHAN_INSTRUMENTS.feed_segment(tok)),
+                "segment": str(key[0]) if broker == "DHAN" else "NSE",
                 "mode": str(MarketFeed.Full),
             }
         )
@@ -1363,7 +1378,6 @@ async def subscribe_symbols_for_user(user_id: int, symbols: List[str]) -> Option
              pass
     
     if missing_syms:
-        print(f"⚠️ [SUB_WARNING] Could not resolve tokens for: {missing_syms}. (Total Map: {len(SYMBOL_TOKEN)})")
         # Trigger reload if enough time has passed
         global _LAST_INSTR_RELOAD
         now = time.time()
@@ -1376,12 +1390,11 @@ async def subscribe_symbols_for_user(user_id: int, symbols: List[str]) -> Option
                 asyncio.create_task(build_symbol_token_map_from_kite(user_id))
 
     if broker == "DHAN":
-        if resolved_dhan:
-            log.info("DHAN_SUBSCRIBE_RESOLVED | user=%s instruments=%s", user_id, resolved_dhan[:50])
-        sent = False
+        sent = not resolved_dhan
         if resolved_dhan and DHAN_FEED and DHAN_USER_ID == user_id:
-            sent = await DHAN_FEED.subscribe([str(token) for token in SUB_TOKENS])
-        return {"sent": bool(sent) and not missing_syms, "missing": missing_syms}
+            sent = await DHAN_FEED.subscribe(DHAN_SUBSCRIPTIONS)
+        return {"sent": bool(sent), "missing": missing_syms,
+                "resolved": [item["symbol"] for item in resolved_dhan]}
 
     # Update live ticker subscriptions if running
     if changed:
@@ -1457,7 +1470,7 @@ async def start_dhan_feed(user_id: int) -> None:
                   or getattr(DHAN_FEED, "health_detail", "websocket_state"))
         _save_feed_health_nowait(user_id, "DHAN", connected, detail)
 
-    previous_closes: Dict[int, float] = {}
+    previous_closes: Dict[tuple, float] = {}
     last_health_write = 0.0
 
     async def on_tick(packet: Dict[str, Any]) -> None:
@@ -1473,17 +1486,21 @@ async def start_dhan_feed(user_id: int) -> None:
             nonlocal last_health_write
             try:
                 security_id = int(pick("security_id", "securityId", "SecurityId", "SECURITY_ID", default=0) or 0)
-                symbol = TOKEN_TO_SYMBOL.get(security_id) or DHAN_INSTRUMENTS.symbol(security_id)
+                segment = pick("exchange_segment", default=None)
+                if segment is None:
+                    return
+                key = (int(segment), str(security_id))
+                symbol = DHAN_INSTRUMENTS.symbol(security_id, int(segment))
                 if not symbol:
                     return
                 ltp = float(pick("LTP", "ltp", "last_price", "lastPrice", "last_traded_price", default=0.0) or 0.0)
                 close = float(pick("close", "Close", "prev_close", "previous_close", default=0.0) or 0.0)
                 if packet.get("type") == "Previous Close":
                     if close > 0:
-                        previous_closes[security_id] = close
+                        previous_closes[key] = close
                     return
                 # Full/Quote 'close' is the day's close, not yesterday's close.
-                close = previous_closes.get(security_id, 0.0)
+                close = previous_closes.get(key, 0.0)
                 high = float(pick("high", "High", "day_high", default=ltp) or ltp)
                 low = float(pick("low", "Low", "day_low", default=ltp) or ltp)
                 tbq = float(pick("total_buy_quantity", "totalBuyQuantity", default=0.0) or 0.0)
@@ -1565,7 +1582,7 @@ async def start_dhan_feed(user_id: int) -> None:
     )
     DHAN_USER_ID = user_id
     DHAN_ACCESS_TOKEN = access_token
-    await DHAN_FEED.start([str(token) for token in SUB_TOKENS])
+    await DHAN_FEED.start(DHAN_SUBSCRIPTIONS)
 
 
 async def restart_selected_feed(user_id: int) -> None:
@@ -1877,8 +1894,9 @@ async def startup():
                             else:
                                 await build_symbol_token_map_from_kite(uid)
 
-                    base_symbols = list(STOCK_INDEX_MAPPING.keys())
-                    await subscribe_symbols_for_user(uid, base_symbols)
+                    base_symbols = await _dhan_monitor_symbols(uid) if broker == "DHAN" else list(STOCK_INDEX_MAPPING.keys())
+                    if API_OWNS_MARKET_FEED:
+                        await subscribe_symbols_for_user(uid, base_symbols)
                     await _poke_market_feed_service(uid, base_symbols, "api_startup_rehydrate")
                     if API_OWNS_MARKET_FEED:
                         if broker == "DHAN":
@@ -2363,6 +2381,7 @@ async def save_broker_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         SYMBOL_TOKEN.clear()
         TOKEN_TO_SYMBOL.clear()
         SUB_TOKENS.clear()
+        DHAN_SUBSCRIPTIONS.clear()
         eng = await ensure_engine(user_id)
         await eng.configure_broker()
 
@@ -2370,12 +2389,13 @@ async def save_broker_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         saved_dhan_creds = await store.load_dhan_credentials(user_id) if broker == "DHAN" else {}
         has_dhan_access_token = bool(str(saved_dhan_creds.get("access_token") or "").strip())
         if broker == "DHAN" and has_dhan_access_token:
-            await _poke_market_feed_service(user_id, list(STOCK_INDEX_MAPPING.keys()), "dhan_broker_config_saved")
+            monitor_symbols = await _dhan_monitor_symbols(user_id)
+            await _poke_market_feed_service(user_id, monitor_symbols, "dhan_broker_config_saved")
         if broker == "DHAN" and has_dhan_access_token and API_OWNS_MARKET_FEED and not _is_test_mode():
             try:
                 await _stop_kite_ticker()
                 await build_symbol_token_map_from_dhan(user_id)
-                await subscribe_symbols_for_user(user_id, list(STOCK_INDEX_MAPPING.keys()))
+                await subscribe_symbols_for_user(user_id, monitor_symbols)
                 await subscribe_dhan_sector_indices_for_user(user_id)
                 await start_dhan_feed(user_id)
             except Exception as exc:
@@ -2622,6 +2642,7 @@ async def zerodha_callback(request: Request, user_id: Optional[int] = None):
     SYMBOL_TOKEN.clear()
     TOKEN_TO_SYMBOL.clear()
     SUB_TOKENS.clear()
+    DHAN_SUBSCRIPTIONS.clear()
 
     # Build instruments map
     async with INSTR_LOCK:
@@ -3151,8 +3172,8 @@ async def api_subscribe_symbols(payload: Dict[str, Any]) -> Dict[str, Any]:
     symbols = payload.get("symbols", [])
     if not symbols:
         return {"ok": False, "error": "NO_SYMBOLS"}
-    await subscribe_symbols_for_user(user_id, symbols)
-    return {"ok": True, "count": len(symbols), "subscribed": symbols}
+    await _runtime_subscribe_symbols(user_id, symbols)
+    return {"ok": True, "count": len(symbols), "requested": symbols}
 
 
 @app.get("/api/sectors/top")

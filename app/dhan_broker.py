@@ -68,6 +68,10 @@ class DhanInstrumentRegistry:
         self.security_to_symbol: Dict[str, str] = {}
         self.security_to_feed_segment: Dict[str, int] = {}
         self.security_to_tick_size: Dict[str, float] = {}
+        self.symbol_to_segment: Dict[str, int] = {}
+        self.instrument_to_symbol: Dict[tuple, str] = {}
+        self.instrument_to_tick: Dict[tuple, float] = {}
+        self.security_segments: Dict[str, set] = {}
         self._master_frame: Optional[pd.DataFrame] = None
         self._lock = asyncio.Lock()
         self.loaded_at: Optional[datetime] = None
@@ -93,43 +97,51 @@ class DhanInstrumentRegistry:
                 return True
             try:
                 frame = await self._load_master_frame(force=force)
-                symbol_map: Dict[str, str] = {}
-                security_map: Dict[str, str] = {}
-                for _, row in frame.iterrows():
-                    exchange = _value(row, "SEM_EXM_EXCH_ID", "EXCH_ID").upper()
-                    segment = _value(row, "SEM_SEGMENT", "SEGMENT").upper()
-                    series = _value(row, "SEM_SERIES", "SERIES").upper()
-                    instrument = _value(row, "SEM_INSTRUMENT_NAME", "INSTRUMENT").upper()
-                    if exchange != "NSE" or segment not in {"E", "C"}:
-                        continue
-                    if series and series not in {"EQ", "BE", "BZ"}:
-                        continue
-                    if instrument and instrument not in {"EQUITY", "EQ"}:
-                        continue
-                    symbol = norm_symbol(_value(row, "SEM_TRADING_SYMBOL", "TRADING_SYMBOL"))
-                    security_id = _value(row, "SEM_SMST_SECURITY_ID", "SECURITY_ID")
-                    if symbol and security_id:
-                        symbol_map[symbol] = security_id
-                        security_map[security_id] = symbol
-                        self.security_to_feed_segment[security_id] = MarketFeed.NSE
-                        self.security_to_tick_size[security_id] = self._normalise_tick_size(
-                            _value(row, "SEM_TICK_SIZE", "TICK_SIZE")
-                        )
-                if not symbol_map:
+                records = await asyncio.to_thread(self._parse_equity_master, frame)
+                if not records:
                     raise RuntimeError("DHAN_SCRIP_MASTER_EMPTY")
+                replacement = DhanInstrumentRegistry()
+                for symbol, segment in self.symbol_to_segment.items():
+                    if segment != MarketFeed.NSE:
+                        sid = self.symbol_to_security[symbol]
+                        replacement.register_instrument(symbol, sid, segment,
+                            self.instrument_to_tick.get((segment, sid)))
+                for symbol, security_id, tick in records:
+                    replacement.register_instrument(symbol, security_id, MarketFeed.NSE, tick)
                 for symbol, security_id in self.INDEX_SECURITY_IDS.items():
-                    symbol_map[symbol] = security_id
-                    security_map[security_id] = self.INDEX_DISPLAY.get(security_id, symbol)
-                    self.security_to_feed_segment[security_id] = MarketFeed.IDX
-                    self.security_to_tick_size[security_id] = 0.05
-                self.symbol_to_security = symbol_map
-                self.security_to_symbol = security_map
+                    replacement.register_instrument(symbol, security_id, MarketFeed.IDX, 0.05)
+                # Publish together on the owning loop; remove obsolete equity IDs
+                # only after a successful refresh, preserving other segments.
+                for name in ("symbol_to_security", "symbol_to_segment", "security_to_symbol",
+                             "security_to_feed_segment", "security_to_tick_size", "instrument_to_symbol",
+                             "instrument_to_tick", "security_segments"):
+                    setattr(self, name, getattr(replacement, name))
                 self.loaded_at = datetime.now()
-                log.info("Loaded %s Dhan NSE equity instruments", len(symbol_map))
+                log.info("Loaded %s Dhan NSE equity instruments", len(records))
                 return True
             except Exception as exc:
                 log.error("Dhan instrument master load failed: %s", exc)
                 return False
+
+    @staticmethod
+    def _parse_equity_master(frame):
+        def column(*names):
+            for name in names:
+                if name in frame:
+                    return frame[name].fillna("").astype(str).str.strip().str.upper()
+            return pd.Series("", index=frame.index)
+
+        mask = ((column("SEM_EXM_EXCH_ID", "EXCH_ID") == "NSE")
+                & column("SEM_SEGMENT", "SEGMENT").isin(["E", "C"])
+                & column("SEM_SERIES", "SERIES").isin(["", "EQ", "BE", "BZ"])
+                & column("SEM_INSTRUMENT_NAME", "INSTRUMENT").isin(["", "EQUITY", "EQ"]))
+        result = []
+        for row in frame.loc[mask].to_dict("records"):
+            symbol = norm_symbol(_value(row, "SEM_TRADING_SYMBOL", "TRADING_SYMBOL"))
+            sid = _value(row, "SEM_SMST_SECURITY_ID", "SECURITY_ID")
+            if symbol and sid:
+                result.append((symbol, sid, _value(row, "SEM_TICK_SIZE", "TICK_SIZE")))
+        return result
 
     async def _load_master_frame(self, force: bool = False) -> pd.DataFrame:
         if self._master_frame is not None and not force:
@@ -259,32 +271,54 @@ class DhanInstrumentRegistry:
         if not normalized or not security_id:
             return
         self.symbol_to_security[normalized] = security_id
-        self.security_to_symbol[security_id] = normalized
-        self.security_to_feed_segment[security_id] = MarketFeed.NSE if feed_segment is None else feed_segment
+        segment = MarketFeed.NSE if feed_segment is None else int(feed_segment)
+        self.symbol_to_segment[normalized] = segment
+        self.instrument_to_symbol[(segment, security_id)] = normalized
+        # Legacy ID-only lookups must not silently select a different segment.
+        segments = self.security_segments.setdefault(security_id, set())
+        segments.add(segment)
+        if len(segments) == 1:
+            self.security_to_symbol[security_id] = normalized
+            self.security_to_feed_segment[security_id] = segment
+        else:
+            self.security_to_symbol.pop(security_id, None)
+            self.security_to_feed_segment.pop(security_id, None)
         if tick_size is not None:
-            self.security_to_tick_size[security_id] = self._normalise_tick_size(tick_size)
+            self.instrument_to_tick[(segment, security_id)] = self._normalise_tick_size(tick_size)
+
+    def instrument_key(self, symbol):
+        symbol = norm_symbol(symbol)
+        sid = self.symbol_to_security.get(symbol)
+        if not sid:
+            return None
+        return (self.symbol_to_segment.get(symbol, MarketFeed.NSE), sid)
 
     def feed_segment(self, security_id: Any) -> int:
+        if len(self.security_segments.get(str(security_id), set())) > 1:
+            raise ValueError("DHAN_AMBIGUOUS_SECURITY_ID")
         return self.security_to_feed_segment.get(str(security_id), MarketFeed.NSE)
 
-    def tick_size(self, security_id: Any, default: float = 0.05) -> float:
+    def tick_size(self, security_id: Any, default: float = 0.05, segment: Optional[int] = None) -> float:
         try:
             fallback = self._normalise_tick_size(default)
         except Exception:
             fallback = 0.05
-        return self.security_to_tick_size.get(str(security_id), fallback)
+        segment = self.feed_segment(security_id) if segment is None else segment
+        return self.instrument_to_tick.get((segment, str(security_id)), self.security_to_tick_size.get(str(security_id), fallback))
 
     def exchange_segment_for_symbol(self, symbol: str, dhan: Any) -> Any:
         normalized = norm_symbol(symbol)
         if self.is_index_symbol(normalized):
             return getattr(dhan, "INDEX", "IDX_I")
         security_id = self.symbol_to_security.get(normalized)
-        if security_id and self.feed_segment(security_id) == MarketFeed.NSE_FNO:
+        if security_id and self.symbol_to_segment.get(normalized) == MarketFeed.NSE_FNO:
             return getattr(dhan, "FNO", "NSE_FNO")
         return dhan.NSE
 
-    def symbol(self, security_id: Any) -> str:
-        return self.security_to_symbol.get(str(security_id), self.INDEX_DISPLAY.get(str(security_id), ""))
+    def symbol(self, security_id: Any, segment: Optional[int] = None) -> str:
+        if segment is not None:
+            return self.instrument_to_symbol.get((int(segment), str(security_id)), "")
+        return self.security_to_symbol.get(str(security_id), "")
 
 
 DHAN_INSTRUMENTS = DhanInstrumentRegistry()
@@ -650,7 +684,7 @@ class _QueuedDhanMarketFeed(MarketFeed):
                 self.health_detail = "websocket_connected"
                 while self._running and not token_expired(self.access_token):
                     try:
-                        await asyncio.wait_for(self.get_instrument_data(), timeout=60)
+                        await self.get_instrument_data()
                     except asyncio.TimeoutError:
                         # An idle event-based feed is not a disconnected socket.
                         continue
@@ -724,7 +758,7 @@ class _QueuedDhanMarketFeed(MarketFeed):
             self.last_sent_instruments = snapshot
 
     async def get_instrument_data(self):
-        packet = await super().get_instrument_data()
+        packet = await asyncio.wait_for(super().get_instrument_data(), timeout=60)
         if isinstance(packet, dict):
             packet = dict(packet, received_at=time.time())
             # Awaiting queue capacity keeps the SDK loop free to answer ping/pong.
@@ -746,10 +780,10 @@ class DhanFeedService:
         self.context = DhanContext(self.client_id, self.access_token)
         self.feed: Optional[MarketFeed] = None
         self.order_update: Optional[OrderUpdate] = None
-        self.security_ids: set[str] = set()
+        self.security_ids: set[tuple] = set()
         self.feed_thread: Any = None
         self.order_task: Optional[asyncio.Task[None]] = None
-        self.sent_security_ids: set[str] = set()
+        self.sent_security_ids: set[tuple] = set()
         self._subscription_lock = asyncio.Lock()
         self._tick_tasks: List[asyncio.Task] = []
         self._tick_queues: List[asyncio.Queue] = []
@@ -766,7 +800,7 @@ class DhanFeedService:
     async def _deliver_tick(self, packet: Dict[str, Any]) -> None:
         if self._stopping:
             return
-        key = str(packet.get("security_id") or packet.get("securityId") or "")
+        key = (packet.get("exchange_segment"), str(packet.get("security_id") or packet.get("securityId") or ""))
         queue = self._tick_queues[hash(key) % len(self._tick_queues)]
         await queue.put(packet)
 
@@ -782,7 +816,7 @@ class DhanFeedService:
             finally:
                 queue.task_done()
 
-    async def start(self, security_ids: Iterable[str]) -> None:
+    async def start(self, security_ids: Iterable[Any]) -> None:
         if self.feed is not None or self.order_task is not None:
             await self.subscribe(security_ids)
             return
@@ -793,7 +827,7 @@ class DhanFeedService:
                 self.on_state(False)
             log.warning("DHAN_FEED_AUTH_EXPIRED | user=%s", self.user_id)
             return
-        self.security_ids.update(str(item) for item in security_ids if item)
+        self.security_ids.update(self._keys(security_ids))
         if len(self.security_ids) > 5000:
             raise ValueError("DHAN_SUBSCRIPTION_LIMIT_EXCEEDED")
         delivery_loop = asyncio.get_running_loop()
@@ -804,8 +838,8 @@ class DhanFeedService:
             for i, queue in enumerate(self._tick_queues)
         ]
         instruments = [
-            (DHAN_INSTRUMENTS.feed_segment(security_id), security_id, MarketFeed.Full)
-            for security_id in sorted(self.security_ids)
+            (segment, security_id, MarketFeed.Full)
+            for segment, security_id in sorted(self.security_ids)
         ]
         log.info(
             "DHAN_FEED_START | user=%s instruments=%s sample=%s",
@@ -815,7 +849,7 @@ class DhanFeedService:
         )
 
         def connected(_feed: MarketFeed) -> None:
-            sent = {str(item[1]) for item in _feed.last_sent_instruments}
+            sent = {(int(item[0]), str(item[1])) for item in _feed.last_sent_instruments}
             delivery_loop.call_soon_threadsafe(self.sent_security_ids.update, sent)
             if self.on_state:
                 self.on_state(True)
@@ -877,9 +911,14 @@ class DhanFeedService:
                         self.user_id, self.order_health_detail, delay)
             await asyncio.sleep(delay)
 
-    async def subscribe(self, security_ids: Iterable[str]) -> bool:
+    @staticmethod
+    def _keys(items):
+        return {(int(item[0]), str(item[1])) if isinstance(item, (tuple, list)) else
+                (DHAN_INSTRUMENTS.feed_segment(item), str(item)) for item in items if item}
+
+    async def subscribe(self, security_ids: Iterable[Any]) -> bool:
         async with self._subscription_lock:
-            desired = self.security_ids | {str(item) for item in security_ids if item}
+            desired = self.security_ids | self._keys(security_ids)
             if len(desired) > 5000:
                 raise ValueError("DHAN_SUBSCRIPTION_LIMIT_EXCEEDED")
             self.security_ids = desired
@@ -894,8 +933,8 @@ class DhanFeedService:
                 # Mutate SDK subscription state only on its owning loop. The full
                 # desired list is retained for reconnect even when this send fails.
                 feed.instruments = [
-                    (DHAN_INSTRUMENTS.feed_segment(sid), sid, MarketFeed.Full)
-                    for sid in sorted(desired)
+                    (segment, sid, MarketFeed.Full)
+                    for segment, sid in sorted(desired)
                 ]
                 if not feed.ws or feed._is_ws_closed():
                     return False

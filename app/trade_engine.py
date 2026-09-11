@@ -925,7 +925,7 @@ class OrderWorker:
     """
 
     def __init__(self) -> None:
-        self.q: "asyncio.Queue[Tuple[asyncio.Future, Any, Tuple[Any, ...], Dict[str, Any]]]" = asyncio.Queue()
+        self.q = asyncio.Queue()
         self.task: Optional[asyncio.Task] = None
 
     async def start(self) -> None:
@@ -942,22 +942,37 @@ class OrderWorker:
         except asyncio.CancelledError:
             pass
         self.task = None
+        while not self.q.empty():
+            pending, *_ = self.q.get_nowait()
+            pending.cancel()
+            self.q.task_done()
 
-    async def submit(self, fn, *args, **kwargs):
+    async def submit(self, fn, *args, _before_send=None, **kwargs):
         fut = asyncio.get_running_loop().create_future()
-        await self.q.put((fut, fn, args, kwargs))
+        await self.q.put((fut, fn, args, kwargs, _before_send))
         return await fut
 
     async def _run(self):
         while True:
-            fut, fn, args, kwargs = await self.q.get()
+            fut, fn, args, kwargs, before_send = await self.q.get()
             try:
+                if fut.cancelled():
+                    continue
+                if before_send is not None:
+                    await before_send()
+                if fut.cancelled():
+                    continue
                 res = await asyncio.to_thread(fn, *args, **kwargs)
-                if not fut.cancelled():
+                if not fut.done():
                     fut.set_result(res)
+            except asyncio.CancelledError:
+                fut.cancel()
+                raise
             except Exception as e:
-                if not fut.cancelled():
+                if not fut.done():
                     fut.set_exception(e)
+            finally:
+                self.q.task_done()
 
 
 class MarketDataWorker:
@@ -1478,7 +1493,8 @@ class TradeEngine:
             return 0.0, "NO_PRICE"
 
         buffer_pct, extra_ticks = self._dhan_limit_settings(cfg)
-        tick = DHAN_INSTRUMENTS.tick_size(security_id, DHAN_PRICE_TICK)
+        tick = DHAN_INSTRUMENTS.tick_size(security_id, DHAN_PRICE_TICK,
+            segment=DHAN_INSTRUMENTS.symbol_to_segment.get(norm_symbol(symbol), MarketFeed.NSE))
         if side == "BUY":
             raw_price = reference * (1.0 + buffer_pct / 100.0) + (extra_ticks * tick)
         else:
@@ -1491,7 +1507,7 @@ class TradeEngine:
             if not await self._ensure_dhan_ready() or not self.dhan:
                 raise RuntimeError("DHAN_NOT_CONNECTED")
             security_id = await DHAN_INSTRUMENTS.security_id(symbol)
-            exchange_segment = self.dhan.NSE
+            exchange_segment = DHAN_INSTRUMENTS.exchange_segment_for_symbol(symbol, self.dhan)
             order_symbol = norm_symbol(symbol)
             if DHAN_INSTRUMENTS.is_index_symbol(symbol):
                 spot_price = await self._fetch_ltp(symbol)
@@ -1525,7 +1541,8 @@ class TradeEngine:
             )
             if limit_price > 0:
                 order_type = getattr(self.dhan, "LIMIT", "LIMIT")
-                tick_size = DHAN_INSTRUMENTS.tick_size(security_id, DHAN_PRICE_TICK)
+                tick_size = DHAN_INSTRUMENTS.tick_size(security_id, DHAN_PRICE_TICK,
+                    segment=DHAN_INSTRUMENTS.symbol_to_segment.get(norm_symbol(order_symbol), MarketFeed.NSE))
                 order_price = _round_dhan_price(limit_price, side, tick_size)
                 log.info(
                     "DHAN_AGGRESSIVE_LIMIT | user=%s symbol=%s security_id=%s side=%s qty=%s price=%.2f tick=%.2f source=%s",
@@ -1553,8 +1570,11 @@ class TradeEngine:
                     qty,
                     price_source,
                 )
+            if hasattr(self.store, "_lock_leases"):
+                await self.store._lock_leases.verify_current()
             response = await self.order_worker.submit(
                 self.dhan.place_order,
+                _before_send=self.store._lock_leases.submission_guard() if hasattr(self.store, "_lock_leases") else None,
                 security_id=str(security_id),
                 exchange_segment=exchange_segment,
                 transaction_type=self.dhan.BUY if side == "BUY" else self.dhan.SELL,
@@ -1578,8 +1598,11 @@ class TradeEngine:
         ok = await self._ensure_kite_ready()
         if not ok or not self.kite:
             raise RuntimeError("ZERODHA_NOT_CONNECTED")
+        if hasattr(self.store, "_lock_leases"):
+            await self.store._lock_leases.verify_current()
         response = await self.order_worker.submit(
             self.kite.place_order,
+            _before_send=self.store._lock_leases.submission_guard() if hasattr(self.store, "_lock_leases") else None,
             variety="regular",
             exchange="NSE",
             tradingsymbol=str(symbol),
@@ -2599,6 +2622,11 @@ class TradeEngine:
         if not _is_within_entry_window(cfg.entry_start_time, cfg.entry_end_time):
             return [{"symbol": s, "status": "SKIPPED", "reason": "ENTRY_WINDOW"} for s in symbols]
 
+        # Cold master parsing must complete before any order lock is held.
+        if self.broker == "DHAN" and not _is_test_mode():
+            if not await DHAN_INSTRUMENTS.ensure_loaded():
+                return [{"symbol": s, "status": "ERROR", "reason": "INSTRUMENT_MASTER_UNAVAILABLE"} for s in symbols]
+
         results: List[Dict[str, Any]] = []
         for raw in symbols:
             sym = norm_symbol(raw)
@@ -2618,8 +2646,9 @@ class TradeEngine:
                     continue
                 lock_acquired = True
             except Exception:
-                # Store may not implement lock (tests/local). Proceed without it.
-                lock_acquired = False
+                log.exception("ENTRY_LOCK_UNAVAILABLE | user=%s symbol=%s", self.user_id, sym)
+                results.append({"symbol": sym, "status": "ERROR", "reason": "ENTRY_LOCK_UNAVAILABLE"})
+                continue
 
             try:
                 custom_signal = None
@@ -2659,7 +2688,7 @@ class TradeEngine:
                                     f"{htf_minutes}minute",
                                     30,
                                 )
-                            custom_signal, custom_meta = evaluate_precision_sniper(
+                            custom_signal, custom_meta = await asyncio.to_thread(evaluate_precision_sniper,
                                 candles,
                                 cfg.custom_settings or {},
                                 htf_candles,
@@ -2719,7 +2748,7 @@ class TradeEngine:
                                 lookback_days = max(15, min(90, sessions * 4 + 14))
                             interval = str(custom_settings.get("timeframe") or "5minute")
                             candles = await self._fetch_historical_candles(sym, interval, lookback_days)
-                            custom_signal, custom_meta = custom_signal_fn(candles, cfg.custom_settings or {})
+                            custom_signal, custom_meta = await asyncio.to_thread(custom_signal_fn, candles, cfg.custom_settings or {})
                     except Exception as e:
                         results.append({"symbol": sym, "status": "ERROR", "reason": f"CUSTOM_DATA_FAIL:{_safe_error(e)}"})
                         continue
@@ -3470,6 +3499,11 @@ class TradeEngine:
                     log.info("="*80 + "\n")
 
         pos = self.positions.get(symbol)
+        if pos and callable(getattr(self.store, "get_position", None)):
+            saved = await self.store.get_position(self.user_id, symbol)
+            if saved and (saved.get("status") == "CLOSED" or saved.get("trade_id") != pos.trade_id):
+                self.positions.pop(symbol, None)
+                pos = None
         if not pos:
             pos = await self._hydrate_open_position_from_store(symbol)
         if not pos or pos.status != "OPEN":
@@ -4122,6 +4156,17 @@ class TradeEngine:
                 return
 
             try:
+                # Another process may have completed the exit before we obtained
+                # this lock. Never submit a second exit from a stale local copy.
+                if callable(getattr(self.store, "get_position", None)):
+                    saved = await self.store.get_position(self.user_id, symbol)
+                    if saved and (saved.get("status") == "CLOSED" or saved.get("trade_id") != pos.trade_id):
+                        self.positions.pop(symbol, None)
+                        return
+                    if saved:
+                        pos.qty = max(0, int(saved.get("qty") or 0))
+                        if pos.qty == 0:
+                            return
                 pos.status = "EXITING"
                 pos.exit_reason = str(reason)
                 pos.updated_ts = time.time()

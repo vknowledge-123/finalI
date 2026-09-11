@@ -54,6 +54,10 @@ class AsyncJobQueue(Generic[T, R]):
         for task in tasks:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        while not self.queue.empty():
+            job = self.queue.get_nowait()
+            job.future.cancel()
+            self.queue.task_done()
 
     async def submit(self, item: T, *, timeout: Optional[float] = None) -> R:
         if not self._started:
@@ -68,17 +72,20 @@ class AsyncJobQueue(Generic[T, R]):
             job = await self.queue.get()
             try:
                 if not job.future.cancelled():
-                    result = await self.handler(job.item)
+                    result = await asyncio.create_task(self.handler(job.item), name=f"{self.name}_job")
                     if not job.future.cancelled():
                         job.future.set_result(result)
             except asyncio.CancelledError:
                 if not job.future.done():
-                    job.future.cancel()
-                raise
+                    if asyncio.current_task().cancelling():
+                        job.future.cancel()
+                    else:
+                        job.future.set_exception(RuntimeError("JOB_CANCELLED_RECONCILE_REQUIRED"))
+                if asyncio.current_task().cancelling():
+                    raise
             except Exception as exc:
                 log.exception("%s worker %s failed", self.name, worker_id)
                 if not job.future.cancelled():
                     job.future.set_exception(exc)
             finally:
                 self.queue.task_done()
-

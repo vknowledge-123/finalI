@@ -112,7 +112,7 @@ class ServiceRegressions(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await store.is_kill(1))
 
     async def test_bad_subscription_job_does_not_stop_service(self):
-        redis = SimpleNamespace(lpop=AsyncMock(side_effect=[
+        redis = SimpleNamespace(llen=AsyncMock(return_value=4), lpop=AsyncMock(side_effect=[
             "[]", json.dumps({"user_id": "bad", "symbols": ["SBIN"]}),
             json.dumps({"user_id": 1, "symbols": "SBIN"}),
             json.dumps({"user_id": 1, "symbols": ["SBIN"]}), None,

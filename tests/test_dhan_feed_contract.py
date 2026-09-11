@@ -61,6 +61,59 @@ class DhanFeedContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await registry.ensure_loaded())
         self.assertEqual(await registry.security_id("SBIN"), "3045")
 
+    async def test_same_security_id_keeps_stock_and_index_independent(self):
+        registry = DhanInstrumentRegistry()
+        registry.register_instrument("ADANIENT", "25", MarketFeed.NSE, 5)
+        registry.register_instrument("NIFTY BANK", "25", MarketFeed.IDX, 1)
+        self.assertEqual(registry.instrument_key("ADANIENT"), (1, "25"))
+        self.assertEqual(registry.instrument_key("NIFTY BANK"), (0, "25"))
+        self.assertEqual(registry.symbol("25", 1), "ADANIENT")
+        self.assertEqual(registry.symbol("25", 0), "NIFTY BANK")
+        self.assertEqual(registry.symbol("25"), "")
+        with self.assertRaisesRegex(ValueError, "AMBIGUOUS_SECURITY_ID"):
+            registry.feed_segment("25")
+        self.assertEqual(registry.tick_size("25", segment=1), 0.05)
+        self.assertEqual(registry.tick_size("25", segment=0), 0.01)
+        service = DhanFeedService(1, "client", "token", lambda p: None, lambda p: None)
+        await service.subscribe([registry.instrument_key("ADANIENT"), registry.instrument_key("NIFTY BANK")])
+        self.assertEqual(service.security_ids, {(1, "25"), (0, "25")})
+
+    async def test_cold_master_parse_runs_off_event_loop(self):
+        registry = DhanInstrumentRegistry()
+        registry._master_frame = pd.DataFrame()
+        started, release = threading.Event(), threading.Event()
+        loop_thread = threading.get_ident()
+        parse_threads = []
+
+        def parse(frame):
+            parse_threads.append(threading.get_ident())
+            started.set()
+            release.wait(3)
+            return [("ADANIENT", "25", "5")]
+
+        with patch.object(registry, "_parse_equity_master", side_effect=parse):
+            task = asyncio.create_task(registry.ensure_loaded())
+            try:
+                self.assertTrue(await asyncio.to_thread(started.wait, 2))
+                self.assertFalse(task.done())
+                self.assertNotEqual(parse_threads[0], loop_thread)
+            finally:
+                release.set()
+                self.assertTrue(await asyncio.wait_for(task, 2))
+        self.assertEqual(registry.instrument_key("ADANIENT"), (1, "25"))
+
+    async def test_master_refresh_removes_obsolete_equity_ids_but_keeps_sectors(self):
+        registry = DhanInstrumentRegistry()
+        registry.register_instrument("OLD", "99", MarketFeed.NSE)
+        registry.register_instrument("NIFTY AUTO", "14", MarketFeed.IDX)
+        with patch.object(registry, "_load_master_frame", AsyncMock(return_value=pd.DataFrame())), \
+             patch.object(registry, "_parse_equity_master", return_value=[("NEW", "100", "5")]):
+            self.assertTrue(await registry.ensure_loaded(force=True))
+        self.assertIsNone(registry.instrument_key("OLD"))
+        self.assertEqual(registry.symbol("99", 1), "")
+        self.assertEqual(registry.instrument_key("NEW"), (1, "100"))
+        self.assertEqual(registry.instrument_key("NIFTY AUTO"), (0, "14"))
+
     async def test_failed_send_is_retried_and_sdk_batches_correct_segments(self):
         service = DhanFeedService(1, "test-client", "test-token", lambda p: None, lambda p: None)
         feed = _QueuedDhanMarketFeed(service.context, [], "v2")
@@ -82,9 +135,9 @@ class DhanFeedContractTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([m["InstrumentCount"] for m in messages], [100, 2])
             instruments = [i for m in messages for i in m["InstrumentList"]]
             self.assertIn({"ExchangeSegment": "IDX_I", "SecurityId": "14"}, instruments)
-            self.assertEqual(service.sent_security_ids, set(ids))
+            self.assertEqual(service.sent_security_ids, {(0, "14")} | {(1, sid) for sid in ids[1:]})
             self.assertTrue(all(m["RequestCode"] == 21 for m in messages))
-            await service.subscribe(ids)
+            await service.subscribe(service.security_ids)
             self.assertEqual(feed.ws.send.await_count, 2)
         finally:
             feed.loop.call_soon_threadsafe(feed.loop.stop)
@@ -94,7 +147,7 @@ class DhanFeedContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_disconnected_subscription_keeps_desired_list_without_claiming_sent(self):
         service = DhanFeedService(1, "client", "token", lambda p: None, lambda p: None)
         self.assertFalse(await service.subscribe(["3045"]))
-        self.assertEqual(service.security_ids, {"3045"})
+        self.assertEqual(service.security_ids, {(MarketFeed.NSE, "3045")})
         self.assertFalse(service.sent_security_ids)
         with self.assertRaisesRegex(ValueError, "SUBSCRIPTION_LIMIT"):
             await service.subscribe([str(i) for i in range(6000)])
@@ -169,21 +222,26 @@ class DhanFeedContractTests(unittest.IsolatedAsyncioTestCase):
             return SimpleNamespace(start=AsyncMock())
 
         engine = SimpleNamespace(on_tick=AsyncMock(return_value=None), on_order_update=AsyncMock())
+        registry = DhanInstrumentRegistry()
+        registry.register_instrument("NIFTY AUTO", "14", MarketFeed.IDX)
+        registry.register_instrument("ADANIENT", "25", MarketFeed.NSE)
+        registry.register_instrument("NIFTY BANK", "25", MarketFeed.IDX)
         with patch.object(main_app, "store", memory), patch.object(main_app, "_is_test_mode", return_value=False), \
              patch.object(main_app, "_stop_kite_ticker", AsyncMock()), \
              patch.object(main_app, "_stop_dhan_feed", AsyncMock()), \
              patch.object(main_app, "DHAN_FEED", None), patch.object(main_app, "DHAN_USER_ID", None), \
              patch.object(main_app, "DHAN_ACCESS_TOKEN", ""), patch.object(main_app, "SUB_TOKENS", {14}), \
-             patch.object(main_app, "TOKEN_TO_SYMBOL", {14: "NIFTY AUTO"}), \
+             patch.object(main_app, "DHAN_INSTRUMENTS", registry), \
+             patch.object(main_app, "DHAN_SUBSCRIPTIONS", {(0, "14")}), \
              patch.object(main_app, "ensure_engine", AsyncMock(return_value=engine)), \
              patch.object(main_app, "DhanFeedService", side_effect=fake_service), \
              patch.object(main_app.ws_mgr, "broadcast_nowait") as broadcast:
             await main_app.start_dhan_feed(1)
             handler = captured["on_tick"]
-            await handler({"type": "Previous Close", "security_id": 14, "prev_close": "100.0"})
+            await handler({"type": "Previous Close", "exchange_segment": 0, "security_id": 14, "prev_close": "100.0"})
             engine.on_tick.assert_not_awaited()
             self.assertEqual(await memory.load_latest_tick(1, "NIFTY AUTO"), {})
-            await handler({"type": "Full Data", "security_id": 14, "LTP": "102", "close": "0", "depth": [{"bid_price": "101"}]})
+            await handler({"type": "Full Data", "exchange_segment": 0, "security_id": 14, "LTP": "102", "close": "0", "depth": [{"bid_price": "101"}]})
             tick = await memory.load_latest_tick(1, "NIFTY AUTO")
             self.assertEqual(tick["close"], 100)
             self.assertEqual(tick["ltp"], 102)
@@ -191,6 +249,13 @@ class DhanFeedContractTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(tick["depth"], [{"bid_price": "101"}])
             self.assertEqual(engine.on_tick.await_args.args[:3], ("NIFTY AUTO", 102, 100))
             self.assertEqual(broadcast.call_args.args[1]["close"], 100)
+            for segment, close, price in [(1, 3000, 3010), (0, 50000, 50100)]:
+                await handler({"type": "Previous Close", "exchange_segment": segment, "security_id": 25, "prev_close": close})
+                await handler({"type": "Ticker Data", "exchange_segment": segment, "security_id": 25, "LTP": price})
+            stock = await memory.load_latest_tick(1, "ADANIENT")
+            index = await memory.load_latest_tick(1, "NIFTY BANK")
+            self.assertEqual((stock["ltp"], stock["close"]), (3010, 3000))
+            self.assertEqual((index["ltp"], index["close"]), (50100, 50000))
             await captured["on_order_update"]({"Type": "order_alert", "Data": {
                 "OrderNo": "O1", "Status": "TRADED", "Symbol": "SBIN", "Quantity": 2,
                 "TradedQty": 2, "RemainingQuantity": 0, "AvgTradedPrice": 100,

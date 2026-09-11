@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import redis.asyncio as redis
+from redis.exceptions import WatchError
 from .order_locks import OrderLockLeases
 
 if TYPE_CHECKING:
@@ -825,7 +826,27 @@ class RedisStore:
         sym = norm_symbol(symbol)
         payload = dict(pos or {})
         payload["symbol"] = sym
-        await self.redis.hset(k_positions(user_id), sym, json.dumps(payload))
+        # Atomically preserve a terminal trade without serializing the whole
+        # positions hash or re-encoding JSON arrays inside Lua.
+        saved = await self.redis.eval("""
+            local raw = redis.call('HGET', KEYS[1], ARGV[1])
+            if raw then
+                local old = cjson.decode(raw)
+                if old.trade_id and old.trade_id ~= '' and old.trade_id == ARGV[3]
+                   and old.status == 'CLOSED' and ARGV[4] ~= 'CLOSED' then
+                    return 0
+                end
+            end
+            redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+            return 1
+        """, 1, k_positions(user_id), sym, json.dumps(payload),
+            str(payload.get("trade_id") or ""), str(payload.get("status") or ""))
+        if not saved:
+            raise RuntimeError("STALE_POSITION_REOPEN_BLOCKED")
+
+    async def get_position(self, user_id: int, symbol: str) -> Dict[str, Any]:
+        raw = await self.redis.hget(k_positions(user_id), norm_symbol(symbol))
+        return json.loads(raw) if raw else {}
 
     async def delete_position(self, user_id: int, symbol: str) -> None:
         sym = norm_symbol(symbol)
@@ -912,36 +933,38 @@ class RedisStore:
         if not payload.get("time"):
             payload["time"] = now_ist().strftime("%Y-%m-%d %H:%M:%S").replace(" ", "T")
 
-        # Try to find and update existing record first (prevent duplicates from re-pushes)
-        raw_alerts = await self.redis.lrange(key, 0, -1)
         target_name = payload.get("alert_name")
         target_time = payload.get("time")
-        
-        updated = False
-        new_list = []
-        
-        for raw in (raw_alerts or []):
-            try:
-                a = json.loads(raw)
-                if a.get("alert_name") == target_name and a.get("time") == target_time:
-                    # Update existing record with any new results or fields
-                    a.update(payload)
-                    updated = True
-                new_list.append(json.dumps(a))
-            except Exception:
-                new_list.append(raw)
-                
-        if updated:
-            await self.redis.delete(key)
-            if new_list:
-                await self.redis.rpush(key, *new_list)
-        else:
-            # New alert, push to front
-            await self.redis.lpush(key, json.dumps(payload))
-            await self.redis.ltrim(key, 0, 199)
-
         ttl = seconds_until_next_ist_day(extra_grace_sec=6 * 60 * 60)
-        await self.redis.expire(key, int(ttl))
+        # Other services write this list too. Retry on concurrent changes instead
+        # of deleting/rebuilding a stale snapshot and losing their results.
+        for _ in range(8):
+            async with self.redis.pipeline(transaction=True) as pipe:
+                try:
+                    await pipe.watch(key)
+                    rows = await pipe.lrange(key, 0, 199)
+                    updates = []
+                    for index, raw in enumerate(rows):
+                        try:
+                            row = json.loads(raw)
+                            if isinstance(row, dict) and row.get("alert_name") == target_name and row.get("time") == target_time:
+                                row.update(payload)
+                                updates.append((index, json.dumps(row)))
+                        except (ValueError, TypeError):
+                            continue
+                    pipe.multi()
+                    if updates:
+                        for index, raw in updates:
+                            pipe.lset(key, index, raw)
+                    else:
+                        pipe.lpush(key, json.dumps(payload))
+                    pipe.ltrim(key, 0, 199)
+                    pipe.expire(key, int(ttl))
+                    await pipe.execute()
+                    return
+                except WatchError:
+                    continue
+        raise RuntimeError("ALERT_HISTORY_CONCURRENT_UPDATE_RETRY_EXHAUSTED")
 
     async def get_recent_alerts(self, user_id: int, limit: int = 50) -> List[Dict[str, Any]]:
         key = k_alerts(user_id)

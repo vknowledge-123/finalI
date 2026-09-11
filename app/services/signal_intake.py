@@ -10,6 +10,7 @@ from fastapi import Request
 
 from ..chartink_client import normalize_alert_name, normalize_symbol, normalize_symbols, parse_chartink_payload
 from ..dhan_broker import compact_broker_error
+from ..redis_store import now_ist
 from .contracts import ChartinkSignalJob
 from .job_queue import AsyncJobQueue
 from .notification_service import NotificationService
@@ -67,7 +68,7 @@ class SignalIntakeService:
             user_id=int(user_id),
             alert_name=alert_name,
             symbols=symbols,
-            timestamp=str(ts or ""),
+            timestamp=str(ts or now_ist().isoformat()),
             content_type=content_type,
             method=request.method,
             payload_keys=payload_keys,
@@ -158,19 +159,19 @@ class SignalIntakeService:
             log.warning("ALERT_SUBSCRIBE_FAIL | user=%s symbols=%s err=%s", user_id, symbols, exc)
 
         initial_result = [{"symbol": symbol, "status": "RECEIVED"} for symbol in symbols]
-        initial_save_task = asyncio.create_task(
-            self.notification.save_alert_received(
-                user_id,
-                job.alert_name,
-                job.timestamp,
-                symbols,
-                initial_result,
-            ),
-            name=f"alert_received_{user_id}",
+        await self.notification.save_alert_received(
+            user_id, job.alert_name, job.timestamp, symbols, initial_result,
         )
 
         try:
             result = await self.trade_decision.process_chartink_signal(job)
+        except asyncio.CancelledError:
+            await self.notification.store.set_kill(user_id, True)
+            await self.notification.save_alert_result(user_id, job.alert_name, job.timestamp, [
+                {"symbol": symbol, "status": "ERROR", "reason": "EXECUTION_INTERRUPTED_RECONCILE_REQUIRED"}
+                for symbol in symbols
+            ])
+            raise
         except Exception as exc:
             log.exception("WEBHOOK_PANIC | user=%s alert=%s", user_id, job.alert_name)
             await self.notification.store.set_kill(user_id, True)
@@ -187,11 +188,6 @@ class SignalIntakeService:
         execution_symbols = [symbol for symbol in execution_symbols if symbol and symbol not in symbols]
         if execution_symbols:
             asyncio.create_task(self.subscribe_symbols(user_id, execution_symbols), name=f"subscribe_exec_{user_id}")
-
-        try:
-            await initial_save_task
-        except Exception as exc:
-            log.warning("ALERT_INITIAL_SAVE_FAIL | user=%s alert=%s err=%s", user_id, job.alert_name, exc)
 
         await asyncio.gather(
             self.notification.save_alert_result(user_id, job.alert_name, job.timestamp, result),

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import time
 from typing import Any, Dict, Tuple
@@ -23,6 +24,17 @@ EXIT_REST_FALLBACK_ENABLED = (os.getenv("EXIT_REST_FALLBACK_ENABLED", "1") or "1
 EXIT_REST_FALLBACK_INTERVAL_SEC = float(os.getenv("EXIT_REST_FALLBACK_INTERVAL_SEC", "2") or "2")
 EXIT_FRESH_TICK_MAX_AGE_SEC = float(os.getenv("EXIT_FRESH_TICK_MAX_AGE_SEC", "5") or "5")
 _REST_FALLBACK_LAST: Dict[Tuple[int, str], float] = {}
+
+
+def _fresh_ws_tick(tick):
+    try:
+        price = float(tick.get("ltp") or tick.get("last_price") or 0)
+        age = float(tick.get("age_sec", 999999))
+        return (math.isfinite(price) and price > 0
+                and str(tick.get("source", "")).upper() in {"DHAN_WS", "ZERODHA_WS"}
+                and 0 <= age <= max(0.5, EXIT_FRESH_TICK_MAX_AGE_SEC))
+    except (TypeError, ValueError):
+        return False
 
 
 async def _reconcile_position(store, registry: EngineRegistry, user_id: int, row: Dict[str, Any]) -> None:
@@ -91,10 +103,11 @@ async def _rest_exit_fallback_position(store, registry: EngineRegistry, user_id:
         latest = await store.load_latest_tick(int(user_id), symbol)
     except Exception:
         latest = {}
-    age = float(latest.get("age_sec", 999999.0))
-    ltp = float(latest.get("ltp") or latest.get("last_price") or 0.0)
-    latest_source = str(latest.get("source") or "").strip().upper()
-    if ltp > 0 and latest_source in {"DHAN_WS", "ZERODHA_WS"} and 0 <= age <= max(0.5, EXIT_FRESH_TICK_MAX_AGE_SEC):
+    try:
+        age = float(latest.get("age_sec", 999999.0))
+    except (TypeError, ValueError):
+        age = 999999.0
+    if _fresh_ws_tick(latest):
         return
 
     now = time.time()
@@ -112,15 +125,21 @@ async def _rest_exit_fallback_position(store, registry: EngineRegistry, user_id:
     except Exception as exc:
         log.warning("REST_EXIT_LTP_FAIL | user=%s symbol=%s err=%s", user_id, symbol, exc)
         return
-    if rest_ltp <= 0:
+    if not math.isfinite(rest_ltp) or rest_ltp <= 0:
         log.warning("REST_EXIT_LTP_EMPTY | user=%s symbol=%s stale_tick_age=%.1fs", user_id, symbol, age)
+        return
+
+    # A websocket quote may arrive while the REST request is in flight.
+    # Do not replace it or run exit evaluation against the older REST snapshot.
+    if _fresh_ws_tick(await store.load_latest_tick(int(user_id), symbol)):
         return
 
     try:
         await store.save_latest_tick(
             int(user_id),
             symbol,
-            {"ltp": rest_ltp, "close": 0.0, "high": rest_ltp, "low": rest_ltp, "source": "REST_EXIT_FALLBACK"},
+            {"ltp": rest_ltp, "close": 0.0, "high": rest_ltp, "low": rest_ltp,
+             "source": "REST_EXIT_FALLBACK", "received_at": now},
             ttl_sec=max(2, int(EXIT_FRESH_TICK_MAX_AGE_SEC)),
         )
     except Exception:
