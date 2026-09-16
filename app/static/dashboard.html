@@ -467,11 +467,15 @@
 
     /* Top bar sizing guardrails (responsive, prevents oversized buttons on large screens) */
     .topbar-row {
-      height: clamp(46px, 4.5vw, 60px);
+      min-height: 58px;
+      padding: 8px 12px;
+      gap: 12px;
+      flex-wrap: wrap;
     }
 
     nav .topbar-actions {
       gap: clamp(8px, 1vw, 14px);
+      flex-wrap: wrap;
     }
 
     nav .btn {
@@ -579,16 +583,12 @@
 
     .logo-wrap {
       margin-left: 8px;
+      flex: 1 1 260px;
+      min-width: 0;
     }
 
     .logo-box svg {
       filter: drop-shadow(0 2px 6px rgba(0, 0, 0, 0.4));
-    }
-
-              <span class="logo-dot"></span>
-              <span class="logo-bar"></span>
-              <span class="logo-one"></span>
-      font-size: clamp(14px, 1.4vw, 16px) !important;
     }
 
     /* iOneAlgo logo mark */
@@ -627,11 +627,15 @@
     }
 
     nav .brand-title {
-      font-size: clamp(16px, 1.7vw, 19px);
+      font-size: 16px;
+      line-height: 1.35;
+      letter-spacing: 0;
     }
 
     nav .brand-sub {
-      font-size: clamp(8px, 0.75vw, 9px);
+      font-size: 10px;
+      line-height: 1.35;
+      letter-spacing: 0;
     }
 
     /* Keep header metrics on a single line */
@@ -671,7 +675,6 @@
     /* Screen-specific sizing to keep top bar compact */
     @media (max-width: 640px) {
       .topbar-row {
-        height: 52px;
         padding-left: 12px;
         padding-right: 12px;
         
@@ -814,17 +817,7 @@
       }
     }
 
-    @media (min-width: 1024px) and (max-width: 1439px) {
-      .topbar-row {
-        height: 56px;
-      }
-    }
-
     @media (min-width: 1440px) {
-      .topbar-row {
-        height: 58px;
-      }
-
       nav .btn {
         font-size: 11px !important;
         padding: 5px 10px !important;
@@ -844,7 +837,7 @@
   <!-- Stars Container -->
   <div id="stars" class="fixed inset-0 pointer-events-none z-0"></div>
 
-  <nav class="fixed top-0 w-full z-50 bg-[#0f172a]/95 backdrop-blur-xl border-b border-white/10 shadow-lg">
+  <nav class="sticky top-0 w-full z-50 bg-[#0f172a]/95 backdrop-blur-xl border-b border-white/10 shadow-lg">
     <div class="max-w-none w-full px-0">
       <div class="topbar-row flex items-center justify-between">
         <!-- Logo -->
@@ -975,7 +968,7 @@
   </nav>
 
   <!-- Main Content (Stacked) -->
-  <main class="max-w-none w-full mx-auto px-0 pt-16 pb-6 space-y-6">
+  <main class="max-w-none w-full mx-auto px-0 pt-3 pb-6 space-y-6">
 
     <!-- Combined Signals + Positions -->
     <section class="animate-enter">
@@ -1062,12 +1055,12 @@
 
     <!-- Backtesting -->
     <section class="animate-enter glass rounded-2xl border border-white/10 p-4">
-      <div class="flex flex-col lg:flex-row lg:items-end gap-3 justify-between mb-4">
+      <div class="flex flex-col gap-3 mb-4">
         <div>
           <h2 class="text-lg font-semibold text-slate-200 font-serif">Custom Strategy Backtest</h2>
           <p class="text-xs text-slate-400 mt-1">Search any NSE stock symbol. The engine fetches warmup candles, evaluates closed candles, enters on the next candle open, and reports trade P&amp;L.</p>
         </div>
-        <div class="grid grid-cols-2 md:grid-cols-7 gap-2 w-full lg:w-auto">
+        <div class="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-7 gap-2 w-full">
           <div>
             <label class="block text-[10px] text-slate-400 uppercase mb-1">Saved Strategy</label>
             <select id="bt_config" class="input-field" onchange="applyBacktestConfig()">
@@ -3867,8 +3860,10 @@
 
           if (d.type === 'tick') {
             const s = d.symbol;
+            const price = Number(d.ltp);
+            if (!s || !Number.isFinite(price) || price <= 0) return;
             const sid = safeId(s); // Use safe ID for alerts
-            const ltp = Number(d.ltp || 0).toFixed(2);
+            const ltp = price.toFixed(2);
             const close = Number(d.close || 0);
             const pctChange = close > 0 ? ((d.ltp - close) / close * 100).toFixed(2) : '0.00';
             const pctStr = pctChange + '%';
@@ -3889,6 +3884,18 @@
 
             // Update P&L if available in POS_MAP (without full re-render)
             const pSnap = POS_MAP[s];
+            if (pSnap && ['OPEN', 'EXITING', 'EXIT_CONDITIONS_MET'].includes(pSnap.status)) {
+              pSnap.ltp = price;
+              const entry = Number(pSnap.entry_price || 0);
+              const quantity = Number(pSnap.qty || 0);
+              if (entry > 0 && quantity > 0) {
+                pSnap.pnl = Number(pSnap.realized_pnl || 0)
+                  + (pSnap.side === 'SELL' ? entry - price : price - entry) * quantity;
+              }
+              POS_SNAPSHOT[s] = { ...pSnap };
+              renderPositions(Object.values(POS_MAP).filter(p =>
+                ['PENDING_ENTRY', 'OPEN', 'EXITING', 'EXIT_CONDITIONS_MET', 'ERROR'].includes(p.status)));
+            }
             if (pSnap && typeof pSnap.pnl !== "undefined") {
               const pnlVal = Number(pSnap.pnl || 0).toFixed(2);
               const pnlColor = pSnap.pnl > 0 ? 'text-emerald-400 font-bold' : pSnap.pnl < 0 ? 'text-rose-400 font-bold' : 'text-slate-400';
@@ -3901,26 +3908,11 @@
             // Update TSL in Alert Table dynamically from POS_MAP
             const p = POS_MAP[s]; // Lookup from map by raw symbol
             if (p) {
-              let tslPrice = 0.0;
-              const tslPct = Number(p.tsl_pct || 0);
+              const customRisk = p.strategy_mode && p.strategy_mode !== 'CLASSIC';
               const tslEnabled = p.trailing_sl_enabled !== false;
-              const previousTrail = Number(p.trail_price || 0);
-              // Update high/low locally for immediate TSL feedback
-              if (p.side === 'BUY') {
-                p.highest = Math.max(Number(p.highest || 0), Number(d.ltp));
-                if (tslEnabled && tslPct > 0 && p.highest > 0) {
-                  const computedTrail = p.highest * (1.0 - tslPct / 100.0);
-                  tslPrice = previousTrail > 0 ? Math.max(previousTrail, computedTrail) : computedTrail;
-                  p.trail_price = tslPrice;
-                }
-              } else if (p.side === 'SELL') {
-                p.lowest = (Number(p.lowest) === 0 ? Number(d.ltp) : Math.min(Number(p.lowest), Number(d.ltp)));
-                if (tslEnabled && tslPct > 0 && p.lowest > 0) {
-                  const computedTrail = p.lowest * (1.0 + tslPct / 100.0);
-                  tslPrice = previousTrail > 0 ? Math.min(previousTrail, computedTrail) : computedTrail;
-                  p.trail_price = tslPrice;
-                }
-              }
+              // Stops are broker-engine state, not a separate browser strategy.
+              const tslPrice = customRisk ? Number(p.trail_price || p.sl_price || 0)
+                : (tslEnabled ? Number(p.trail_price || 0) : 0);
 
               if (tslPrice > 0) {
                 const tslVal = tslPrice.toFixed(2);

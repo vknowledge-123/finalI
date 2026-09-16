@@ -1,6 +1,7 @@
 # app/redis_store.py
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
@@ -9,7 +10,11 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import redis.asyncio as redis
-from redis.exceptions import WatchError
+from redis.exceptions import (
+    AuthenticationError, AuthorizationError, BusyLoadingError,
+    ConnectionError as RedisConnectionError, NoPermissionError,
+    TimeoutError as RedisTimeoutError, WatchError,
+)
 from .order_locks import OrderLockLeases
 
 if TYPE_CHECKING:
@@ -281,6 +286,26 @@ class RedisStore:
             return bool(await self.redis.ping())
         except Exception:
             return False
+
+    async def require_connection(self) -> None:
+        """Fail startup with a useful diagnosis, without exposing URLs or credentials."""
+        try:
+            connected = bool(await asyncio.wait_for(self.redis.ping(), timeout=5.0))
+        except AuthenticationError:
+            raise RuntimeError("REDIS_AUTH_FAILED: Check Redis username/password in the service environment") from None
+        except (AuthorizationError, NoPermissionError):
+            raise RuntimeError("REDIS_PERMISSION_DENIED: Check Redis user ACL permissions") from None
+        except BusyLoadingError:
+            raise RuntimeError("REDIS_LOADING: Redis is still loading its persisted data") from None
+        except (RedisTimeoutError, TimeoutError):
+            raise RuntimeError("REDIS_TIMEOUT: Redis did not respond within the startup timeout") from None
+        except RedisConnectionError:
+            raise RuntimeError("REDIS_CONNECTION_FAILED: Check Redis service, host and port") from None
+        except Exception:
+            # Raw client/server exception messages can include connection secrets.
+            raise RuntimeError("REDIS_CHECK_FAILED: Check Redis configuration and server health") from None
+        if not connected:
+            raise RuntimeError("REDIS_PING_FAILED: Redis did not confirm readiness")
 
     async def init_scripts(self) -> None:
         if not self._sha_lock:

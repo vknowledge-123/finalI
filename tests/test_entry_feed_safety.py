@@ -1,6 +1,6 @@
 import os
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from app.memory_store import InMemoryStore
 from app.trade_engine import OrderExecution, TradeEngine
@@ -20,6 +20,10 @@ class EntryFeedSafetyTests(unittest.IsolatedAsyncioTestCase):
         os.environ["REQUIRE_BROKER_FEED_FOR_ENTRY"] = "1"
         os.environ["ENTRY_FEED_READY_TIMEOUT_SEC"] = "0"
         os.environ["ENTRY_FRESH_TICK_MAX_AGE_SEC"] = "5"
+        # Exercise production entry guards without downloading a live master.
+        master = patch("app.trade_engine.DHAN_INSTRUMENTS.ensure_loaded", AsyncMock(return_value=True))
+        master.start()
+        self.addCleanup(master.stop)
 
     async def asyncTearDown(self) -> None:
         for key, value in self._old_env.items():

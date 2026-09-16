@@ -29,8 +29,7 @@ async def daily_cleanup(user_id: int = 1) -> None:
 
     log.info("Daily cleanup started at %s for user %s", now.strftime("%Y-%m-%d %H:%M:%S %Z"), user_id)
     try:
-        if not await store.ping():
-            raise RuntimeError(f"Redis is not reachable at {redis_url}")
+        await store.require_connection()
 
         positions = await store.list_positions(user_id)
         alerts = await store.get_recent_alerts(user_id, limit=1000)

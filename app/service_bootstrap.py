@@ -49,8 +49,7 @@ async def init_store() -> RedisStore:
         except Exception as exc:
             log.warning("Encryption initialization failed: %s", exc)
     store = RedisStore(REDIS_URL, encryption_manager)
-    if not await store.ping():
-        raise RuntimeError(f"Redis is not reachable at {REDIS_URL}")
+    await store.require_connection()
     await store.init_scripts()
     return store
 

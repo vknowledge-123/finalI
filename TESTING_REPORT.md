@@ -1,9 +1,77 @@
 # Integration Test Report
 
-Date: 2026-09-10
+Date: 2026-09-16
 
-Final result: **197 tests passed**, 9 deprecation warnings, in 65.86 seconds.
-Python compilation passed. No live orders were placed.
+Latest complete suite: **210 tests passed**, no failures or skips, 10 deprecation
+warnings. Python compilation and syntax checks for all four shell scripts passed.
+No live orders were placed. The production VMs were not changed.
+
+## Redis Startup Diagnostics Follow-up
+
+The reported production startup error hid the original Redis failure and included
+the password-bearing connection URL. API startup/lazy initialization, service
+bootstrap and the daily cleanup command now use a five-second connection check
+with credential-free error codes for authentication, permissions, loading,
+connection failures and timeouts. Failure still prevents startup; there is no
+production in-memory fallback. Three regressions cover error classification and
+traceback redaction, success/false PING, and cancellation propagation. The complete
+suite passed in 22.10 seconds. The actual VM Redis failure remains undiagnosed until
+its service status and configured-credential connection check are available.
+
+## Resumed Integration Pass
+
+- Fixed dashboard tick handling so valid live prices update the stored browser
+  snapshot, row P&L and aggregate open-position P&L. Previously the row could show
+  a new LTP alongside stale P&L and restore an old price on rendering.
+- Removed the tick handler's independent continuous trailing-stop calculation.
+  It now displays the backend stop rather than silently overriding step-wise or
+  custom strategy stops. Invalid/nonpositive tick prices are ignored.
+- Fixed clipped navigation text by allowing the header to wrap and take its
+  natural height. Removed malformed HTML inside its CSS. Backtest fields now
+  wrap into fewer columns instead of clipping the date controls.
+- Completed the previously unfinished browser harness: use valid Cost SL inputs,
+  check the actual API save-response schema, and open the mobile menu before
+  clicking Configure Alert. These were test-fixture failures, not broker failures.
+- Isolated production entry-guard tests from live instrument-master downloads.
+- Added a Redis Lua regression confirming that a stale update cannot reopen the
+  same CLOSED trade, a new trade ID can open, and JSON arrays/objects retain types.
+
+Real headless Chrome / Playwright checks passed at 1440x1000, 768x1024 and 390x844:
+configuration save/GET/reload, CNC/fixed quantity, Cost SL, TSL and alert-exit toggle
+round trips, real local WebSocket tick delivery, LTP/P&L display, preservation of
+the backend trailing stop, and CLOSED position display without a square-off button.
+No browser page errors were reported. Screenshots were inspected; header bounds
+and document width are also asserted. The test server uses in-memory storage and
+synthetic positions, disables admin gating only for this UI harness, and shuts
+down after the run. Admin password/TOTP gating has separate API integration tests.
+
+Other passing suites cover Dhan packet parsing/subscription/recovery, cancelled
+jobs and dispatch guards, order/partial-fill/cancellation handling, reconciliation,
+sector cache, alert filtering, risk/exit behavior, custom strategies, backtests,
+and API/frontend contracts. This is coverage of the named test cases, not an
+exhaustive test of every possible feature combination.
+
+The Dhan feed contracts were compared with the official
+[live market feed documentation](https://dhanhq.co/docs/v2/live-market-feed/)
+and the pinned [Python SDK v2.2.0 source](https://github.com/dhan-oss/DhanHQ-py/tree/v2.2.0).
+These document segment/security-ID routing, binary packet layouts, subscription
+batching and v2 disconnect. Broker transport is simulated in the contract tests.
+
+Optional browser test (Chrome installed, run from the repository root):
+
+```bash
+python -m pip install playwright==1.62.0
+PYTHONPATH=. python tests/browser_smoke.py
+```
+
+Pyflakes scanned application and test Python files: no undefined names reported.
+Existing unused imports/locals and a duplicate helper remain. The 10 pytest
+warnings are FastAPI lifecycle and Dhan SDK datetime deprecations, not test errors.
+
+## Previously Implemented Reliability Fixes
+
+The sections below document fixes retained from the earlier passes and exercised
+again by the current suite; they are not all new changes from this resumed run.
 
 ## Execution And Subscription Reliability Follow-up
 
@@ -47,8 +115,8 @@ persistence, Redis transaction concurrency, wrong-owner Lua lock operations,
 stock/index collisions, off-loop parsing and bounded subscription retries.
 Redis tests used fakeredis 2.38.0 with Lua support and the pinned redis-py 5.0.8.
 WSL could not start because virtualization is unavailable, so no real Redis server
-or Linux process-failure test was run here. Existing FastAPI/frontend Node DOM
-contract tests passed; these are not real-browser visual tests.
+or Linux process-failure test was run here. FastAPI/frontend Node DOM contract
+tests and the real-browser checks described above passed.
 
 Test dependencies are in requirements-test.txt (not needed on the production VM).
 Run in test mode with:
@@ -145,10 +213,10 @@ and [Dhan live market feed](https://dhanhq.co/docs/v2/live-market-feed/).
 
 ## Limits
 
-These checks do not prove that every feature is bug-free. Real-browser discovery
-returned no available browser, so desktop/mobile layout, clipboard behavior and
-visual interaction were not verified in a browser. DOM doubles do not replace
-those checks.
+These checks do not prove that every feature is bug-free. Browser coverage is
+limited to the flows listed above. Clipboard permissions on public HTTP/HTTPS,
+real broker login redirects, physical mobile devices and other browser engines
+were not verified by the browser harness.
 
 Redis/systemd/nginx and the five deployed server processes were not exercised
 together. Broker transport, order states and storage are simulated in the tests;

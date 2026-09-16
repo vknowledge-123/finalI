@@ -526,8 +526,7 @@ async def ensure_store_ready():
                 print(f"⚠️  Encryption initialization failed: {exc}")
                 encryption_manager = None
         store = RedisStore(REDIS_URL, encryption_manager)
-        if not await store.ping():
-            raise RuntimeError(f"Redis is not reachable at {REDIS_URL}")
+        await store.require_connection()
         await store.init_scripts()
 
     auth_service = AuthService(store)
@@ -1846,8 +1845,7 @@ async def startup():
     
     # Initialize Redis store with encryption
     store = RedisStore(REDIS_URL, encryption_manager)
-    if not await store.ping():
-        raise RuntimeError(f"Redis is not reachable at {REDIS_URL}")
+    await store.require_connection()
     await store.init_scripts()
     
     # Initialize auth service

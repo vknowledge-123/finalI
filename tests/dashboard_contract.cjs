@@ -16,6 +16,7 @@ const context = vm.createContext({
   console: {log() {}, error() {}, warn() {}}, URLSearchParams, URL, Date, Number, String,
   setTimeout: () => 1, clearTimeout() {}, setInterval: () => 1, clearInterval() {},
   location: {search: '', protocol: 'http:', host: 'localhost'},
+  WebSocket: class {constructor(url) {this.url = url;}},
   window: {location: {href: ''}, addEventListener() {}}, navigator: {},
   document: {getElementById: id => elements[id] || null, createElement: () => element(),
     addEventListener() {}, querySelectorAll() {return [];}, body: element()},
@@ -44,6 +45,17 @@ const run = code => vm.runInContext(code, context);
   run(`POS_SNAPSHOT.SBIN={symbol:'SBIN',status:'OPEN',qty:1};`);
   await context.refreshPositions();
   assert.equal(run('Object.keys(POS_SNAPSHOT).length'), 0); checks++;
+  run(`startWS(); POS_MAP.SBIN={symbol:'SBIN',status:'OPEN',qty:2,side:'BUY',entry_price:100,
+    realized_pnl:3,trail_price:99,tsl_pct:1,tsl_stepwise:true,strategy_mode:'CLASSIC'};
+    WS.onmessage({data:JSON.stringify({type:'tick',symbol:'SBIN',ltp:101.5,close:100})});`);
+  assert.equal(run('POS_MAP.SBIN.ltp'), 101.5);
+  assert.equal(run('POS_MAP.SBIN.pnl'), 6);
+  assert.equal(run('POS_SNAPSHOT.SBIN.pnl'), 6);
+  assert.equal(run('POS_MAP.SBIN.trail_price'), 99); checks++;
+  run(`POS_MAP.SBIN.side='SELL'; WS.onmessage({data:JSON.stringify({type:'tick',symbol:'SBIN',ltp:99,close:100})});`);
+  assert.equal(run('POS_MAP.SBIN.pnl'), 5); checks++;
+  run(`WS.onmessage({data:JSON.stringify({type:'tick',symbol:'SBIN',ltp:'bad'})});`);
+  assert.equal(run('POS_MAP.SBIN.ltp'), 99); checks++;
   const key = Object.keys(fixture.configs.configs)[0];
   await context.fillCfg(key);
   assert.equal(String(elements.cfg_tsl_on.value), 'false');

@@ -135,6 +135,17 @@ class RedisQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.store.redis.llen(ALERT_QUEUE), 1)
         self.assertTrue(await self.store.get_recent_alerts(1))
 
+    async def test_terminal_position_lua_rejects_stale_reopen_and_preserves_json(self):
+        closed = {"trade_id": "T1", "status": "CLOSED", "qty": 0, "fills": [], "checks": {}}
+        await self.store.upsert_position(1, "SBIN", closed)
+        with self.assertRaisesRegex(RuntimeError, "STALE_POSITION_REOPEN"):
+            await self.store.upsert_position(1, "SBIN", dict(closed, status="OPEN", qty=2))
+        stored = await self.store.get_position(1, "SBIN")
+        self.assertEqual(stored, dict(closed, symbol="SBIN"))
+        new_trade = dict(closed, trade_id="T2", status="OPEN", qty=3)
+        await self.store.upsert_position(1, "SBIN", new_trade)
+        self.assertEqual(await self.store.get_position(1, "SBIN"), dict(new_trade, symbol="SBIN"))
+
     async def test_webhook_queue_execution_updates_same_dashboard_row(self):
         import httpx
         from app import alert_service
