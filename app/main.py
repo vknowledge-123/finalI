@@ -58,8 +58,8 @@ from .custom_strategy import (
 from .websocket_manager import WebSocketManager
 from .stock_sector import SECTOR_INDEX_INSTRUMENTS, STOCK_INDEX_MAPPING
 from .dhan_broker import DHAN_INSTRUMENTS, DhanContext, DhanFeedService, MarketFeed, dhanhq
-from .backtest import run_custom_strategy_backtest
 from .services.runtime import ServiceRuntime
+from .kite_broker import KiteCallbackQueue
 from .service_queues import MARKET_SUBSCRIPTION_QUEUE
 from .auth import AuthService
 from .middleware import AuthMiddleware, get_current_user, SecurityHeadersMiddleware
@@ -341,7 +341,7 @@ async def _verify_admin_password(email: str, password: str) -> bool:
     stored_email = _normalise_admin_email(str(admin.get("email") or ""))
     if not stored_email or _normalise_admin_email(email) != stored_email:
         return False
-    return _verify_password(password, str(admin.get("password_hash") or ""))
+    return await asyncio.to_thread(_verify_password, password, str(admin.get("password_hash") or ""))
 
 
 def _totp_uri(email: str, secret: str) -> str:
@@ -502,6 +502,7 @@ auth_service = None
 
 # Engines per user
 ENGINE: Dict[int, TradeEngine] = {}
+ENGINE_INIT_LOCKS: Dict[int, asyncio.Lock] = {}
 SERVICE_RUNTIME: Optional[ServiceRuntime] = None
 DAILY_DASHBOARD_CLEANUP_TASK: Optional[asyncio.Task] = None
 _LAST_DASHBOARD_CLEANUP_YMD: str = ""
@@ -552,6 +553,7 @@ async def ensure_app_state_middleware(request: Request, call_next):
 KT: Optional[KiteTicker] = None
 KT_CONNECTED: bool = False
 KT_TASK: Optional[asyncio.Future] = None
+KT_DELIVERY: Optional[KiteCallbackQueue] = None
 KT_LOCK = asyncio.Lock()
 
 KT_USER_ID: Optional[int] = None
@@ -613,7 +615,7 @@ async def _load_shared_feed_connected(user_id: int, broker: str) -> Tuple[bool, 
         health = await store.load_broker_feed_health(int(user_id), broker)
     except Exception as exc:
         health = {"connected": False, "reason": f"BROKER_FEED_HEALTH_ERROR:{exc}"}
-    age = float(health.get("age_sec", 999999.0) or 999999.0)
+    age = float(health["age_sec"] if health.get("age_sec") is not None else 999999.0)
     return bool(health.get("connected", False)) and age <= 15.0, health
 
 
@@ -914,7 +916,7 @@ async def is_session_valid(user_id: int) -> bool:
 
     try:
         kite = _kite_client(api_key, at)
-        kite.profile()  # validates access_token
+        await asyncio.to_thread(kite.profile)
         _SESSION_CACHE[user_id] = {"ok": True, "ts": now}
         return True
     except Exception:
@@ -931,24 +933,26 @@ async def is_session_valid(user_id: int) -> bool:
 async def ensure_engine(user_id: int) -> TradeEngine:
     user_id = int(user_id)
     app_store = await ensure_store_ready()
-    if user_id not in ENGINE:
-        ENGINE[user_id] = TradeEngine(
+    async with ENGINE_INIT_LOCKS.setdefault(user_id, asyncio.Lock()):
+        if user_id in ENGINE:
+            return ENGINE[user_id]
+        engine = TradeEngine(
             user_id=user_id,
             store=app_store,
             broadcast_cb=ws_mgr.broadcast_nowait,
             token_resolver=lambda symbol: SYMBOL_TOKEN.get(_sym_safe(symbol)),
             token_ready_cb=_ensure_token_map_ready,
         )
-        await ENGINE[user_id].configure_kite()
         try:
+            await engine.configure_kite()
             cache = await app_store.load_sector_cache(user_id)
             if cache:
-                ENGINE[user_id].load_sector_cache(cache)
-        except Exception:
-            pass
-
-        # ✅ Restore open positions after restart
-        restored = await ENGINE[user_id].rehydrate_open_positions()
+                engine.load_sector_cache(cache)
+            restored = await engine.rehydrate_open_positions()
+        except BaseException:
+            await engine.close()
+            raise
+        ENGINE[user_id] = engine
         if restored:
             # ✅ Ensure ticks come for these symbols
             asyncio.create_task(subscribe_symbols_for_user(user_id, restored))
@@ -1066,7 +1070,7 @@ async def build_symbol_token_map_from_kite(user_id: int) -> bool:
         kite.set_access_token(access_token)
 
         print("[INSTR] Downloading NSE instruments...")
-        all_instruments = kite.instruments("NSE")
+        all_instruments = await asyncio.to_thread(kite.instruments, "NSE")
 
         if not all_instruments:
             print("[INSTR] ❌ No instruments returned from Kite")
@@ -1415,7 +1419,7 @@ async def subscribe_symbols_for_user(user_id: int, symbols: List[str]) -> Option
 # KiteTicker start / restart
 # -----------------------------
 async def _stop_kite_ticker() -> None:
-    global KT, KT_CONNECTED, KT_TASK, KT_USER_ID, KT_ACCESS_TOKEN
+    global KT, KT_CONNECTED, KT_TASK, KT_USER_ID, KT_ACCESS_TOKEN, KT_DELIVERY
     old_user_id = KT_USER_ID
     try:
         if KT is not None:
@@ -1424,6 +1428,9 @@ async def _stop_kite_ticker() -> None:
             except Exception:
                 pass
     finally:
+        if KT_DELIVERY is not None:
+            await KT_DELIVERY.close()
+            KT_DELIVERY = None
         if old_user_id is not None:
             _save_feed_health_nowait(int(old_user_id), "ZERODHA", False, "stopped")
         KT = None
@@ -1607,7 +1614,7 @@ async def start_kite_ticker(user_id: int) -> None:
     Starts a single KiteTicker (threaded=True) and routes ticks back into FastAPI loop.
     Uses MODE_FULL for OHLC + quantities.
     """
-    global KT, KT_TASK, KT_CONNECTED, KT_USER_ID, KT_ACCESS_TOKEN
+    global KT, KT_TASK, KT_CONNECTED, KT_USER_ID, KT_ACCESS_TOKEN, KT_DELIVERY
 
     if _is_test_mode():
         return
@@ -1636,6 +1643,14 @@ async def start_kite_ticker(user_id: int) -> None:
         KT_USER_ID = user_id
         KT_ACCESS_TOKEN = access_token
 
+        async def on_tick_overflow():
+            log.error("ZERODHA_TICK_QUEUE_OVERFLOW | user=%s entries_blocked=1", user_id)
+            await store.set_kill(user_id, True)
+            await store.save_broker_feed_health(user_id, "ZERODHA", False, ttl_sec=15, detail="tick_queue_overflow")
+
+        delivery = KiteCallbackQueue(on_tick_overflow)
+        KT_DELIVERY = delivery
+
         def on_connect(ws, response):
             global KT_CONNECTED
             KT_CONNECTED = True
@@ -1658,16 +1673,15 @@ async def start_kite_ticker(user_id: int) -> None:
             print("[KT] error", code, reason)
 
         def on_ticks(ws, ticks):
-            if ticks:
-                 # Debug: print first few tokens to verify we get data
-                 sample = [t.get('instrument_token') for t in ticks[:3]]
-                 # print(f"[KT] TICKS RECEIVED: {len(ticks)} sample={sample}")
-
+            received_at = time.time()
             loop = APP_LOOP
             if loop is None:
                 return
 
             async def _handle():
+                if time.time() - received_at > 5:
+                    log.warning("ZERODHA_STALE_TICK_BATCH | user=%s", user_id)
+                    return
                 eng = await ensure_engine(user_id)
 
                 for t in ticks or []:
@@ -1696,6 +1710,7 @@ async def start_kite_ticker(user_id: int) -> None:
                             {
                                 "broker": "ZERODHA",
                                 "source": "ZERODHA_WS",
+                                "received_at": received_at,
                                 "ltp": ltp,
                                 "close": close,
                                 "high": high,
@@ -1738,7 +1753,7 @@ async def start_kite_ticker(user_id: int) -> None:
                     except Exception as e:
                         print("[KT] tick handle error:", e)
 
-            asyncio.run_coroutine_threadsafe(_handle(), loop)
+            delivery.submit(_handle)
 
         kt.on_connect = on_connect
         kt.on_close = on_close
@@ -1944,6 +1959,7 @@ async def shutdown() -> None:
         except Exception:
             pass
     ENGINE.clear()
+    ENGINE_INIT_LOCKS.clear()
     if store is not None:
         try:
             await store.close()
@@ -2135,7 +2151,8 @@ async def admin_setup(payload: Dict[str, Any]) -> Dict[str, Any]:
     fn = getattr(store, "save_admin_auth", None)
     if not callable(fn):
         return {"ok": False, "error": "ADMIN_AUTH_STORE_UNAVAILABLE"}
-    await fn(email, _hash_password(password))
+    if not await fn(email, await asyncio.to_thread(_hash_password, password)):
+        return {"ok": False, "error": "ADMIN_ALREADY_CONFIGURED"}
     log.warning("ADMIN_CREATED | email=%s", email)
     return {"ok": True, "mode": "SETUP_TOTP"}
 
@@ -2632,7 +2649,7 @@ async def zerodha_callback(request: Request, user_id: Optional[int] = None):
         return RedirectResponse(url=f"/dashboard?user_id={user_id}")
 
     kite = KiteConnect(api_key=api_key)
-    data = kite.generate_session(request_token.strip(), api_secret=api_secret)
+    data = await asyncio.to_thread(kite.generate_session, request_token.strip(), api_secret=api_secret)
     access_token = str(data.get("access_token") or "").strip()
 
     await store.save_access_token(user_id, access_token)
@@ -3119,16 +3136,27 @@ async def run_backtest_api(payload: Dict[str, Any]) -> Dict[str, Any]:
             "interval": interval,
         }
 
-    result = run_custom_strategy_backtest(
-        candles,
-        strategy_mode,
-        {**payload, "_required_candles": required_candles, "_warmup_days": warmup_days},
-        symbol=symbol,
-        from_dt=from_dt,
-        to_dt=to_dt,
-        qty=int(payload.get("qty", 1) or 1),
-        capital=float(payload.get("capital", 0) or 0),
-    )
+    runtime = await ensure_service_runtime()
+    try:
+        result = await runtime.backtests.run_custom_strategy(
+            candles,
+            strategy_mode,
+            {**{key: value for key, value in payload.items() if key != "candles"},
+             "_required_candles": required_candles, "_warmup_days": warmup_days},
+            symbol=symbol,
+            from_dt=from_dt,
+            to_dt=to_dt,
+            qty=int(payload.get("qty", 1) or 1),
+            capital=float(payload.get("capital", 0) or 0),
+        )
+    except RuntimeError as exc:
+        if str(exc) == "BACKTEST_BUSY":
+            return JSONResponse(status_code=429, content={"error": "BACKTEST_BUSY"})
+        raise
+    except ValueError as exc:
+        if str(exc) == "BACKTEST_TOO_MANY_CANDLES":
+            return JSONResponse(status_code=400, content={"error": "BACKTEST_TOO_MANY_CANDLES"})
+        raise
     return {"status": "ok", "result": result}
 
 

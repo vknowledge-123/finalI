@@ -1,6 +1,6 @@
 # app/auth.py
 from typing import Optional, Dict, Any
-from datetime import datetime
+import asyncio
 import logging
 from .models import User, OTP, Session
 from .redis_store import RedisStore
@@ -39,7 +39,7 @@ class AuthService:
         await self.store.save_otp(email, otp)
         
         # Send email
-        email_sent = email_service.send_otp(email, otp.code)
+        email_sent = await asyncio.to_thread(email_service.send_otp, email, otp.code)
         
         if email_sent:
             logger.info("\033[93m📩 OTP SENT │ EMAIL=%s\033[0m", email) # For debugging - remove in production
@@ -49,12 +49,11 @@ class AuthService:
                 "email": email
             }
         else:
-            # If email fails, return OTP in response for development
+            await self.store.delete_otp(email)
             return {
-                "status": "success",
-                "message": "Email service unavailable. Use this code for testing:",
+                "status": "error",
+                "message": "Unable to send verification email. Please try again later.",
                 "email": email,
-                "otp_code": otp.code  # Only for development!
             }
     
     async def verify_otp_and_login(self, email: str, otp_code: str) -> Optional[Dict[str, Any]]:

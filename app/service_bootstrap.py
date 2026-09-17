@@ -66,25 +66,27 @@ class EngineRegistry:
     def __init__(self, store: RedisStore) -> None:
         self.store = store
         self.engines: Dict[int, TradeEngine] = {}
+        self._init_locks: Dict[int, asyncio.Lock] = {}
 
     async def get(self, user_id: int) -> TradeEngine:
         uid = int(user_id)
-        engine = self.engines.get(uid)
-        if engine is None:
+        async with self._init_locks.setdefault(uid, asyncio.Lock()):
+            engine = self.engines.get(uid)
+            if engine is not None:
+                await engine.configure_broker()
+                return engine
             engine = TradeEngine(uid, self.store)
-            self.engines[uid] = engine
-            await engine.configure_broker()
             try:
+                await engine.configure_broker()
                 cache = await self.store.load_sector_cache(uid)
                 if cache:
                     engine.load_sector_cache(cache)
-            except Exception:
-                pass
-            try:
                 await engine.rehydrate_open_positions()
-            except Exception as exc:
-                log.warning("Position rehydrate failed | user=%s err=%s", uid, exc)
-        return engine
+            except BaseException:
+                await engine.close()
+                raise
+            self.engines[uid] = engine
+            return engine
 
     async def close(self) -> None:
         for engine in list(self.engines.values()):
@@ -93,6 +95,7 @@ class EngineRegistry:
             except Exception:
                 pass
         self.engines.clear()
+        self._init_locks.clear()
 
 
 async def wait_for_shutdown() -> None:

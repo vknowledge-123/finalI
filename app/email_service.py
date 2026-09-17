@@ -72,7 +72,7 @@ class EmailService:
             msg.attach(html_part)
             
             # Send email
-            with smtplib.SMTP(self.smtp_host, self.smtp_port) as server:
+            with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=10) as server:
                 server.starttls()
                 server.login(self.smtp_user, self.smtp_password)
                 server.send_message(msg)

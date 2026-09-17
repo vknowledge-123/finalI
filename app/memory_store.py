@@ -140,6 +140,8 @@ class InMemoryStore:
     # Admin app authentication
     # -------------------------
     async def save_admin_auth(self, email: str, password_hash: str) -> Dict[str, Any]:
+        if self._admin_auth:
+            return {}
         self._admin_auth = {
             "email": str(email or "").strip().lower(),
             "password_hash": str(password_hash or "").strip(),

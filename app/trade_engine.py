@@ -19,6 +19,7 @@ from kiteconnect import KiteConnect  # type: ignore
 from .redis_store import RedisStore, norm_alert_name, norm_symbol
 from .alert_features import alert_time, breakout_level, enabled as feature_enabled
 from .breakout_state import config_signature, waiting_result
+from .kite_broker import place_protected_order, normalize_holdings as normalize_kite_holdings
 from .stock_sector import SECTOR_INDEX_INSTRUMENTS, STOCK_INDEX_MAPPING
 import os 
 import re
@@ -189,7 +190,7 @@ def _normalize_order_status(value: Any) -> str:
         return "PARTIAL"
     if status in {"OPEN", "PENDING", "TRANSIT", "VALIDATION_PENDING", "PUT_ORDER_REQ_RECEIVED"}:
         return "PENDING"
-    if status in {"CANCELLED", "CANCELED"}:
+    if status in {"CANCELLED", "CANCELED", "EXPIRED"}:
         return "CANCELLED"
     if status in {"REJECTED", "FAILED"}:
         return "REJECTED"
@@ -250,13 +251,14 @@ def _normalize_order_snapshot(data: Any) -> Dict[str, Any]:
     order_id = _order_field(raw, "order_id", "orderId", "orderNo", "orderIdStr")
     status = _normalize_order_status(_order_field(raw, "status", "orderStatus", "order_status"))
     traded_qty = _order_int(raw, "filledQty", "filledQuantity", "tradedQuantity", "tradedQty", "TradedQty", "filled_qty", "filled_quantity")
+    explicit_fill = _order_field(raw, "filledQty", "filledQuantity", "tradedQuantity", "tradedQty", "filled_qty", "filled_quantity") is not None
     qty = _order_int(raw, "quantity", "Quantity", "orderQuantity", "qty")
-    remaining = _order_field(raw, "remainingQuantity", "remaining_qty", "pendingQuantity")
+    remaining = _order_field(raw, "remainingQuantity", "remaining_qty", "pendingQuantity", "pending_quantity")
     remaining_qty = int(float(remaining if remaining not in (None, "") else max(0, qty - traded_qty)))
-    if traded_qty <= 0 and qty > 0 and remaining_qty >= 0 and qty >= remaining_qty:
+    if not explicit_fill and status not in {"REJECTED", "CANCELLED"} and qty > 0 and 0 <= remaining_qty <= qty:
         traded_qty = qty - remaining_qty
     avg_price = _order_float(raw, "average_price", "averagePrice", "averageTradedPrice", "avgTradedPrice", "tradedPrice", "TradedPrice", "price")
-    if status == "COMPLETE" and traded_qty <= 0 and qty > 0 and avg_price > 0:
+    if not explicit_fill and status == "COMPLETE" and traded_qty <= 0 and qty > 0 and avg_price > 0:
         traded_qty = qty
         remaining_qty = 0
     return {
@@ -405,6 +407,8 @@ def _order_rejection_reason(snapshot: Dict[str, Any]) -> str:
             raw if isinstance(raw, dict) else {},
             "omsErrorDescription",
             "oms_error_description",
+            "status_message",
+            "status_message_raw",
             "rejectionReason",
             "rejection_reason",
             "errorMessage",
@@ -417,8 +421,6 @@ def _order_rejection_reason(snapshot: Dict[str, Any]) -> str:
 
 def _is_retryable_order_rejection(reason: str) -> bool:
     text = str(reason or "").lower()
-    if "market" in text and "protection" in text:
-        return True
     fatal_words = (
         "insufficient",
         "fund",
@@ -448,7 +450,7 @@ def _is_retryable_order_rejection(reason: str) -> bool:
         "timeout",
         "temporary",
     )
-    return not text or any(word in text for word in retry_words)
+    return bool(text) and any(word in text for word in retry_words)
 
 
 def _nested_number(data: Any, keys: Tuple[str, ...]) -> float:
@@ -1080,30 +1082,26 @@ class TradeEngine:
         await self.configure_broker()
 
     async def configure_broker(self) -> None:
-        try:
-            self.broker = await self.store.load_broker(self.user_id)
-        except Exception:
-            self.broker = "ZERODHA"
+        previous = (self.broker, self.api_key, self.access_token, self.dhan_client_id, self.dhan_access_token)
+        broker = await self.store.load_broker(self.user_id)
 
         creds = await self.store.load_credentials(self.user_id)
         api_key = (creds.get("api_key") or "").strip()
 
-        token = ""
-        try:
-            token = (await self.store.load_access_token(self.user_id)).strip()
-        except Exception:
-            token = ""
+        token = (await self.store.load_access_token(self.user_id)).strip()
 
         if not token:
             token = (creds.get("access_token") or "").strip()
 
+        dhan_creds = await self.store.load_dhan_credentials(self.user_id)
+        self.broker = broker
         self.api_key = api_key
         self.access_token = token
-        dhan_creds = await self.store.load_dhan_credentials(self.user_id)
         self.dhan_client_id = str(dhan_creds.get("client_id") or "").strip()
         self.dhan_access_token = str(dhan_creds.get("access_token") or "").strip()
-        self.kite = None
-        self.dhan = None
+        if previous != (self.broker, self.api_key, self.access_token, self.dhan_client_id, self.dhan_access_token):
+            self.kite = None
+            self.dhan = None
 
         await self.order_worker.start()
         self._ensure_pnl_exit_monitor_started()
@@ -1240,7 +1238,9 @@ class TradeEngine:
 
     async def _broker_holdings(self) -> List[Dict[str, Any]]:
         if self.broker != "DHAN":
-            return []
+            if not await self._ensure_kite_ready() or not self.kite:
+                raise RuntimeError("ZERODHA_NOT_CONNECTED")
+            return normalize_kite_holdings(await self.market_data_worker.submit(self.kite.holdings))
         if not await self._ensure_dhan_ready() or not self.dhan:
             raise RuntimeError("DHAN_NOT_CONNECTED")
         holdings_fn = getattr(self.dhan, "get_holdings", None)
@@ -1258,15 +1258,13 @@ class TradeEngine:
             return []
 
         holdings_by_symbol: Dict[str, Dict[str, Any]] = {}
-        holdings_loaded = False
+        delivery_positions = None
         try:
             holdings = await self._broker_holdings()
             holdings_by_symbol = {norm_symbol(row.get("tradingsymbol", "")): row for row in holdings}
-            holdings_loaded = True
         except Exception as e:
             log.warning("CNC_HOLDINGS_FETCH_FAIL | user=%s err=%s", self.user_id, e)
-            if self.broker == "DHAN":
-                return []
+            return []
 
         restored: List[str] = []
         for row in carry_rows or []:
@@ -1275,14 +1273,25 @@ class TradeEngine:
                 if not sym:
                     continue
                 holding = holdings_by_symbol.get(sym) if holdings_by_symbol else None
-                if holdings_loaded and not holding:
-                    delete_fn = getattr(self.store, "delete_cnc_carry_position", None)
-                    if callable(delete_fn):
-                        await delete_fn(self.user_id, sym)
-                    await self.store.clear_open(self.user_id, sym)
-                    continue
+                if not holding:
+                    # Today's delivery purchases can still be in positions.
+                    # Absence from holdings alone is not evidence of a sale.
+                    if delivery_positions is None:
+                        book = await self._broker_positions()
+                        delivery_positions = {
+                            norm_symbol(p.get("tradingsymbol", "")): p
+                            for p in book.get("net", [])
+                            if str(p.get("product") or "").upper() == "CNC"
+                            and int(p.get("quantity") or 0) > 0
+                        }
+                    holding = delivery_positions.get(sym)
+                    if not holding:
+                        log.warning("CNC_CARRY_UNCONFIRMED | user=%s symbol=%s record_preserved=1", self.user_id, sym)
+                        continue
 
-                qty = int((holding or {}).get("quantity") or row.get("qty") or 0)
+                # Holdings may include manually bought shares. Never adopt more
+                # than this strategy's persisted ownership.
+                qty = min(int(holding["quantity"]), int(row.get("qty") or 0)) if holding else int(row.get("qty") or 0)
                 if qty <= 0:
                     continue
                 avg = float((holding or {}).get("average_price") or 0.0)
@@ -1295,7 +1304,7 @@ class TradeEngine:
                 data["product"] = "CNC"
                 data["qty"] = qty
                 data["status"] = "OPEN"
-                if avg > 0:
+                if avg > 0 and not data.get("entry_price"):
                     data["entry_price"] = avg
                 if not data.get("trade_id"):
                     data["trade_id"] = f"cnc-{sym}-{int(time.time())}"
@@ -1576,7 +1585,7 @@ class TradeEngine:
                 await self.store._lock_leases.verify_current()
             response = await self.order_worker.submit(
                 self.dhan.place_order,
-                _before_send=self.store._lock_leases.submission_guard() if hasattr(self.store, "_lock_leases") else None,
+                _before_send=self._submission_guard(cfg),
                 security_id=str(security_id),
                 exchange_segment=exchange_segment,
                 transaction_type=self.dhan.BUY if side == "BUY" else self.dhan.SELL,
@@ -1603,8 +1612,9 @@ class TradeEngine:
         if hasattr(self.store, "_lock_leases"):
             await self.store._lock_leases.verify_current()
         response = await self.order_worker.submit(
-            self.kite.place_order,
-            _before_send=self.store._lock_leases.submission_guard() if hasattr(self.store, "_lock_leases") else None,
+            place_protected_order,
+            self.kite,
+            _before_send=self._submission_guard(cfg),
             variety="regular",
             exchange="NSE",
             tradingsymbol=str(symbol),
@@ -1617,6 +1627,19 @@ class TradeEngine:
         if isinstance(response, dict):
             ensure_no_broker_error(response, "ZERODHA_PLACE_ORDER_REJECTED")
         return response
+
+    def _submission_guard(self, cfg):
+        lease_guard = self.store._lock_leases.submission_guard() if hasattr(self.store, "_lock_leases") else None
+        async def check():
+            if lease_guard:
+                await lease_guard()
+            deadline = (cfg or {}).get("_breakout_deadline")
+            if deadline is not None:
+                if time.time() >= float(deadline):
+                    raise RuntimeError("BREAKOUT_TTL_EXPIRED")
+                if await self.store.is_kill(self.user_id):
+                    raise RuntimeError("KILL_SWITCH")
+        return check
 
     def _order_confirm_settings(self, cfg: Optional[Dict[str, Any]] = None) -> Tuple[float, int]:
         cfg = cfg or {}
@@ -1664,11 +1687,16 @@ class TradeEngine:
 
     async def _fetch_dhan_order_list_snapshot(self, order_id: str) -> Dict[str, Any]:
         order_id = str(order_id or "").strip()
-        if self.broker != "DHAN" or not order_id:
+        if not order_id:
             return {}
-        if not await self._ensure_dhan_ready() or not self.dhan:
-            return {}
-        fn = getattr(self.dhan, "get_order_list", None)
+        if self.broker == "DHAN":
+            if not await self._ensure_dhan_ready() or not self.dhan:
+                return {}
+            fn = getattr(self.dhan, "get_order_list", None)
+        else:
+            if not await self._ensure_kite_ready() or not self.kite:
+                return {}
+            fn = getattr(self.kite, "orders", None)
         if not callable(fn):
             return {}
         try:
@@ -1684,11 +1712,16 @@ class TradeEngine:
 
     async def _fetch_dhan_trade_snapshot(self, order_id: str) -> Dict[str, Any]:
         order_id = str(order_id or "").strip()
-        if self.broker != "DHAN" or not order_id:
+        if not order_id:
             return {}
-        if not await self._ensure_dhan_ready() or not self.dhan:
-            return {}
-        fn = getattr(self.dhan, "get_trade_book", None)
+        if self.broker == "DHAN":
+            if not await self._ensure_dhan_ready() or not self.dhan:
+                return {}
+            fn = getattr(self.dhan, "get_trade_book", None)
+        else:
+            if not await self._ensure_kite_ready() or not self.kite:
+                return {}
+            fn = getattr(self.kite, "order_trades", None)
         if not callable(fn):
             return {}
         try:
@@ -1714,14 +1747,14 @@ class TradeEngine:
         side = ""
         for row in rows:
             qty = _order_int(row, "tradedQuantity", "tradedQty", "filledQuantity", "quantity", "qty")
-            price = _order_float(row, "tradedPrice", "averagePrice", "avgTradedPrice", "price")
+            price = _order_float(row, "tradedPrice", "averagePrice", "average_price", "avgTradedPrice", "price")
             filled_qty += max(0, qty)
             if qty > 0 and price > 0:
                 value += qty * price
             if not symbol:
                 symbol = norm_symbol(str(_order_field(row, "tradingSymbol", "tradingsymbol", "symbol") or ""))
             if not side:
-                side = str(_order_field(row, "transactionType", "txnType", "side") or "").upper()
+                side = str(_order_field(row, "transactionType", "transaction_type", "txnType", "side") or "").upper()
         avg_price = value / filled_qty if filled_qty > 0 and value > 0 else 0.0
         return {
             "order_id": order_id,
@@ -1770,7 +1803,8 @@ class TradeEngine:
         base_snapshot: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Dict[str, Any], Optional[int]]:
         snapshot: Dict[str, Any] = dict(base_snapshot or {})
-        if self.broker != "DHAN":
+        if (snapshot.get("status") == "COMPLETE" and int(snapshot.get("filled_quantity") or 0) == requested_qty
+                and float(snapshot.get("average_price") or 0) > 0):
             return snapshot, before_qty
 
         order_book = await self._fetch_dhan_order_list_snapshot(order_id)
@@ -1790,21 +1824,15 @@ class TradeEngine:
                 if terminal:
                     snapshot["status"] = terminal
 
-        after_qty = await self._fetch_broker_symbol_qty(symbol)
-        if before_qty is not None and after_qty is not None:
-            delta = int(after_qty) - int(before_qty)
-            position_filled = delta if side == "BUY" else -delta
-            if position_filled > 0:
-                current_filled = int(snapshot.get("filled_quantity") or 0)
-                if position_filled > current_filled:
-                    snapshot["filled_quantity"] = min(int(requested_qty), int(position_filled))
+        # Account quantity changes may be manual or belong to another order.
+        # Only this order's status/trades can establish its executed quantity.
         filled = min(max(0, int(snapshot.get("filled_quantity") or 0)), int(requested_qty))
         if filled > 0:
             snapshot["filled_quantity"] = filled
             snapshot["remaining_quantity"] = max(0, int(requested_qty) - filled)
             if str(snapshot.get("status") or "").upper() in {"", "UNKNOWN", "PENDING", "PARTIAL"}:
                 snapshot["status"] = "COMPLETE" if int(snapshot["remaining_quantity"]) == 0 else "PARTIAL"
-        return snapshot, after_qty
+        return snapshot, before_qty
 
     async def _cancel_order_if_pending(self, order_id: str) -> bool:
         order_id = str(order_id or "").strip()
@@ -1865,7 +1893,6 @@ class TradeEngine:
         cfg: Optional[Dict[str, Any]] = None,
     ) -> OrderExecution:
         timeout_sec, pending_retries = self._order_confirm_settings(cfg)
-        needs_confirm = self.broker == "DHAN" or _as_bool((cfg or {}).get("confirm_order_execution"), False)
         attempts = 0
         last_snapshot: Dict[str, Any] = {}
         last_order_id = ""
@@ -1875,13 +1902,26 @@ class TradeEngine:
         total_filled = 0
         weighted_value = 0.0
         before_qty: Optional[int] = None
-        if self.broker == "DHAN" and not DHAN_INSTRUMENTS.is_index_symbol(symbol):
-            before_qty = await self._fetch_broker_symbol_qty(symbol)
 
         while attempts <= pending_retries and remaining_to_place > 0:
             attempts += 1
             attempt_qty = int(remaining_to_place)
-            placed = await self._place_order(symbol, side, attempt_qty, product, cfg)
+            try:
+                placed = await self._place_order(symbol, side, attempt_qty, product, cfg)
+            except Exception as exc:
+                if total_filled <= 0:
+                    raise
+                # A later retry failure must not discard already confirmed fills.
+                # Block new exposure until any uncertain retry is reconciled.
+                await self.store.set_kill(self.user_id, True)
+                log.error("ORDER_RETRY_FAILED_AFTER_FILL | user=%s symbol=%s filled=%s error=%s",
+                          self.user_id, symbol, total_filled, _safe_error(exc))
+                return OrderExecution(
+                    order_id=last_filled_order_id, symbol=norm_symbol(symbol), side=side,
+                    qty=total_filled, filled_qty=total_filled, status="PARTIAL",
+                    avg_price=weighted_value / total_filled if weighted_value > 0 else 0.0,
+                    remaining_qty=requested_total - total_filled, attempts=attempts,
+                )
             exec_symbol = norm_symbol(symbol)
             exec_side: Side = side
             exec_ltp = 0.0
@@ -1894,18 +1934,9 @@ class TradeEngine:
                 order_id = str(placed or "")
             last_order_id = order_id
 
-            if not needs_confirm:
-                return OrderExecution(
-                    order_id=order_id,
-                    symbol=exec_symbol,
-                    side=exec_side,
-                    qty=attempt_qty,
-                    status="COMPLETE",
-                    filled_qty=attempt_qty,
-                    remaining_qty=0,
-                    attempts=attempts,
-                    ltp=exec_ltp,
-                )
+            if not order_id:
+                await self.store.set_kill(self.user_id, True)
+                raise RuntimeError("ORDER_ID_MISSING_RECONCILE_REQUIRED")
 
             snapshot = await self._wait_for_order_execution(order_id, timeout_sec)
             snapshot, after_qty = await self._reconcile_dhan_execution_snapshot(
@@ -1950,15 +1981,18 @@ class TradeEngine:
                 )
 
             if status == "COMPLETE" or remaining_to_place <= 0:
+                if total_filled <= 0:
+                    await self.store.set_kill(self.user_id, True)
+                    raise RuntimeError(f"ORDER_COMPLETE_WITHOUT_FILL_RECONCILE_REQUIRED:{order_id}")
                 return OrderExecution(
                     order_id=last_filled_order_id or order_id,
                     symbol=exec_symbol or norm_symbol(str(snapshot.get("tradingsymbol") or symbol)),
                     side=exec_side,
                     qty=total_filled or filled_qty,
-                    status="COMPLETE",
+                    status="COMPLETE" if remaining_to_place <= 0 else "PARTIAL",
                     avg_price=(weighted_value / total_filled) if total_filled > 0 and weighted_value > 0 else avg_price,
                     filled_qty=total_filled or filled_qty,
-                    remaining_qty=0,
+                    remaining_qty=max(0, remaining_to_place),
                     attempts=attempts,
                     ltp=exec_ltp,
                 )
@@ -2114,7 +2148,7 @@ class TradeEngine:
                 except Exception:
                     latest = {}
 
-                age = float(latest.get("age_sec", 999999.0) or 999999.0)
+                age = float(latest["age_sec"] if latest.get("age_sec") is not None else 999999.0)
                 ltp = float(latest.get("ltp") or latest.get("last_price") or 0.0)
                 if ltp > 0 and age <= fresh_sec:
                     return True, "", ltp
@@ -2927,7 +2961,10 @@ class TradeEngine:
                     results.append({"symbol": sym, "status": "SKIPPED", "reason": "BREAKOUT_TTL_EXPIRED"})
                     continue
                 try:
-                    execution = await self._place_order_with_execution(sym, side, qty, cfg.product, cfg.custom_settings)
+                    execution_cfg = dict(cfg.custom_settings or {})
+                    if watch:
+                        execution_cfg["_breakout_deadline"] = watch["expires_at"]
+                    execution = await self._place_order_with_execution(sym, side, qty, cfg.product, execution_cfg)
                 except Exception as e:
                     results.append({"symbol": sym, "status": "ERROR", "reason": f"ORDER_FAIL:{_safe_error(e)}"})
                     continue
@@ -4144,6 +4181,15 @@ class TradeEngine:
             await self._exit_position(symbol, reason)
             return {"status": "EXIT_TRIGGERED", "symbol": symbol, "reason": reason, "source": "MEMORY"}
 
+        acquired = await self.store.acquire_lock(self.user_id, symbol, "exit", ttl_ms=5000)
+        if acquired != 1:
+            return {"status": "BUSY", "symbol": symbol, "reason": "EXIT_IN_PROGRESS"}
+        try:
+            return await self._manual_squareoff_from_broker(symbol, reason)
+        finally:
+            await self.store.release_lock(self.user_id, symbol, "exit")
+
+    async def _manual_squareoff_from_broker(self, symbol: str, reason: str) -> Dict[str, Any]:
         # Ensure selected broker is ready
         ok = await self._ensure_broker_ready()
         if not ok:
@@ -4159,7 +4205,7 @@ class TradeEngine:
 
         rows = []
         try:
-            rows = list(data.get("net") or []) + list(data.get("day") or [])
+            rows = list(data.get("net") if "net" in data else data.get("day") or [])
         except Exception:
             rows = []
 
@@ -4209,16 +4255,18 @@ class TradeEngine:
                 },
             )
             oid = execution.order_id
+            filled = max(0, int(execution.filled_qty or 0))
             log.info(
                 "✅ MANUAL_EXIT_ZERODHA_OK | user=%s symbol=%s exit_oid=%s side=%s qty=%s product=%s",
                 self.user_id, symbol, str(oid), exit_side, qty, product
             )
             return {
-                "status": "EXIT_OK",
+                "status": "EXIT_OK" if filled == qty else "EXIT_PARTIAL" if filled > 0 else "ERROR",
                 "symbol": symbol,
                 "exit_order_id": str(oid),
                 "exit_side": exit_side,
-                "qty": qty,
+                "qty": filled,
+                "remaining_qty": max(0, qty - filled),
                 "product": product,
                 "reason": reason,
                 "source": "ZERODHA_POSITIONS",

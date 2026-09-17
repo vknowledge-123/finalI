@@ -63,9 +63,9 @@ class OTP(BaseModel):
     
     def verify(self, input_code: str) -> bool:
         """Verify the OTP code"""
-        self.attempts += 1
         if not self.is_valid():
             return False
+        self.attempts += 1
         return self.code == input_code
     
     def to_dict(self) -> Dict[str, Any]:

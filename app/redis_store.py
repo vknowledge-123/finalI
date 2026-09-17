@@ -689,8 +689,8 @@ class RedisStore:
             "password_hash": str(password_hash or "").strip(),
             "created_at": now_ist().isoformat(),
         }
-        await self.redis.set(k_admin_auth(), json.dumps(payload))
-        return payload
+        created = await self.redis.set(k_admin_auth(), json.dumps(payload), nx=True)
+        return payload if created else {}
 
     async def load_admin_auth(self) -> Dict[str, Any]:
         try:

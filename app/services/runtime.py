@@ -82,6 +82,7 @@ class ServiceRuntime:
     async def stop(self) -> None:
         await self.scheduler.stop()
         await self.signal_intake.stop()
+        await self.backtests.close()
 
     def status(self) -> Dict[str, Any]:
         queue = self.signal_intake.queue.queue

@@ -566,6 +566,7 @@ class TradeEngineIntegrationTests(unittest.IsolatedAsyncioTestCase):
         engine._fetch_historical_candles = AsyncMock(return_value=candles)
         engine._fetch_ltp = AsyncMock(return_value=99.0)
         engine._place_order = AsyncMock(return_value="ENTRY-1")
+        engine._wait_for_order_execution = AsyncMock(return_value={"status": "COMPLETE", "filled_quantity": 2, "average_price": 99.0})
 
         result = await engine.on_chartink_alert("SNIPER", ["SBIN"], ts="2026-06-12T10:00:00")
 
@@ -619,6 +620,7 @@ class TradeEngineIntegrationTests(unittest.IsolatedAsyncioTestCase):
         engine._fetch_historical_candles = AsyncMock(return_value=candles)
         engine._fetch_ltp = AsyncMock(return_value=131.0)
         engine._place_order = AsyncMock(return_value="GMMA-ENTRY-1")
+        engine._wait_for_order_execution = AsyncMock(return_value={"status": "COMPLETE", "filled_quantity": 3, "average_price": 131.0})
 
         result = await engine.on_chartink_alert("GMMA", ["SBIN"], ts="2026-06-12T10:00:00")
 
@@ -664,6 +666,7 @@ class TradeEngineIntegrationTests(unittest.IsolatedAsyncioTestCase):
         engine._fetch_historical_candles = AsyncMock(return_value=candles)
         engine._fetch_ltp = AsyncMock(return_value=131.0)
         engine._place_order = AsyncMock(return_value="GMMA-ENTRY-15")
+        engine._wait_for_order_execution = AsyncMock(return_value={"status": "COMPLETE", "filled_quantity": 3, "average_price": 131.0})
 
         result = await engine.on_chartink_alert("GMMA15", ["SBIN"], ts="2026-06-12T10:00:00")
 
@@ -700,6 +703,7 @@ class TradeEngineIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         engine._fetch_ltp = AsyncMock(return_value=100.0)
         engine._place_order = AsyncMock(return_value="ENTRY-2")
+        engine._wait_for_order_execution = AsyncMock(return_value={"status": "COMPLETE", "filled_quantity": 1, "average_price": 100.0})
 
         skipped = await engine.on_chartink_alert("classic", ["SBIN"])
         entered = await engine.on_chartink_alert("classic", ["INFY"])
@@ -727,6 +731,7 @@ class TradeEngineIntegrationTests(unittest.IsolatedAsyncioTestCase):
         engine = TradeEngine(1, store)
         engine._fetch_ltp = AsyncMock(return_value=12000.0)
         engine._place_order = AsyncMock(return_value="ENTRY-MIN-1")
+        engine._wait_for_order_execution = AsyncMock(return_value={"status": "COMPLETE", "filled_quantity": 1, "average_price": 12000.0})
 
         result = await engine.on_chartink_alert("classic", ["MRF"])
 
@@ -975,7 +980,7 @@ class TradeEngineIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(restored, ["SBIN"])
         self.assertEqual(engine.positions["SBIN"].product, "CNC")
         self.assertEqual(engine.positions["SBIN"].qty, 3)
-        self.assertEqual(engine.positions["SBIN"].entry_price, 101.0)
+        self.assertEqual(engine.positions["SBIN"].entry_price, 100.0)
         self.assertEqual(engine.positions["SBIN"].target_price, 110.0)
         self.assertEqual(engine.positions["SBIN"].sl_price, 95.0)
         self.assertEqual(engine.positions["SBIN"].trail_price, 103.95)
@@ -1500,6 +1505,11 @@ class TradeEngineIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await store.upsert_position(1, "SBIN", position.to_public())
         await store.mark_open(1, "SBIN", position.trade_id)
         engine._place_order = AsyncMock(side_effect=["TP1-OID", "TP2-OID", "TP3-OID"])
+        engine._wait_for_order_execution = AsyncMock(side_effect=[
+            {"status": "COMPLETE", "filled_quantity": 50, "average_price": 102},
+            {"status": "COMPLETE", "filled_quantity": 25, "average_price": 104},
+            {"status": "COMPLETE", "filled_quantity": 25, "average_price": 106},
+        ])
 
         await engine.on_tick("SBIN", 102, 100, 102, 101)
         self.assertEqual(position.qty, 50)

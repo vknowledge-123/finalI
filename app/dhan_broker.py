@@ -462,7 +462,7 @@ def normalize_dhan_holdings(response: Any) -> List[Dict[str, Any]]:
                 data = value
                 break
     if not isinstance(data, list):
-        data = []
+        raise ValueError("DHAN_HOLDINGS_INVALID_RESPONSE")
 
     normalized: List[Dict[str, Any]] = []
     for row in data:
@@ -481,18 +481,13 @@ def normalize_dhan_holdings(response: Any) -> List[Dict[str, Any]]:
         try:
             qty = int(
                 float(
-                    row.get("availableQty")
-                    or row.get("sellableQty")
-                    or row.get("totalQty")
-                    or row.get("holdingQty")
-                    or row.get("quantity")
-                    or row.get("qty")
-                    or 0
+                    next((row[key] for key in ("availableQty", "sellableQty", "totalQty", "holdingQty", "quantity", "qty")
+                          if row.get(key) is not None), 0)
                 )
             )
         except Exception:
             qty = 0
-        if not symbol or qty <= 0:
+        if not symbol or qty < 0:
             continue
         normalized.append(
             {
