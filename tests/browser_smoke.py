@@ -16,6 +16,8 @@ os.environ["ADMIN_AUTH_ENABLED"] = "0"
 import uvicorn
 from playwright.sync_api import expect, sync_playwright
 from app import main as application
+from app.crypto import EncryptionManager
+from cryptography.fernet import Fernet
 
 
 def main():
@@ -35,6 +37,7 @@ def main():
                 raise RuntimeError("Test server failed to start")
             time.sleep(0.05)
         assert server.started, "Test server startup timeout"
+        application.store.encryption = EncryptionManager(Fernet.generate_key().decode())
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(channel="chrome", headless=True)
             try:
@@ -51,6 +54,21 @@ def main():
                     page.locator("#cfg_prod").select_option("CNC")
                     page.locator("#cfg_qtymode").select_option("QTY")
                     page.locator("#cfg_qty").fill("2")
+                    page.locator("#cfg_order_retries").fill("0")
+                    page.locator("#cfg_order_buffer").fill("0")
+                    expect(page.locator("#cfg_high_break_tf")).to_be_disabled()
+                    expect(page.locator("#cfg_high_break_ttl")).to_be_disabled()
+                    expect(page.locator("#cfg_telegram_token")).to_be_disabled()
+                    page.locator("#cfg_high_break_on").check()
+                    page.locator("#cfg_high_break_tf").select_option("5")
+                    page.locator("#cfg_high_break_ttl").fill("2")
+                    page.locator("#cfg_high_break_buffer_on").check()
+                    page.locator("#cfg_high_break_buffer").fill("0.10")
+                    page.locator("#cfg_telegram_on").check()
+                    page.locator("#cfg_telegram_token").fill("123456789:" + "a" * 35)
+                    page.locator("#cfg_telegram_chat").fill("-1001234567")
+                    page.locator("#cfg_high_break_on").evaluate("element => element.scrollIntoView({block: 'start'})")
+                    page.screenshot(path=str(artifacts / f"alert-features-{width}.png"))
                     page.locator("#cfg_tgt").fill("4")
                     page.locator("#cfg_sl").fill("1")
                     page.locator("#cfg_tsl_on").select_option("false")
@@ -75,12 +93,52 @@ def main():
                     assert config["qty"] == 2 and config["product"] == "CNC", config
                     assert config["cost_sl_enabled"] and config["exit_alert_enabled"], config
                     assert config["trailing_sl_enabled"] is False, config
+                    assert config["order_pending_retry_count"] == 0, config
+                    assert config["order_limit_buffer_pct"] == 0, config
+                    assert config["high_break_enabled"] and config["high_break_buffer_enabled"], config
+                    assert config["high_break_timeframe_minutes"] == 5 and config["high_break_buffer"] == 0.1, config
+                    assert config["high_break_ttl_minutes"] == 2, config
+                    assert config["telegram_enabled"] and config["telegram_token_set"], config
+                    assert "telegram_bot_token_encrypted" not in config and "telegram_bot_token" not in config, config
                     page.reload(wait_until="networkidle")
+                    page.evaluate("openCfg()")
                     page.evaluate("name => fillCfg(name)", config_key)
                     assert page.locator("#cfg_tsl_on").input_value() == "false"
+                    assert page.locator("#cfg_order_retries").input_value() == "0"
+                    assert page.locator("#cfg_order_buffer").input_value() == "0"
+                    expect(page.locator("#cfg_high_break_on")).to_be_checked()
+                    expect(page.locator("#cfg_high_break_ttl")).to_have_value("2")
+                    expect(page.locator("#cfg_telegram_on")).to_be_checked()
+                    expect(page.locator("#cfg_telegram_token")).to_have_value("")
+                    expect(page.locator("#cfg_telegram_token_status")).to_have_text("(saved)")
+                    page.locator("#cfg_high_break_on").uncheck()
+                    expect(page.locator("#cfg_high_break_ttl")).to_be_disabled()
+                    expect(page.locator("#cfg_high_break_tf")).to_be_disabled()
+                    expect(page.locator("#cfg_high_break_buffer")).to_be_disabled()
+                    page.locator("#cfg_telegram_on").uncheck()
+                    expect(page.locator("#cfg_telegram_token")).to_be_disabled()
                     assert page.locator("#cfg_cost_sl_on").input_value() == "true"
                     assert page.locator("#cfg_exit_alert_name").input_value() == f"Browser Exit {width}"
                     page.evaluate("closeCfg()")
+                    watch = {"id": f"browser-watch-{width}", "user_id": 1, "symbol": "WATCHTEST",
+                             "side": "BUY", "level": "100.10", "expires_at": time.time() + 120, "phase": "WAITING"}
+
+                    async def seed_watch():
+                        from app.breakout_state import waiting_result
+                        await application.store.save_breakout_watch(watch)
+                        await application.store.save_alert(1, {
+                            "alert_name": "Browser breakout", "time": datetime.now(timezone.utc).isoformat(),
+                            "result": [waiting_result(watch)],
+                        })
+
+                    asyncio.run_coroutine_threadsafe(seed_watch(), application.APP_LOOP).result(5)
+                    page.evaluate("loadAlerts()")
+                    expect(page.locator("#alertsBody")).to_contain_text("WAITING FOR BREAKOUT")
+                    expect(page.locator("#alertsBody")).to_contain_text("Above 100.10")
+                    asyncio.run_coroutine_threadsafe(application.store.transition_breakout_watch(watch["id"], "WAITING",
+                        dict(watch, phase="DONE", result={"symbol": "WATCHTEST", "status": "SKIPPED", "reason": "BREAKOUT_TTL_EXPIRED"})), application.APP_LOOP).result(5)
+                    # The dashboard must refresh a completed watch without a manual click.
+                    expect(page.locator("#alertsBody")).to_contain_text("BREAKOUT_TTL_EXPIRED", timeout=7000)
                     position = {
                         "trade_id": f"browser-{width}", "symbol": "SBIN", "user_id": 1,
                         "alert_name": f"Browser Smoke {width}", "status": "OPEN", "product": "CNC",

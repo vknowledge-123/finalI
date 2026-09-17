@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 from .models import OTP, Session, User, utc_now
 from .redis_store import norm_alert_name, norm_symbol
 from .order_locks import OrderLockLeases
+from .breakout_state import project_alerts
 
 
 class InMemoryStore:
@@ -31,6 +32,9 @@ class InMemoryStore:
         self._dhan_auth_state: Dict[int, Dict[str, Any]] = {}
         self._kill: Dict[int, bool] = {}
         self._alert_configs: Dict[int, Dict[str, Dict[str, Any]]] = {}
+        self._telegram_entries = {}
+        self._telegram_sent = {}
+        self._breakout_watches = {}
         self._alerts: Dict[int, List[Dict[str, Any]]] = {}
         self._positions: Dict[int, Dict[str, Dict[str, Any]]] = {}
         self._cnc_carry_positions: Dict[int, Dict[str, Dict[str, Any]]] = {}
@@ -294,6 +298,44 @@ class InMemoryStore:
     # -------------------------
     # Alert config
     # -------------------------
+    async def save_breakout_watch(self, watch):
+        self._breakout_watches[watch["id"]] = dict(watch)
+
+    async def get_breakout_watch(self, watch_id):
+        record = self._breakout_watches.get(watch_id)
+        return dict(record) if record else None
+
+    async def transition_breakout_watch(self, watch_id, phase, updated):
+        if self._breakout_watches.get(watch_id, {}).get("phase") != phase:
+            return False
+        self._breakout_watches[watch_id] = dict(updated)
+        return True
+
+    async def list_breakout_watches(self):
+        return [dict(record) for record in self._breakout_watches.values()]
+
+    async def delete_breakout_watch(self, watch_id):
+        self._breakout_watches.pop(watch_id, None)
+
+    async def queue_telegram_entry(self, user_id, event):
+        self._telegram_entries.setdefault(int(user_id), {})[event["trade_id"]] = dict(event)
+
+    async def list_telegram_entries(self, user_id):
+        return list(self._telegram_entries.get(int(user_id), {}).values())
+
+    async def delete_telegram_entry(self, user_id, trade_id):
+        self._telegram_entries.get(int(user_id), {}).pop(trade_id, None)
+
+    async def claim_telegram_message(self, user_id, identity):
+        key = (int(user_id), identity)
+        if self._telegram_sent.get(key, 0) > time.time():
+            return False
+        self._telegram_sent[key] = time.time() + 60
+        return True
+
+    async def mark_telegram_sent(self, user_id, identity):
+        self._telegram_sent[(int(user_id), identity)] = time.time() + 172800
+
     async def list_alert_configs(self, user_id: int) -> Dict[str, Dict[str, Any]]:
         cfg = self._alert_configs.get(int(user_id), {})
         return {key: dict(value) for key, value in cfg.items()}
@@ -342,7 +384,7 @@ class InMemoryStore:
         limit_n = max(0, int(limit))
         if limit_n <= 0:
             return []
-        return list(items[:limit_n])
+        return project_alerts(items[:limit_n], await self.list_breakout_watches(), uid)
 
     async def update_alert_status(
         self,
@@ -522,6 +564,7 @@ class InMemoryStore:
             | set(self._brokers.keys())
             | set(self._kill.keys())
             | set(self._cnc_carry_positions.keys())
+            | set(self._alert_configs.keys())
         )
         return sorted(uids)
 

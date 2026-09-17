@@ -1463,9 +1463,8 @@
     <div class="relative min-h-screen flex items-center justify-center p-3">
       <div
         class="cfg-card rounded-2xl p-3 border border-white/10 shadow-2xl w-full max-w-3xl relative animate-enter my-3 bg-[#0f172a]">
-        <button onclick="closeCfg()" class="absolute top-5 right-5 text-slate-400 hover:text-white">✕</button>
-
         <div class="cfg-header flex items-center justify-between mb-2">
+          <button onclick="closeCfg()" aria-label="Close strategy configuration" class="absolute top-5 right-5 text-slate-400 hover:text-white">✕</button>
           <div>
             <h3 class="text-base font-bold text-white">Strategy Configuration</h3>
             <p class="text-[9px] text-slate-400">Define parameters for your Chartink alerts.</p>
@@ -1563,6 +1562,43 @@
               <input id="cfg_qty" type="number" class="input-field" placeholder="e.g. 1">
             </div>
           </div>
+
+          <section class="col-span-2 border-t border-white/10 pt-3 mt-1">
+            <label class="flex items-center gap-2 text-sm font-semibold mb-3">
+              <input id="cfg_high_break_on" type="checkbox" onchange="toggleAlertFeatures()" class="h-4 w-4 accent-cyan-400">
+              Previous Candle Breakout
+            </label>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div><label for="cfg_high_break_tf" class="block text-xs text-slate-400 mb-1">Candle timeframe</label>
+                <select id="cfg_high_break_tf" class="input-field"><option value="1">1 minute</option><option value="5">5 minutes</option></select>
+              </div>
+              <div><label for="cfg_high_break_ttl" class="block text-xs text-slate-400 mb-1">Monitoring TTL (minutes)</label>
+                <input id="cfg_high_break_ttl" type="number" min="1" max="60" step="1" value="1" class="input-field">
+              </div>
+              <div><label class="flex items-center gap-2 text-xs text-slate-400 mb-1">
+                <input id="cfg_high_break_buffer_on" type="checkbox" onchange="toggleAlertFeatures()" class="h-4 w-4 accent-cyan-400"> Price buffer (INR)
+                </label><input id="cfg_high_break_buffer" type="number" min="0" max="10000" step="0.01" value="0.10" class="input-field" aria-label="Breakout price buffer in rupees">
+              </div>
+            </div>
+          </section>
+          <section class="col-span-2 border-t border-white/10 pt-3 mt-1">
+            <label class="flex items-center gap-2 text-sm font-semibold mb-3">
+              <input id="cfg_telegram_on" type="checkbox" onchange="toggleAlertFeatures()" class="h-4 w-4 accent-cyan-400">
+              Telegram Messages (Classic)
+            </label>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div><label for="cfg_telegram_token" class="block text-xs text-slate-400 mb-1">Bot token <span id="cfg_telegram_token_status"></span></label>
+                <input id="cfg_telegram_token" type="password" autocomplete="new-password" class="input-field" placeholder="BotFather token">
+              </div>
+              <div><label for="cfg_telegram_chat" class="block text-xs text-slate-400 mb-1">Group / chat ID</label>
+                <input id="cfg_telegram_chat" class="input-field" placeholder="-1001234567890">
+              </div>
+            </div>
+            <dl class="mt-3 text-xs text-slate-400 flex flex-wrap gap-x-5 gap-y-1">
+              <div><dt class="inline">Welcome: </dt><dd class="inline">09:05 IST, daily</dd></div>
+              <div><dt class="inline">Dhan account P&amp;L: </dt><dd class="inline">Every 5 minutes, 09:15-15:30 IST</dd></div>
+            </dl>
+          </section>
 
           <div class="col-span-2 border-t border-amber-500/20 pt-3 mt-1">
             <div class="flex items-center justify-between mb-2">
@@ -1830,7 +1866,7 @@
                 <input id="cfg_max_loss" type="number" step="1" class="input-field" placeholder="e.g. 800">
               </div>
             </div>
-            <p class="text-[10px] text-slate-500 mt-1">Checks MTM every 2 seconds. If hit, exits all positions and disables trading for the day.</p>
+            <p class="text-[10px] text-slate-500 mt-1">Checks broker positions MTM every 2 seconds. A limit breach blocks new entries and requests exits for MIS and managed CNC positions, including tracked carry positions. Untracked demat holdings are excluded.</p>
           </div>
 
           <!-- Entry Time Window -->
@@ -2461,6 +2497,17 @@
     let PNL_EXIT_CFG = null;
     let BACKTEST_CONFIGS = {};
 
+    function toggleAlertFeatures() {
+      const high = document.getElementById("cfg_high_break_on").checked;
+      document.getElementById("cfg_high_break_tf").disabled = !high;
+      document.getElementById("cfg_high_break_ttl").disabled = !high;
+      document.getElementById("cfg_high_break_buffer_on").disabled = !high;
+      document.getElementById("cfg_high_break_buffer").disabled = !high || !document.getElementById("cfg_high_break_buffer_on").checked;
+      const telegram = document.getElementById("cfg_telegram_on").checked;
+      document.getElementById("cfg_telegram_token").disabled = !telegram;
+      document.getElementById("cfg_telegram_chat").disabled = !telegram;
+    }
+
     function toggleExitAlertFields() {
       const enabled = document.getElementById("cfg_exit_alert_on")?.value === "true";
       const box = document.getElementById("exitAlertNameBox");
@@ -2470,6 +2517,7 @@
     }
 
     function toggleStrategyMode() {
+      toggleAlertFeatures();
       const mode = document.getElementById("cfg_strategy_mode").value;
       const precision = mode === "PRECISION_SNIPER";
       const gmma = mode === "GMMA_OBV";
@@ -2624,6 +2672,11 @@
         "cfg_alert": displayName, "cfg_enabled": String(!!c.enabled), "cfg_dir": c.direction,
         "cfg_exit_alert_on": String(!!c.exit_alert_enabled),
         "cfg_exit_alert_name": c.exit_alert_name_raw || c.exit_alert_name || "",
+        "cfg_high_break_tf": c.high_break_timeframe_minutes ?? 1,
+        "cfg_high_break_ttl": c.high_break_ttl_minutes ?? 1,
+        "cfg_high_break_buffer": c.high_break_buffer ?? 0.10,
+        "cfg_telegram_token": "",
+        "cfg_telegram_chat": c.telegram_chat_id ?? "",
         "cfg_prod": c.product, "cfg_qtymode": c.qty_mode, "cfg_cap": c.capital,
         "cfg_qty": c.qty, "cfg_tgt": c.target_pct, "cfg_sl": c.stop_loss_pct,
         "cfg_tsl_on": String(c.trailing_sl_enabled !== false),
@@ -2755,6 +2808,11 @@
         const el = document.getElementById(k);
         if (el) el.value = sets[k];
       }
+      document.getElementById("cfg_high_break_on").checked = c.high_break_enabled === true;
+      document.getElementById("cfg_high_break_buffer_on").checked = c.high_break_buffer_enabled === true;
+      document.getElementById("cfg_telegram_on").checked = c.telegram_enabled === true;
+      document.getElementById("cfg_telegram_token_status").textContent = c.telegram_token_set ? "(saved)" : "";
+      document.getElementById("cfg_telegram_token").placeholder = c.telegram_token_set ? "Unchanged unless replaced" : "BotFather token";
       toggleExitAlertFields();
       toggleStrategyMode();
       togglePartialProfitFields();
@@ -2767,6 +2825,14 @@
         enabled: document.getElementById("cfg_enabled").value === "true",
         exit_alert_enabled: document.getElementById("cfg_exit_alert_on").value === "true",
         exit_alert_name: document.getElementById("cfg_exit_alert_name").value.trim(),
+        high_break_enabled: document.getElementById("cfg_high_break_on").checked,
+        high_break_timeframe_minutes: Number(document.getElementById("cfg_high_break_tf").value),
+        high_break_ttl_minutes: Number(document.getElementById("cfg_high_break_ttl").value),
+        high_break_buffer_enabled: document.getElementById("cfg_high_break_buffer_on").checked,
+        high_break_buffer: Number(document.getElementById("cfg_high_break_buffer").value || 0),
+        telegram_enabled: document.getElementById("cfg_telegram_on").checked,
+        telegram_bot_token: document.getElementById("cfg_telegram_token").value.trim(),
+        telegram_chat_id: document.getElementById("cfg_telegram_chat").value.trim(),
         direction: document.getElementById("cfg_dir").value,
         product: document.getElementById("cfg_prod").value,
         qty_mode: document.getElementById("cfg_qtymode").value,
@@ -2951,6 +3017,7 @@
         await savePnlExitCfg();
         toast(`Strategy '${payload.alert_name}' Saved`);
         loadCfgList();
+        document.getElementById("cfg_telegram_token").value = "";
         closeCfg(); // Auto close on save
       } catch (e) { toast((e && e.message) ? e.message : String(e), 'error'); }
     }
@@ -3512,6 +3579,11 @@
           let statusLabel = r.status;
           let statusReason = r.reason;
           let sideLabel = r.side; // keep original side
+          if (statusLabel === 'WAITING_FOR_BREAKOUT') {
+            statusLabel = 'WAITING FOR BREAKOUT';
+            const until = new Date(Number(r.breakout_expires_at) * 1000).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false });
+            statusReason = `${sideLabel === 'SELL' ? 'Below' : 'Above'} ${Number(r.break_level).toFixed(2)} | until ${until}`;
+          }
 
           // Override if live position has interesting status
           if (livePos) {
@@ -3546,6 +3618,7 @@
             switch (s) {
               case 'ENTERED': return 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20';
               case 'PENDING ENTRY': return 'bg-amber-500/10 text-amber-300 border border-amber-500/30 animate-pulse';
+              case 'WAITING FOR BREAKOUT': return 'bg-cyan-500/10 text-cyan-300 border border-cyan-500/30';
               case 'SKIPPED': return 'bg-yellow-500/10 text-yellow-400 border border-yellow-500/20';
               case 'ERROR': return 'bg-rose-500/10 text-rose-400 border border-rose-500/20';
               case 'CONDITIONS MET': return 'bg-gradient-to-r from-orange-500/20 to-amber-500/20 text-orange-200 border border-orange-500/40 shadow-[0_0_10px_rgba(251,146,60,0.3)] animate-pulse';
@@ -3995,6 +4068,19 @@
       refreshZ();
       // checkAutoSqOff(); // Removed as we switched to manual button
       setInterval(refreshZ, 5000);
+      let breakoutRefreshPending = false;
+      setInterval(async () => {
+        const waiting = ALERTS.some(a => (a.result || []).some(r =>
+          r.breakout_watch_id && ['WAITING_FOR_BREAKOUT', 'PENDING ENTRY'].includes(r.status)));
+        if (!waiting || breakoutRefreshPending || document.hidden) return;
+        breakoutRefreshPending = true;
+        try {
+          await loadAlerts();
+          await refreshPositions();
+        } finally {
+          breakoutRefreshPending = false;
+        }
+      }, 2000);
       const today = new Date();
       const weekAgo = new Date();
       weekAgo.setDate(today.getDate() - 7);

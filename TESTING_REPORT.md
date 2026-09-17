@@ -1,10 +1,85 @@
 # Integration Test Report
 
-Date: 2026-09-16
+Date: 2026-09-17
 
-Latest complete suite: **210 tests passed**, no failures or skips, 10 deprecation
-warnings. Python compilation and syntax checks for all four shell scripts passed.
+Latest complete suite: **256 tests passed**, no failures or skips, 12 deprecation
+warnings (21.57 seconds). Python compilation passed. Shell scripts are unchanged
+since the previous successful syntax checks.
 No live orders were placed. The production VMs were not changed.
+
+## Breakout Monitoring TTL
+
+Added a persisted 1-60 minute TTL (default 1), fixed previous-candle threshold,
+non-blocking watches and dashboard waiting/expiry states. TTL includes initial
+preparation time; Entry End Time remains an earlier cutoff. Repeated alerts do
+not extend an active watch. Split-mode execution and single-process API watches
+have separate ownership. Waiting watches resume and resubscribe after restart;
+uncertain submitted orders are not replayed and require reconciliation.
+
+Added 21 regression tests covering LONG/SHORT crossing, stale/missing prices,
+expiry, slow validation past the deadline, unchanged candle reference, price
+falling back, duplicate alerts/orders, trade limits, position guards, kill switch,
+config changes, disabled toggle, entry window, restart recovery, owner isolation,
+subscription recovery, lost leases, order failures, concurrent checks, slow-order
+isolation and Redis CAS/history projection. Redis is simulated with fakeredis.
+Browser tests verify the real configuration API round trip, TTL toggle/default,
+mobile layout and waiting-to-expired refresh without manual clicks. Broker calls
+remain mocked. Newly added watch modules pass Pyflakes; no production latency or
+live broker execution guarantee is implied.
+
+## Telegram and Breakout Features
+
+Added 16 tests for optional feature settings, encrypted token persistence and
+API redaction, strict previous-bar selection, LONG/SHORT boundaries and buffers,
+toggle bypass, missing broker candles, actual partial-fill notification quantities,
+daily welcome and five-minute P&L slots, shared-group deduplication/restarts,
+disabled/custom strategy suppression, delivery failure backoff, Telegram 429,
+credential-log redaction, Dhan realized/unrealized aggregation and Redis event
+TTL/claim isolation. Telegram HTTP transport and broker calls were mocked.
+The final pass also corrects the one-minute candle request for Zerodha to its
+documented `minute` interval and verifies closed-bar filtering for both aliases.
+
+Chrome tests at 1440x1000, 768x1024 and 390x844 cover enabling the new controls,
+real local API save/GET/reload, masked saved tokens, zero settings and disabling
+dependent fields. A test-harness modal-opening error was corrected. Screenshot
+inspection also found a mobile sticky-header overlap, fixed with scroll padding
+and a header-owned close button. Existing tick/P&L and closed-position UI checks
+remain in the browser harness. No real Telegram messages were sent.
+
+Operational behavior and limitations: [Telegram and breakout guide](TELEGRAM_AND_BREAKOUT.md).
+
+## Strategy Configuration Follow-up
+
+- SHORT sector selection now uses ascending percentage change (biggest losers);
+  LONG still uses descending change. Custom BOTH strategies use their confirmed
+  BUY/SELL side. Dashboard ranking order remains unchanged.
+- Daily P&L breaches request square-off for known MIS and CNC positions, including
+  tracked carry positions restored into the normal position store. Manual/all
+  square-off can hydrate a managed CNC position from Redis before attempting an
+  exit, even when it is absent from the broker's day positions.
+- The local kill flag is set before requesting square-off. Pyramiding checks it
+  before adding exposure. Automatic time-based intraday square-off remains MIS-only.
+- Numeric zero retries and zero percentage buffer survive API validation,
+  canonical/legacy field normalization, storage, engine settings and browser
+  save/reload. Fractional retry counts and zero confirmation timeouts are rejected.
+- Chrome smoke tests passed at 1440x1000, 768x1024 and 390x844, including real
+  local API save/GET/reload of zero settings, WebSocket updates and closed rows.
+
+Nine new regression tests cover these changes, including profit/loss breaches,
+disabled/zero/unbreached limits, kill state on square-off failure, restored CNC
+positions, pyramid blocking and side-dependent Top N selection.
+
+Scope: the trigger uses broker positions MTM, not total demat portfolio valuation.
+Untracked demat holdings are not imported and liquidated. Square-off remains a
+best-effort broker operation, not a guarantee of fills. Broker calls in tests are
+mocked; no live exchange execution or production deployment was tested.
+
+The supplied [Dhan Trader's Control documentation](https://dhanhq.co/docs/v2/traders-control/)
+was reviewed. This patch does not integrate or enable Dhan's account-wide
+`/killswitch` or `/pnlExit` endpoints. The broker kill switch requires closed
+positions and no pending orders; it is not a replacement for the app's local
+entry block during liquidation. Broker-side P&L rules can trigger immediately
+when configured and reset at the end of the trading session.
 
 ## Redis Startup Diagnostics Follow-up
 
@@ -226,8 +301,9 @@ Redis environment. Lock renewal cannot retract a broker request already sent or
 guarantee safety during process stalls/network partitions; reconciliation remains
 necessary after uncertain outcomes.
 
-The local test server was stopped after testing. Changes have not been pushed or
-deployed to the client's VM.
+The browser harness server was stopped after testing. A separate brokerless
+preview is available at http://127.0.0.1:8010/dashboard. Changes have not been
+pushed or deployed to the client's VM.
 
 ## Reproduce
 

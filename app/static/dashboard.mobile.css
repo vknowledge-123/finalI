@@ -297,19 +297,22 @@
     border-radius: 14px !important;
     overflow: auto !important;
     -webkit-overflow-scrolling: touch;
+    scroll-padding-top: 76px;
+    scroll-padding-bottom: 112px;
   }
 
   #cfgModal .cfg-header {
     position: sticky;
-    top: 0;
+    top: -12px;
+    flex-shrink: 0;
     z-index: 30;
     margin: -12px -12px 10px !important;
     padding: 12px 44px 10px 12px;
-    background: rgba(15, 23, 42, 0.98);
+    background: #0f172a;
     border-bottom: 1px solid rgba(255, 255, 255, 0.08);
   }
 
-  #cfgModal .cfg-card > button[onclick="closeCfg()"] {
+  #cfgModal .cfg-header > button[onclick="closeCfg()"] {
     position: absolute !important;
     top: 10px !important;
     right: 10px !important;
@@ -355,11 +358,11 @@
 
   #cfgModal .cfg-actions {
     position: sticky;
-    bottom: 0;
+    bottom: -12px;
     z-index: 35;
     margin: 12px -12px -12px !important;
     padding: 10px 12px 12px !important;
-    background: rgba(15, 23, 42, 0.98);
+    background: #0f172a;
     border-top: 1px solid rgba(255, 255, 255, 0.1);
     flex-direction: column;
   }

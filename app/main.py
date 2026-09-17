@@ -102,6 +102,8 @@ except ImportError:
     pass  # dotenv not installed, use system env vars
 
 # Import encryption module
+from .alert_features import prepare_features, public_config
+
 try:
     from .crypto import init_encryption
     ENCRYPTION_AVAILABLE = True
@@ -2741,7 +2743,7 @@ async def broker_status(user_id: int = 1) -> Dict[str, Any]:
 async def list_alert_config(user_id: int = 1) -> Dict[str, Any]:
     user_id = int(user_id)
     cfg = await store.list_alert_configs(user_id)
-    return {"configs": cfg}
+    return {"configs": {key: public_config(value) for key, value in cfg.items()}}
 
 
 @app.post("/api/alert-config")
@@ -2806,10 +2808,21 @@ async def save_alert_config(payload: Dict[str, Any]) -> Dict[str, Any]:
     strategy_mode = str(payload.get("strategy_mode", "CLASSIC") or "CLASSIC").strip().upper()
     if strategy_mode not in {"CLASSIC", "PRECISION_SNIPER", "GMMA_OBV", "GMMA_GOLD_CROSS", "LIQUIDITY_SWEEP", "PURE_LIQUIDITY_SWEEP", "GVK_TREND"}:
         return {"error": "INVALID_STRATEGY_MODE"}
+
+    def execution_setting(*keys: str, default: float) -> Any:
+        for key in keys:
+            value = payload.get(key)
+            if value is not None and value != "":
+                return value
+        return default
+
     try:
-        order_timeout = float(payload.get("order_confirm_timeout_sec") or payload.get("execution_confirm_timeout_sec") or 1.5)
-        order_retries = int(payload.get("order_pending_retry_count") or payload.get("execution_retry_count") or 1)
-        order_buffer = float(payload.get("order_limit_buffer_pct") or payload.get("dhan_limit_buffer_pct") or payload.get("execution_protection_pct") or 0.15)
+        order_timeout = float(execution_setting("order_confirm_timeout_sec", "execution_confirm_timeout_sec", default=1.5))
+        retries_value = float(execution_setting("order_pending_retry_count", "execution_retry_count", default=1))
+        order_retries = int(retries_value)
+        if order_retries != retries_value:
+            return {"error": "ORDER_EXECUTION_SETTINGS_INVALID"}
+        order_buffer = float(execution_setting("order_limit_buffer_pct", "dhan_limit_buffer_pct", "execution_protection_pct", default=0.15))
     except Exception:
         return {"error": "ORDER_EXECUTION_SETTINGS_INVALID"}
     if not (0.2 <= order_timeout <= 10.0 and 0 <= order_retries <= 5 and 0.0 <= order_buffer <= 5.0):
@@ -2882,13 +2895,22 @@ async def save_alert_config(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "incoming_alert_name_raw": incoming_raw,
             }
 
+    try:
+        features = prepare_features(payload, await store.get_alert_config(user_id, alert_name) or {}, store)
+    except ValueError as exc:
+        return {"error": str(exc)}
     payload2 = dict(payload)
+    payload2.pop("telegram_bot_token", None)
+    payload2.pop("telegram_token_set", None)
+    payload2.update(features)
     payload2["alert_name"] = alert_name
     payload2["alert_name_raw"] = str(raw_name)
     payload2["exit_alert_enabled"] = exit_alert_enabled
     payload2["exit_alert_name"] = exit_alert_name if exit_alert_enabled else ""
     payload2["exit_alert_name_raw"] = exit_alert_raw if exit_alert_enabled else ""
     payload2["strategy_mode"] = strategy_mode
+    payload2["order_confirm_timeout_sec"] = order_timeout
+    payload2["order_pending_retry_count"] = order_retries
     payload2["order_limit_buffer_pct"] = order_buffer
     payload2["target_pct"] = target_pct
     payload2["stop_loss_pct"] = stop_loss_pct
@@ -2904,7 +2926,10 @@ async def save_alert_config(payload: Dict[str, Any]) -> Dict[str, Any]:
          try:
              eng = await ensure_engine(user_id)
              ranks = eng.get_sector_rank()
-             top_n = int(payload2.get("top_n_sector", payload2.get("topn", 3)))
+             direction = str(payload2.get("direction") or "LONG").upper()
+             if direction == "SHORT":
+                 ranks = sorted(ranks, key=lambda item: item[1])
+             top_n = max(1, int(payload2.get("top_n_sector", payload2.get("topn", 1)) or 1))
              
              # Get top N sectors
              top_sectors = ranks[:top_n]
@@ -2920,7 +2945,7 @@ async def save_alert_config(payload: Dict[str, Any]) -> Dict[str, Any]:
          except Exception as e:
              print(f"⚠️ Failed to log top sectors: {e}")
 
-    return {"status": "saved", "config": payload2}
+    return {"status": "saved", "config": public_config(payload2)}
 
 
 @app.delete("/api/alert-config")

@@ -18,6 +18,8 @@ from .sector_ranking import SectorRankingService
 from .signal_intake import SignalIntakeService
 from .strategy_evaluation import StrategyEvaluationService
 from .trade_decision import TradeDecisionService
+from .telegram_service import TelegramService
+from .breakout_monitor import BreakoutMonitor
 
 
 class ServiceRuntime:
@@ -43,6 +45,8 @@ class ServiceRuntime:
 
         self.api_gateway: Optional[ApiGatewayService] = None
         self.notifications = NotificationService(store_provider, ws_manager)
+        self.telegram = TelegramService(store_provider, ensure_engine)
+        self.breakouts = BreakoutMonitor(store_provider, ensure_engine, subscribe_symbols=subscribe_symbols)
         self.market_feed = MarketFeedService(
             start_feed=start_feed or _noop_user,
             stop_dhan_feed=stop_dhan_feed or _noop,
@@ -70,7 +74,10 @@ class ServiceRuntime:
         self.api_gateway = ApiGatewayService(self.signal_intake)
 
     async def start(self) -> None:
+        await self.breakouts.recover()
         await self.signal_intake.start()
+        self.scheduler.schedule("telegram_notifications", self.telegram.run)
+        self.scheduler.schedule("breakout_monitor", self.breakouts.run)
 
     async def stop(self) -> None:
         await self.scheduler.stop()

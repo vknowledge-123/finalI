@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 import json
 import logging
 import os
@@ -11,6 +12,7 @@ from typing import Any, Dict, List
 from .service_bootstrap import EngineRegistry, configure_logging, init_store
 from .service_queues import ALERT_QUEUE, ALERT_PROCESSING_QUEUE, ALERT_DEAD_QUEUE
 from .dhan_broker import compact_broker_error
+from .services.breakout_monitor import BreakoutMonitor
 
 configure_logging("execution_service")
 log = logging.getLogger("execution_service")
@@ -27,7 +29,7 @@ async def _process_job(store, registry: EngineRegistry, job: Dict[str, Any]) -> 
         return
     try:
         engine = await registry.get(user_id)
-        result = await engine.on_chartink_alert(alert_name, symbols, ts=ts)
+        result = await engine.on_chartink_alert(alert_name, symbols, ts=ts, monitor_owner="execution")
     except Exception as exc:
         log.exception("Alert execution failed | user=%s alert=%s", user_id, alert_name)
         await store.set_kill(user_id, True)
@@ -114,6 +116,7 @@ async def _consume_once(store, registry):
 async def main() -> None:
     store = await init_store()
     registry = EngineRegistry(store)
+    monitor_task = None
     try:
         token = uuid.uuid4().hex
         if not await store.redis.set(WORKER_LEASE, token, nx=True, px=30000):
@@ -123,6 +126,9 @@ async def main() -> None:
         store._lock_leases.track(WORKER_LEASE, token, 30000, store._renew_order_lock,
                                  store._release_order_lock, lease_lost)
         await _recover_interrupted(store)
+        monitor = BreakoutMonitor(lambda: store, registry.get, owner="execution")
+        await monitor.recover()
+        monitor_task = asyncio.create_task(monitor.run(), name="breakout_monitor")
         log.info("Execution service waiting on Redis queue %s", ALERT_QUEUE)
         while True:
             try:
@@ -133,6 +139,10 @@ async def main() -> None:
                 log.exception("EXECUTION_PERSISTENCE_OR_PROCESSING_FAILED")
                 raise
     finally:
+        if monitor_task:
+            monitor_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await monitor_task
         await registry.close()
         await store.close()
 

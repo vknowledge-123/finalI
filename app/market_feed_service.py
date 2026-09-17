@@ -232,6 +232,9 @@ async def _ensure_user_feed_started(main_app: Any, store: Any, started_users: Se
     positions = await store.list_positions(user_id)
     active = [row["symbol"] for row in positions if row.get("symbol")
               and row.get("status") in {"OPEN", "EXITING", "EXIT_CONDITIONS_MET"}]
+    active.extend(w["symbol"] for w in await store.list_breakout_watches()
+                  if w["user_id"] == user_id and w["phase"] == "WAITING" and w["expires_at"] > time.time())
+    active = list(dict.fromkeys(active))
     if active:
         await main_app.subscribe_symbols_for_user(user_id, active)
     if not await _feed_started_with_current_credentials(main_app, store, user_id, broker):

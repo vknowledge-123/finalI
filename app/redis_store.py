@@ -16,6 +16,7 @@ from redis.exceptions import (
     TimeoutError as RedisTimeoutError, WatchError,
 )
 from .order_locks import OrderLockLeases
+from .breakout_state import project_alerts
 
 if TYPE_CHECKING:
     from app.crypto import EncryptionManager
@@ -764,6 +765,8 @@ class RedisStore:
         keys.extend(await self.redis.keys("dhan:api_creds:*"))
         keys.extend(await self.redis.keys("broker:selected:*"))
         keys.extend(await self.redis.keys("positions:cnc_carry:*"))
+        async for key in self.redis.scan_iter(match="cfg:alerts:*"):
+            keys.append(key)
         ids = []
         for k in keys:
             try:
@@ -773,6 +776,58 @@ class RedisStore:
             except (ValueError, IndexError):
                 continue
         return list(set(ids))
+
+    async def save_breakout_watch(self, watch: Dict[str, Any]) -> None:
+        async with self.redis.pipeline(transaction=True) as pipe:
+            pipe.hset("breakout:watches", watch["id"], json.dumps(watch))
+            pipe.expire("breakout:watches", 172800)
+            await pipe.execute()
+
+    async def get_breakout_watch(self, watch_id: str) -> Optional[Dict[str, Any]]:
+        raw = await self.redis.hget("breakout:watches", watch_id)
+        return json.loads(raw) if raw else None
+
+    async def transition_breakout_watch(self, watch_id: str, phase: str, updated: Dict[str, Any]) -> bool:
+        for _ in range(8):
+            async with self.redis.pipeline(transaction=True) as pipe:
+                try:
+                    await pipe.watch("breakout:watches")
+                    raw = await pipe.hget("breakout:watches", watch_id)
+                    if not raw or json.loads(raw).get("phase") != phase:
+                        return False
+                    pipe.multi()
+                    pipe.hset("breakout:watches", watch_id, json.dumps(updated))
+                    await pipe.execute()
+                    return True
+                except WatchError:
+                    continue
+        raise RuntimeError("BREAKOUT_STATE_CONFLICT")
+
+    async def list_breakout_watches(self) -> List[Dict[str, Any]]:
+        return [json.loads(raw) for raw in (await self.redis.hgetall("breakout:watches")).values()]
+
+    async def delete_breakout_watch(self, watch_id: str) -> None:
+        await self.redis.hdel("breakout:watches", watch_id)
+
+    async def queue_telegram_entry(self, user_id: int, event: Dict[str, Any]) -> None:
+        key = f"telegram:entries:{int(user_id)}"
+        async with self.redis.pipeline(transaction=True) as pipe:
+            pipe.hset(key, str(event["trade_id"]), json.dumps(event))
+            pipe.expire(key, 86400)
+            await pipe.execute()
+
+    async def list_telegram_entries(self, user_id: int) -> List[Dict[str, Any]]:
+        rows = await self.redis.hgetall(f"telegram:entries:{int(user_id)}")
+        return [json.loads(value) for value in rows.values()]
+
+    async def delete_telegram_entry(self, user_id: int, trade_id: str) -> None:
+        await self.redis.hdel(f"telegram:entries:{int(user_id)}", trade_id)
+
+    async def claim_telegram_message(self, user_id: int, identity: str) -> bool:
+        return bool(await self.redis.set(f"telegram:sent:{int(user_id)}:{identity}", "sending", nx=True, ex=60))
+
+    async def mark_telegram_sent(self, user_id: int, identity: str) -> None:
+        await self.redis.set(f"telegram:sent:{int(user_id)}:{identity}", "sent", ex=172800)
 
     # =========================
     # Alert config (hash)
@@ -1000,6 +1055,8 @@ class RedisStore:
                 out.append(json.loads(raw))
             except Exception:
                 continue
+        if any(result.get("breakout_watch_id") for row in out for result in row.get("result") or []):
+            return project_alerts(out, await self.list_breakout_watches(), user_id)
         return out
 
     async def delete_alerts(self, user_id: int) -> None:

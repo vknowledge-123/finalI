@@ -17,6 +17,8 @@ from kiteconnect import KiteConnect  # type: ignore
 
 # Keep dependencies intact (same modules you already use)
 from .redis_store import RedisStore, norm_alert_name, norm_symbol
+from .alert_features import alert_time, breakout_level, enabled as feature_enabled
+from .breakout_state import config_signature, waiting_result
 from .stock_sector import SECTOR_INDEX_INSTRUMENTS, STOCK_INDEX_MAPPING
 import os 
 import re
@@ -1126,8 +1128,8 @@ class TradeEngine:
 
     async def _pnl_exit_monitor(self) -> None:
         """
-        Poll Kite MTM/P&L (positions) every ~2s.
-        If MTM >= max_profit OR MTM <= -max_loss => squareoff all + enable kill switch for the day.
+        Poll broker positions MTM/P&L every ~2s.
+        On a limit breach, block entries and exit known MIS/CNC exposure.
         """
         while True:
             try:
@@ -1177,7 +1179,7 @@ class TradeEngine:
                     await self.trigger_kill_switch(
                         reason=f"PNL_EXIT:{trigger}:MTM={mtm:.2f}",
                         squareoff_first=True,
-                        products={"MIS"},
+                        products={"MIS", "CNC"},
                     )
             except asyncio.CancelledError:
                 raise
@@ -2243,12 +2245,14 @@ class TradeEngine:
             instrument_token=int(token),
             from_date=start,
             to_date=now,
-            interval=interval,
+            interval="minute" if interval == "1minute" else interval,
             continuous=False,
             oi=False,
         )
         interval_minutes = 5
-        if interval.endswith("minute"):
+        if interval == "minute":
+            interval_minutes = 1
+        elif interval.endswith("minute"):
             try:
                 interval_minutes = int(interval[:-6])
             except Exception:
@@ -2601,7 +2605,9 @@ class TradeEngine:
             return [{"symbol": "", "status": "SKIPPED", "reason": "NO_SYMBOLS_PARSED", "exit_alert": exit_alert_key}]
         return results
 
-    async def on_chartink_alert(self, alert_name: str, symbols: List[str], ts: str = "") -> List[Dict[str, Any]]:
+    async def on_chartink_alert(self, alert_name: str, symbols: List[str], ts: str = "", *,
+                                breakout_watch_id: str = "", monitor_owner: str = "api") -> List[Dict[str, Any]]:
+        monitor_started_at = time.time()
         alert_key = normalize_alert_key(alert_name)
         exit_cfg = await self._find_exit_alert_config(alert_key)
         if exit_cfg:
@@ -2616,6 +2622,7 @@ class TradeEngine:
             return [{"symbol": s, "status": "SKIPPED", "reason": "KILL_SWITCH"} for s in symbols]
 
         cfg = AlertConfig.from_dict(cfg_raw)
+        received_at = alert_time(ts)
         if not cfg.enabled:
             return [{"symbol": s, "status": "SKIPPED", "reason": "DISABLED"} for s in symbols]
 
@@ -2650,10 +2657,33 @@ class TradeEngine:
                 results.append({"symbol": sym, "status": "ERROR", "reason": "ENTRY_LOCK_UNAVAILABLE"})
                 continue
 
+            watch = None
             try:
+                if breakout_watch_id:
+                    watch = await self.store.get_breakout_watch(breakout_watch_id)
+                    if (not watch or watch.get("phase") != "WAITING" or watch.get("user_id") != self.user_id
+                            or watch.get("symbol") != sym or watch.get("alert_name") != alert_key
+                            or watch.get("owner") != monitor_owner):
+                        watch = None
+                        results.append({"symbol": sym, "status": "SKIPPED", "reason": "BREAKOUT_WATCH_INACTIVE"})
+                        continue
+                    if time.time() >= watch["expires_at"]:
+                        results.append({"symbol": sym, "status": "SKIPPED", "reason": "BREAKOUT_TTL_EXPIRED"})
+                        continue
+                    if config_signature(cfg_raw) != watch["config_signature"]:
+                        results.append({"symbol": sym, "status": "SKIPPED", "reason": "BREAKOUT_CONFIG_CHANGED"})
+                        continue
+                elif feature_enabled(cfg_raw.get("high_break_enabled")):
+                    existing = next((w for w in await self.store.list_breakout_watches()
+                                     if w["user_id"] == self.user_id and w["symbol"] == sym
+                                     and w["alert_name"] == alert_key and w["phase"] in ("WAITING", "EXECUTING")), None)
+                    if existing and (existing["phase"] == "EXECUTING" or time.time() < existing["expires_at"]):
+                        results.append(waiting_result(existing))
+                        continue
                 custom_signal = None
                 custom_meta: Dict[str, Any] = {}
                 custom_settings: Dict[str, Any] = {}
+                ranked: List[tuple] = []
 
                 # sector filter
                 if cfg.sector_filter_on:
@@ -2668,10 +2698,6 @@ class TradeEngine:
                             ranked = self.get_sector_rank()
                     if not ranked:
                         results.append({"symbol": sym, "status": "SKIPPED", "reason": "SECTOR_RANK_NOT_READY"})
-                        continue
-                    top_secs = [sec for sec, _ in ranked[: max(1, int(cfg.top_n_sector or 1))]]
-                    if sector not in top_secs:
-                        results.append({"symbol": sym, "status": "SKIPPED", "reason": "SECTOR_FILTER"})
                         continue
 
                 if cfg.strategy_mode in ("PRECISION_SNIPER", "GMMA_OBV", "GMMA_GOLD_CROSS", "LIQUIDITY_SWEEP", "PURE_LIQUIDITY_SWEEP", "GVK_TREND"):
@@ -2774,6 +2800,15 @@ class TradeEngine:
                         results.append({"symbol": sym, "status": "SKIPPED", "reason": "CUSTOM_DUPLICATE_CANDLE"})
                         continue
 
+                side: Side = custom_signal.side if custom_signal else ("BUY" if cfg.direction == "LONG" else "SELL")
+                if cfg.sector_filter_on:
+                    # BOTH custom strategies must use the confirmed order side.
+                    ranked = sorted(ranked, key=lambda item: item[1], reverse=side == "BUY")
+                    top_secs = [sec for sec, _ in ranked[: max(1, int(cfg.top_n_sector or 1))]]
+                    if sector not in top_secs:
+                        results.append({"symbol": sym, "status": "SKIPPED", "reason": "SECTOR_FILTER"})
+                        continue
+
                 # already open
                 pos_existing = self.positions.get(sym)
                 if pos_existing and pos_existing.status in ("OPEN", "EXIT_CONDITIONS_MET", "EXITING"):
@@ -2783,9 +2818,38 @@ class TradeEngine:
                     results.append({"symbol": sym, "status": "SKIPPED", "reason": "ALREADY_OPEN"})
                     continue
 
+                break_level = Decimal(watch["level"]) if watch else None
+                if watch and side != watch["side"]:
+                    results.append({"symbol": sym, "status": "SKIPPED", "reason": "BREAKOUT_DIRECTION_CHANGED"})
+                    continue
+                if not watch and feature_enabled(cfg_raw.get("high_break_enabled")):
+                    try:
+                        minutes = int(cfg_raw.get("high_break_timeframe_minutes", 1))
+                        if minutes not in (1, 5):
+                            raise ValueError("HIGH_BREAK_SETTINGS_INVALID")
+                        ttl = float(cfg_raw.get("high_break_ttl_minutes", 1))
+                        if not math.isfinite(ttl) or not ttl.is_integer() or not 1 <= ttl <= 60:
+                            raise ValueError("HIGH_BREAK_SETTINGS_INVALID")
+                        buffer = float(cfg_raw.get("high_break_buffer", 0)) if feature_enabled(cfg_raw.get("high_break_buffer_enabled")) else 0.0
+                        if not math.isfinite(buffer) or buffer < 0:
+                            raise ValueError("HIGH_BREAK_SETTINGS_INVALID")
+                        candles = await self._fetch_historical_candles(sym, f"{minutes}minute", 1)
+                        break_level = breakout_level(candles, received_at, minutes, side, buffer)
+                    except Exception as exc:
+                        reason = str(exc) if isinstance(exc, ValueError) and str(exc).startswith("HIGH_BREAK_") else "HIGH_BREAK_DATA_UNAVAILABLE"
+                        log.warning("HIGH_BREAK_SKIP | user=%s symbol=%s reason=%s", self.user_id, sym, reason)
+                        results.append({"symbol": sym, "status": "SKIPPED", "reason": reason})
+                        continue
+                    watch = {"id": uuid.uuid4().hex, "user_id": self.user_id, "alert_name": alert_key,
+                             "symbol": sym, "side": side, "level": str(break_level),
+                             "created_at": monitor_started_at, "expires_at": monitor_started_at + ttl * 60,
+                             "alert_time": str(ts or received_at.isoformat()), "owner": monitor_owner,
+                             "phase": "WAITING", "config_signature": config_signature(cfg_raw)}
+                    await self.store.save_breakout_watch(watch)
+
                 feed_ok, feed_reason, live_ltp = await self._wait_for_entry_feed_ready(sym)
                 if not feed_ok:
-                    results.append({"symbol": sym, "status": "SKIPPED", "reason": feed_reason})
+                    results.append(waiting_result(watch) if watch else {"symbol": sym, "status": "SKIPPED", "reason": feed_reason})
                     continue
 
                 ltp = live_ltp if live_ltp > 0 else await self._fetch_ltp(
@@ -2794,7 +2858,7 @@ class TradeEngine:
                 )
                 if ltp <= 0:
                     reason = feed_reason if feed_reason.startswith("NO_FRESH_LIVE_TICK:") else "NO_LTP"
-                    results.append({"symbol": sym, "status": "SKIPPED", "reason": reason})
+                    results.append(waiting_result(watch) if watch else {"symbol": sym, "status": "SKIPPED", "reason": reason})
                     continue
                 if feed_reason.startswith("NO_FRESH_LIVE_TICK:"):
                     log.warning(
@@ -2805,6 +2869,12 @@ class TradeEngine:
                         float(ltp),
                         feed_reason,
                     )
+
+                if break_level is not None:
+                    price = Decimal(str(ltp))
+                    if not (price > break_level if side == "BUY" else price < break_level):
+                        results.append(waiting_result(watch))
+                        continue
 
                 qty = 0
                 if cfg.qty_mode == "QTY":
@@ -2822,6 +2892,26 @@ class TradeEngine:
                     results.append({"symbol": sym, "status": "ERROR", "reason": "ZERO_QTY"})
                     continue
 
+                if watch:
+                    latest_cfg = await self.store.get_alert_config(self.user_id, alert_key)
+                    reason = ""
+                    if time.time() >= watch["expires_at"]:
+                        reason = "BREAKOUT_TTL_EXPIRED"
+                    elif await self.store.is_kill(self.user_id):
+                        reason = "KILL_SWITCH"
+                    elif not _is_within_entry_window(cfg.entry_start_time, cfg.entry_end_time):
+                        reason = "ENTRY_WINDOW"
+                    elif not latest_cfg or config_signature(latest_cfg) != watch["config_signature"]:
+                        reason = "BREAKOUT_CONFIG_CHANGED"
+                    if reason:
+                        results.append({"symbol": sym, "status": "SKIPPED", "reason": reason})
+                        continue
+                    submitting = dict(watch, phase="EXECUTING", executing_at=time.time())
+                    if not await self.store.transition_breakout_watch(watch["id"], "WAITING", submitting):
+                        results.append({"symbol": sym, "status": "SKIPPED", "reason": "BREAKOUT_WATCH_INACTIVE"})
+                        continue
+                    watch = submitting
+
                 # Count only candidates that passed validation and are ready
                 # for order placement. The per-symbol entry lock prevents races.
                 allowed = await self.store.allow_trade(self.user_id, alert_key, int(cfg.trade_limit_per_day))
@@ -2829,16 +2919,13 @@ class TradeEngine:
                     results.append({"symbol": sym, "status": "SKIPPED", "reason": "TRADE_LIMIT"})
                     continue
 
-                side: Side
-                if custom_signal:
-                    side = custom_signal.side  # type: ignore[assignment]
-                else:
-                    side = "BUY" if cfg.direction == "LONG" else "SELL"
-
                 # Place order and confirm actual execution before marking a
                 # strategy position OPEN. Dhan can convert MARKET to a
                 # protection LIMIT order; pending orders are cancelled/retried
                 # by _place_order_with_execution.
+                if watch and time.time() >= watch["expires_at"]:
+                    results.append({"symbol": sym, "status": "SKIPPED", "reason": "BREAKOUT_TTL_EXPIRED"})
+                    continue
                 try:
                     execution = await self._place_order_with_execution(sym, side, qty, cfg.product, cfg.custom_settings)
                 except Exception as e:
@@ -2961,6 +3048,17 @@ class TradeEngine:
                 except Exception:
                     pass
 
+                if cfg.strategy_mode == "CLASSIC" and feature_enabled(cfg_raw.get("telegram_enabled")):
+                    try:
+                        await self.store.queue_telegram_entry(self.user_id, {
+                            "trade_id": pos.trade_id, "created_at": time.time(),
+                            "alert_name": alert_key, "symbol": execution_symbol,
+                            "side": side, "product": pos.product, "qty": executed_qty,
+                            "entry": entry, "target": target_price, "stop_loss": sl_price,
+                        })
+                    except Exception as exc:
+                        log.warning("TELEGRAM_ENTRY_QUEUE_FAILED | user=%s type=%s", self.user_id, type(exc).__name__)
+
                 tick = self.ticks.get(sym) or {}
                 close = float(tick.get("close") or 0.0)
                 pct = ((entry - close) / close * 100.0) if close > 0 else 0.0
@@ -2993,6 +3091,12 @@ class TradeEngine:
                     }
                 )
             finally:
+                if watch and results and results[-1].get("symbol") == sym:
+                    result = results[-1]
+                    result["breakout_watch_id"] = watch["id"]
+                    if result.get("status") != "WAITING_FOR_BREAKOUT":
+                        await self.store.transition_breakout_watch(watch["id"], watch["phase"],
+                                                                  dict(watch, phase="DONE", result=result))
                 if lock_acquired:
                     try:
                         await self.store.release_lock(self.user_id, sym, "entry")
@@ -3272,6 +3376,8 @@ class TradeEngine:
         trigger = last_add * (1.0 + step) if pos.side == "BUY" else last_add * (1.0 - step)
         should_add = ltp >= trigger if pos.side == "BUY" else ltp <= trigger
         if not should_add:
+            return False
+        if await self.store.is_kill(self.user_id):
             return False
 
         self._pyramid_inflight[symbol] = True
@@ -4031,7 +4137,9 @@ class TradeEngine:
 
         # 1) Memory fast path
         pos = self.positions.get(symbol)
-        if pos and pos.status == "OPEN":
+        if not pos:
+            pos = await self._hydrate_open_position_from_store(symbol)
+        if pos and pos.status in {"OPEN", "EXITING", "EXIT_CONDITIONS_MET"}:
             log.info("🖐️ MANUAL_EXIT_MEM | user=%s symbol=%s reason=%s", self.user_id, symbol, reason)
             await self._exit_position(symbol, reason)
             return {"status": "EXIT_TRIGGERED", "symbol": symbol, "reason": reason, "source": "MEMORY"}
@@ -4429,12 +4537,14 @@ class TradeEngine:
         products: Optional[Set[str]] = None,
     ) -> Dict[str, Any]:
         """
-        Panic action: square-off exposure (best-effort), then enable kill switch.
+        Block new entries locally, then square-off exposure (best-effort).
+        This is not Dhan's broker kill switch, which requires a flat account.
         """
         async with self._kill_trigger_lock:
             if await self.store.is_kill(self.user_id):
                 return {"ok": True, "enabled": True, "already": True}
 
+            await self._enable_kill_switch(reason=reason)
             sq: Optional[Dict[str, Any]] = None
             if squareoff_first:
                 try:
@@ -4442,5 +4552,4 @@ class TradeEngine:
                 except Exception as e:
                     sq = {"ok": False, "error": str(e), "count": 0, "results": []}
 
-            await self._enable_kill_switch(reason=reason)
             return {"ok": True, "enabled": True, "squareoff": sq}

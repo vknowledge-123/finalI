@@ -1,6 +1,7 @@
 import os
 import unittest
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 os.environ.setdefault("APP_TESTING", "1")
 
@@ -10,6 +11,53 @@ from app.trade_engine import OrderExecution, TradeEngine
 
 
 class SectorCacheTests(unittest.IsolatedAsyncioTestCase):
+    async def test_both_direction_uses_custom_signal_side_for_sector_selection(self) -> None:
+        for side, admitted in [("BUY", "GAINER"), ("SELL", "LOSER")]:
+            with self.subTest(side=side):
+                store = InMemoryStore()
+                await store.save_alert_config(1, {
+                    "alert_name": "BOTH_SECTOR", "enabled": True, "direction": "BOTH",
+                    "strategy_mode": "PRECISION_SNIPER", "sector_filter_on": True, "top_n_sector": 1,
+                    "entry_start_time": "00:00", "entry_end_time": "23:59",
+                })
+                engine = TradeEngine(1, store)
+                engine.sym_sector = {"GAINER": "NIFTY AUTO", "LOSER": "NIFTY METAL"}
+                engine.sector_sum = {"NIFTY AUTO": 4, "NIFTY METAL": -3}
+                engine.sector_cnt = {"NIFTY AUTO": 1, "NIFTY METAL": 1}
+                engine._fetch_historical_candles = AsyncMock(return_value=[])
+                engine._wait_for_entry_feed_ready = AsyncMock(return_value=(False, "TEST_FEED_GUARD", 0))
+                signal = SimpleNamespace(side=side, candle_time="2026-09-16T10:00:00")
+                with patch("app.trade_engine.evaluate_precision_sniper", return_value=(signal, {})):
+                    result = await engine.on_chartink_alert("BOTH_SECTOR", ["GAINER", "LOSER"])
+                self.assertEqual({row["symbol"] for row in result if row["reason"] == "TEST_FEED_GUARD"}, {admitted})
+
+    async def test_entry_sector_selection_uses_direction_and_top_n(self) -> None:
+        for direction, top_n, expected in [
+            ("SHORT", 1, {"LOSER"}), ("SHORT", 2, {"LOSER", "RUNNER"}),
+            ("LONG", 1, {"GAINER"}), ("LONG", 2, {"GAINER", "RUNNER"}),
+        ]:
+            with self.subTest(direction=direction, top_n=top_n):
+                store = InMemoryStore()
+                await store.save_alert_config(1, {
+                    "alert_name": "RANK_DIRECTION", "enabled": True,
+                    "direction": direction, "sector_filter_on": True, "top_n_sector": top_n,
+                    "entry_start_time": "00:00", "entry_end_time": "23:59",
+                })
+                engine = TradeEngine(1, store)
+                engine.sym_sector = {"LOSER": "NIFTY METAL", "RUNNER": "NIFTY IT", "GAINER": "NIFTY AUTO"}
+                engine.load_sector_cache({"sectors": [
+                    {"name": "NIFTY AUTO", "ltp": 104, "prev_close": 100, "pct": 4},
+                    {"name": "NIFTY IT", "ltp": 99, "prev_close": 100, "pct": -1},
+                    {"name": "NIFTY METAL", "ltp": 97, "prev_close": 100, "pct": -3},
+                ]})
+                # Stop at the next guard so this tests filtering without broker orders.
+                engine._wait_for_entry_feed_ready = AsyncMock(return_value=(False, "TEST_FEED_GUARD", 0))
+                result = await engine.on_chartink_alert("RANK_DIRECTION", ["LOSER", "RUNNER", "GAINER"])
+                admitted = {row["symbol"] for row in result if row["reason"] == "TEST_FEED_GUARD"}
+                self.assertEqual(admitted, expected)
+                self.assertTrue(all(row["reason"] in {"TEST_FEED_GUARD", "SECTOR_FILTER"} for row in result))
+                self.assertEqual(engine.get_sector_rank()[0][0], "NIFTY AUTO")
+
     def test_sector_quote_values_reads_dhan_ohlc_shape(self) -> None:
         response = {
             "status": "success",

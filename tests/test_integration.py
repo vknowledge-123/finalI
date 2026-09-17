@@ -603,6 +603,45 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(cfg["cost_sl_enabled"], True)
         self.assertEqual(cfg["cost_sl_rr"], 2.0)
 
+    def test_execution_settings_preserve_zero_and_normalize_aliases(self) -> None:
+        cases = [
+            {"order_pending_retry_count": 0, "order_limit_buffer_pct": 0},
+            {"execution_retry_count": 0, "dhan_limit_buffer_pct": 0},
+            {"execution_retry_count": "0", "execution_protection_pct": "0"},
+            {"order_pending_retry_count": 0, "execution_retry_count": 3,
+             "order_limit_buffer_pct": 0, "dhan_limit_buffer_pct": 2},
+        ]
+        from app.trade_engine import TradeEngine
+        engine = TradeEngine(1, InMemoryStore())
+        for index, settings in enumerate(cases):
+            with self.subTest(settings=settings):
+                response = self.client.post("/api/alert-config", json={
+                    "user_id": 1, "alert_name": f"ZERO SETTINGS {index}", **settings,
+                }).json()
+                self.assertEqual(response["status"], "saved")
+                configs = self.client.get("/api/alert-config?user_id=1").json()["configs"]
+                cfg = configs[f"zero settings {index}"]
+                self.assertEqual(cfg["order_pending_retry_count"], 0)
+                self.assertEqual(cfg["order_limit_buffer_pct"], 0)
+                self.assertEqual(engine._order_confirm_settings(cfg), (1.5, 0))
+                self.assertEqual(engine._dhan_limit_settings(cfg)[0], 0)
+
+    def test_execution_settings_defaults_and_invalid_values(self) -> None:
+        for settings in [{}, {"order_pending_retry_count": None, "order_limit_buffer_pct": ""}]:
+            result = self.client.post("/api/alert-config", json={
+                "user_id": 1, "alert_name": "EXEC DEFAULTS", **settings,
+            }).json()
+            self.assertEqual(result["config"]["order_pending_retry_count"], 1)
+            self.assertEqual(result["config"]["order_limit_buffer_pct"], 0.15)
+        for key, value in [("order_pending_retry_count", -1), ("order_pending_retry_count", 0.5),
+                           ("order_confirm_timeout_sec", 0), ("order_limit_buffer_pct", -0.1),
+                           ("order_limit_buffer_pct", "nan")]:
+            with self.subTest(key=key, value=value):
+                result = self.client.post("/api/alert-config", json={
+                    "user_id": 1, "alert_name": "EXEC INVALID", key: value,
+                }).json()
+                self.assertEqual(result["error"], "ORDER_EXECUTION_SETTINGS_INVALID")
+
     def test_alert_config_preserves_raw_name_and_blocks_real_collision(self) -> None:
         payload = {
             "user_id": 1,
