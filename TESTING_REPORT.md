@@ -1,11 +1,99 @@
 # Integration Test Report
 
-Date: 2026-09-17
+Date: 2026-09-19
 
-Latest complete suite: **256 tests passed**, no failures or skips, 12 deprecation
-warnings (21.57 seconds). Python compilation passed. Shell scripts are unchanged
-since the previous successful syntax checks.
+Latest complete suite: **287 tests passed**, no failures or skips, 12 deprecation
+warnings (22.78 seconds). Python compilation and all four deployment scripts'
+Bash syntax checks passed. Desktop, tablet and mobile Chrome smoke tests passed.
 No live orders were placed. The production VMs were not changed.
+
+## Completed Broker Integration Review
+
+This section completes the review interrupted on September 17. The earlier
+implementation fixes were already present in commit `df9588b` when work resumed;
+the final pass adds packet-to-dashboard coverage, exercises actual request
+cancellation, and removes the breakout tests' dependency on today's weekday.
+The first resumed run correctly rejected Saturday candles in 20 test fixtures.
+Fixtures now use a fixed trading day; production weekend checks are unchanged.
+
+### Fixes Verified
+
+- Zerodha order acceptance no longer implies a fill. Both brokers require
+  execution evidence, and explicit zero fills are not reconstructed from a
+  cancelled order's zero pending quantity. Dhan EXPIRED is terminal.
+- KiteConnect 5.0.1 does not accept the `market_protection` keyword on its public
+  placement method. The compatibility helper sends the field through that SDK's
+  authenticated transport once, without falling back to an unprotected order or
+  retrying a potentially accepted request after TypeError.
+- Zerodha trade-book `average_price` and rejection messages are normalized.
+  Unknown rejection reasons do not cause blind retries. Confirmed partial fills
+  survive a later placement retry failure; new exposure is blocked for review.
+- Manual broker-book exits use the net view, acquire an exit lock, and report
+  actual filled and remaining quantities. Account-wide position changes are not
+  treated as proof that a particular order filled.
+- CNC restoration reads both brokers' holdings, respects zero availability and
+  persisted strategy ownership, and preserves strategy entry cost. A missing
+  holding is checked against today's CNC positions before being left unresolved;
+  it is no longer silently deleted as though an exit were confirmed.
+- Engine initialization is serialized and incomplete engines are not published.
+  Service workers refresh credentials at job boundaries without rebuilding an
+  unchanged broker client. Zero-second-old ticks are accepted as fresh.
+- Zerodha tick delivery is bounded and ordered, preserves receive timestamps,
+  coalesces thread wakeups and blocks entries on overflow. Callback failures do
+  not terminate the consumer. Shutdown releases its task and pending work.
+- CPU-heavy backtests run in a single separate worker process. Busy requests are
+  rejected rather than queued without bounds; cancelling a request does not free
+  capacity while its calculation is still running. Blocking broker login/profile,
+  instrument download, password hashing/checking and SMTP calls are offloaded.
+- Breakout expiry is checked again immediately before queued order submission.
+  Admin creation uses atomic create-only storage, and email failure never returns
+  a plaintext OTP. The third permitted OTP attempt is usable.
+
+### Verification Coverage
+
+- Backend/API suite covers authentication and TOTP, configuration, webhook queues,
+  execution, partial fills, reconciliation, tick recovery, exits, CNC persistence,
+  risk controls, sector ranking, custom strategies, Telegram and breakout TTL.
+  Passing tests are coverage evidence, not an exhaustive certification of every
+  branch or broker failure mode.
+- Broker contract tests use the installed DhanHQ 2.2.0 and KiteConnect 5.0.1 SDKs
+  with simulated transports. A real Kite binary packet is decoded and delivered
+  through the app callback to storage, the engine and dashboard broadcast.
+  Existing Dhan binary-feed, reconnection and shutdown regressions also pass.
+- Real Chrome at 1440x1000, 768x1024 and 390x844 exercises local API save/GET/reload,
+  optional-feature controls, hidden saved Telegram tokens, zero settings,
+  breakout expiry, tick-driven P&L, preserved trailing stops and closed positions.
+  No browser page errors were observed; desktop/mobile screenshots were inspected.
+- `compileall app tests` passed. Pyflakes scanned all 53 application Python files
+  plus tests: no undefined names or syntax errors; 29 findings remain for unused
+  imports/variables/globals and a duplicate helper definition. These are not a
+  clean-lint claim. `git diff --check` passed.
+- `bash -n` passed for `setup_letsencrypt.sh`, `restart_trading_stack.sh`,
+  `reset_admin_auth.sh` and `install_daily_restart_timer.sh`.
+
+### Documentation And Limits
+
+Order status, cancellation and trade retrieval were checked against the official
+[Dhan order documentation](https://dhanhq.co/docs/v2/orders/) and
+[Kite order documentation](https://kite.trade/docs/connect/v3/orders/).
+Feed contracts were checked against the official
+[Dhan live feed documentation](https://dhanhq.co/docs/v2/live-market-feed/) and
+[Kite WebSocket documentation](https://kite.trade/docs/connect/v3/websocket/).
+Holdings/position distinctions were checked against
+[Dhan portfolio documentation](https://dhanhq.co/docs/v2/portfolio/) and
+[Kite portfolio documentation](https://kite.trade/docs/connect/v3/portfolio/).
+The supplied Dhan OpenAPI JSON and SDK reference were also reviewed.
+
+Tests ran locally on Windows/Python 3.13, with Redis 5.0.8 client and in-memory or
+fakeredis storage. Local FastAPI is 0.115.6 (the deployment requirement is 0.115.5),
+so this is not a clean-room verification of every production dependency pin.
+The 12 warnings concern deprecated FastAPI lifecycle hooks, Redis close and a
+Dhan SDK datetime conversion. No production Redis, five-process Linux deployment,
+live login, exchange fills, real Telegram delivery or sustained market-load
+benchmark was tested. SDK upgrades still require contract tests. Broker/network
+latency, circuit limits and unavailable liquidity can prevent immediate fills.
+An unresolved CNC record or uncertain order requires reconciliation, not blind
+replay. This report does not certify the application as bug-free or attack-proof.
 
 ## Breakout Monitoring TTL
 

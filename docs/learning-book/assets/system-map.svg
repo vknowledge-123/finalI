@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="350" viewBox="0 0 900 350" role="img" aria-labelledby="title description">
+<title id="title">The practical rebuild sequence</title>
+<desc id="description">Python foundations lead to APIs and secure identity, durable state and queues, safe paper execution, testing, and Google Cloud operations. Analytics and AI are separate advisory systems.</desc>
+<rect width="900" height="350" fill="#f2f6f4"/>
+<g font-family="Arial, sans-serif" fill="#20332b">
+<text x="28" y="38" font-size="16" font-weight="700">BUILD IN LAYERS</text>
+<g stroke="#afc7bd" fill="#fff" stroke-width="1.5">
+<rect x="28" y="62" width="250" height="75" rx="4"/><rect x="325" y="62" width="250" height="75" rx="4"/><rect x="622" y="62" width="250" height="75" rx="4"/>
+<rect x="28" y="177" width="250" height="75" rx="4"/><rect x="325" y="177" width="250" height="75" rx="4"/><rect x="622" y="177" width="250" height="75" rx="4"/>
+</g>
+<g font-size="20" font-weight="700">
+<text x="45" y="92">01 Python</text><text x="342" y="92">02 APIs and identity</text><text x="639" y="92">03 Durable state</text>
+<text x="45" y="207">04 Paper execution</text><text x="342" y="207">05 Testing</text><text x="639" y="207">06 Cloud operations</text>
+</g>
+<g font-size="15" fill="#52645d">
+<text x="45" y="118">Values, functions, concurrency</text><text x="342" y="118">Contracts, login, authorization</text><text x="639" y="118">Ledger, queues, ownership</text>
+<text x="45" y="233">Fills, risk, reconciliation</text><text x="342" y="233">Unit, integration, browser, faults</text><text x="639" y="233">Deploy, observe, recover</text>
+</g>
+<g stroke="#397c66" stroke-width="2" fill="none"><path d="M285 100h30m-7-6 7 6-7 6"/><path d="M582 100h30m-7-6 7 6-7 6"/><path d="M285 215h30m-7-6 7 6-7 6"/><path d="M582 215h30m-7-6 7 6-7 6"/></g>
+<path d="M747 137v20H153v20" fill="none" stroke="#397c66" stroke-width="2"/>
+<rect x="28" y="278" width="844" height="47" fill="#eee6ed" rx="4"/>
+<text x="46" y="307" font-size="17" fill="#6d3455">Optional specialization: data pipelines, ML and retrieval. No authority to place orders.</text>
+</g></svg>

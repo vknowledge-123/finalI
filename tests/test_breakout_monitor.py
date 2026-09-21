@@ -20,7 +20,8 @@ class BreakoutMonitorTests(unittest.IsolatedAsyncioTestCase):
                     "high_break_ttl_minutes": 2, "high_break_buffer_enabled": True, "high_break_buffer": .1}
         await self.store.save_alert_config(1, self.cfg)
         self.engine = TradeEngine(1, self.store)
-        self.at = datetime.now(IST).replace(hour=10, minute=30, second=3, microsecond=0)
+        # Candle selection must not depend on whether the test runs on a weekend.
+        self.at = datetime(2026, 9, 17, 10, 30, 3, tzinfo=IST)
         self.engine._fetch_historical_candles = AsyncMock(return_value=[{
             "date": self.at.replace(second=0) - timedelta(minutes=1), "high": 100, "low": 99,
         }])

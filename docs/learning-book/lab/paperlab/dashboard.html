@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Trading School Paper Lab</title>
+  <style>
+    * { box-sizing:border-box; }
+    body { margin:0; color:#18212a; background:#f4f6f7; font:16px/1.5 system-ui,sans-serif; }
+    header { background:#172521; color:white; padding:20px 24px; }
+    h1 { font-size:24px; margin:0; } h2 { font-size:20px; }
+    main { max-width:1040px; margin:auto; padding:24px; }
+    section { padding:0 0 24px; margin-bottom:24px; border-bottom:1px solid #cbd2d5; }
+    form { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:14px; }
+    label { display:flex; flex-direction:column; gap:5px; }
+    input,select,button { font:inherit; padding:10px; min-width:0; border:1px solid #7c898d; border-radius:4px; }
+    button { background:#146552; color:white; cursor:pointer; min-height:44px; }
+    #status { min-height:28px; color:#8e2549; overflow-wrap:anywhere; }
+    .table-wrap { overflow-x:auto; } table { width:100%; border-collapse:collapse; background:white; }
+    th,td { text-align:left; padding:12px; border-bottom:1px solid #d8dfe1; white-space:nowrap; }
+    th { background:#e6ecea; } .badge { color:#fcdd8b; font-size:13px; }
+    @media(max-width:620px) { main { padding:16px; } form { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+  <header><h1>Trading School</h1><span class="badge">PAPER ONLY</span></header>
+  <main>
+    <section>
+      <h2>Strategy</h2>
+      <form id="config">
+        <label>Strategy name<input id="name" value="Practice" required maxlength="120"></label>
+        <label>Direction<select id="side"><option>BUY</option><option>SELL</option></select></label>
+        <label>Quantity<input id="quantity" type="number" min="1" max="10000" value="1" required></label>
+        <label>Target percent<input id="target" type="number" min="0.01" max="99" step="0.01" value="2" required></label>
+        <label>Stop percent<input id="stop" type="number" min="0.01" max="99" step="0.01" value="1" required></label>
+        <label>Retry count<input id="retries" type="number" min="0" max="3" value="0" required></label>
+        <button type="submit">Save strategy</button>
+      </form>
+      <p id="status" role="status" aria-live="polite"></p>
+    </section>
+    <section>
+      <h2>Positions</h2><button id="refresh" type="button">Refresh positions</button>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>LTP</th><th>P&amp;L</th><th>Status</th><th>Exit</th></tr></thead>
+        <tbody id="positions"></tbody>
+      </table></div>
+    </section>
+  </main>
+  <script>
+    const status = document.querySelector('#status');
+    async function request(url, options = {}) {
+      const response = await fetch(url, options);
+      const text = await response.text();
+      let data;
+      try { data = JSON.parse(text); }
+      catch { throw new Error(`Unexpected server response (${response.status})`); }
+      if (!response.ok || data.ok === false) {
+        throw new Error(typeof data.detail === 'string' ? data.detail : `Request failed (${response.status})`);
+      }
+      return data;
+    }
+    document.querySelector('#config').addEventListener('submit', async event => {
+      event.preventDefault();
+      const button = event.target.querySelector('button');
+      button.disabled = true;
+      try {
+        const data = await request('/api/configs', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({name:document.querySelector('#name').value,
+            side:document.querySelector('#side').value,
+            quantity:Number(document.querySelector('#quantity').value),
+            target_pct:document.querySelector('#target').value,
+            stop_pct:document.querySelector('#stop').value,
+            retry_count:Number(document.querySelector('#retries').value)})
+        });
+        status.textContent = `Saved ${data.strategy.name}`;
+      } catch(error) { status.textContent = error.message; }
+      finally { button.disabled = false; }
+    });
+    async function refresh() {
+      try {
+        const data = await request('/api/positions');
+        const body = document.querySelector('#positions');
+        body.replaceChildren();
+        for (const position of data.positions) {
+          const row = document.createElement('tr');
+          for (const field of ['symbol','side','quantity','entry','ltp','pnl','status','exit_reason']) {
+            const cell = document.createElement('td');
+            cell.textContent = position[field] ?? '-';
+            row.appendChild(cell);
+          }
+          body.appendChild(row);
+        }
+      } catch(error) { status.textContent = error.message; }
+    }
+    document.querySelector('#refresh').addEventListener('click', refresh);
+    refresh();
+  </script>
+</body>
+</html>

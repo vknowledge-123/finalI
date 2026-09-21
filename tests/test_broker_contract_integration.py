@@ -1,11 +1,12 @@
 import asyncio
+import struct
 import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from dhanhq import DhanContext, dhanhq
-from kiteconnect import KiteConnect
+from kiteconnect import KiteConnect, KiteTicker
 
 from app.auth import AuthService
 from app.dhan_broker import normalize_dhan_holdings
@@ -241,6 +242,42 @@ class BrokerIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ConcurrencyAndAuthTests(unittest.IsolatedAsyncioTestCase):
+    async def test_kite_sdk_packet_reaches_store_engine_and_dashboard(self):
+        from app import main
+        store = InMemoryStore()
+        await store.save_credentials(1, "FAKE", "FAKE")
+        await store.save_access_token(1, "FAKE")
+        token = 123 * 256 + 1
+        packet = struct.pack(">HHII", 1, 8, token, 10025)
+        ticks = KiteTicker("FAKE", "FAKE")._parse_binary(packet)
+        engine = SimpleNamespace(on_tick=AsyncMock(return_value=None))
+        ticker = SimpleNamespace(connect=Mock(), close=Mock())
+        manager = SimpleNamespace(broadcast_nowait=Mock())
+        with patch.multiple(main, store=store, APP_LOOP=asyncio.get_running_loop(),
+                            KT=None, KT_USER_ID=None, KT_ACCESS_TOKEN="", KT_CONNECTED=False,
+                            KT_TASK=None, KT_DELIVERY=None, KT_LOCK=asyncio.Lock(),
+                            TOKEN_TO_SYMBOL={token: "SBIN"}, ws_mgr=manager), \
+                patch.object(main, "_is_test_mode", return_value=False), \
+                patch.object(main, "_save_feed_health_nowait"), \
+                patch.object(main, "ensure_engine", AsyncMock(return_value=engine)), \
+                patch.object(main, "KiteTicker", return_value=ticker):
+            try:
+                await main.start_kite_ticker(1)
+                await main.KT_TASK
+                received_before = time.time()
+                await asyncio.to_thread(ticker.on_ticks, ticker, ticks)
+                await asyncio.wait_for(asyncio.to_thread(main.KT_DELIVERY.queue.join), 2)
+                saved = await store.load_latest_tick(1, "SBIN")
+                self.assertEqual((saved["ltp"], saved["source"]), (100.25, "ZERODHA_WS"))
+                self.assertGreaterEqual(saved["ts"], received_before)
+                self.assertLessEqual(saved["ts"], time.time())
+                engine.on_tick.assert_awaited_once_with("SBIN", 100.25, 0.0, 100.25, 100.25, 0.0, 0.0)
+                self.assertEqual(manager.broadcast_nowait.call_args.args[1]["ltp"], 100.25)
+                ticker.connect.assert_called_once_with(threaded=True)
+            finally:
+                await main._stop_kite_ticker()
+            ticker.close.assert_called_once()
+
     async def test_admin_creation_cannot_overwrite_an_existing_admin(self):
         import fakeredis.aioredis
         from app.redis_store import RedisStore
@@ -326,11 +363,22 @@ class ConcurrencyAndAuthTests(unittest.IsolatedAsyncioTestCase):
     async def test_backtest_admission_stays_bounded_after_request_cancellation(self):
         from app.services.backtest_service import BacktestService
         service = BacktestService()
-        service._job = asyncio.get_running_loop().create_future()
-        with self.assertRaisesRegex(RuntimeError, "BACKTEST_BUSY"):
-            await service.run_custom_strategy([])
-        service._job.cancel()
-        await service.close()
+        loop = asyncio.get_running_loop()
+        worker_result = loop.create_future()
+        service._pool = Mock()
+        try:
+            with patch.object(loop, "run_in_executor", return_value=worker_result):
+                request = asyncio.create_task(service.run_custom_strategy([]))
+                await asyncio.sleep(0)
+                request.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await request
+            self.assertFalse(worker_result.cancelled())
+            with self.assertRaisesRegex(RuntimeError, "BACKTEST_BUSY"):
+                await service.run_custom_strategy([])
+        finally:
+            worker_result.set_result({"trades": []})
+            await service.close()
 
     async def test_registry_never_exposes_partially_initialized_engine(self):
         store = InMemoryStore()
