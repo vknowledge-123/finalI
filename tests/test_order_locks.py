@@ -1,5 +1,7 @@
 import asyncio
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from app.memory_store import InMemoryStore
 
@@ -19,10 +21,30 @@ class OrderLockTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.store.acquire_lock(1, "SBIN", "exit"), 1)
 
     async def test_slow_operation_renews_past_original_expiry(self):
-        self.assertEqual(await self.store.acquire_lock(1, "SBIN", "exit", ttl_ms=120), 1)
-        await asyncio.sleep(0.35)
-        self.assertEqual(await self.store.acquire_lock(1, "SBIN", "exit"), 0)
-        self.assertFalse(await self.store.is_kill(1))
+        clock = 100.0
+        renewed = asyncio.Event()
+        renew = self.store._renew_order_lock
+
+        async def advance_and_renew(key, token, ttl_ms):
+            nonlocal clock
+            clock += 0.04
+            ok = await renew(key, token, ttl_ms)
+            if clock >= 100.35:
+                renewed.set()
+            return ok
+
+        # Advance lease time per renewal, independently of OS scheduling delays.
+        with patch("app.memory_store.time", SimpleNamespace(time=lambda: clock)), patch.object(
+            self.store, "_renew_order_lock", advance_and_renew
+        ):
+            self.assertEqual(await self.store.acquire_lock(1, "SBIN", "exit", ttl_ms=120), 1)
+            try:
+                await asyncio.wait_for(renewed.wait(), timeout=5)
+                self.assertGreater(clock, 100.12)
+                self.assertEqual(await self.store.acquire_lock(1, "SBIN", "exit"), 0)
+                self.assertFalse(await self.store.is_kill(1))
+            finally:
+                await self.store.release_lock(1, "SBIN", "exit")
 
     async def test_another_task_cannot_release_owners_lock(self):
         await self.store.acquire_lock(1, "SBIN", "exit")

@@ -46,8 +46,9 @@ def main():
                     page = context.new_page()
                     errors = []
                     page.on("pageerror", lambda error: errors.append(str(error)))
-                    loaded = page.goto(f"http://127.0.0.1:{port}/dashboard", wait_until="networkidle")
+                    loaded = page.goto(f"http://127.0.0.1:{port}/dashboard", wait_until="domcontentloaded")
                     assert loaded.status == 200, (loaded.status, page.url)
+                    page.wait_for_function("typeof openCfg === 'function' && typeof formatPrice === 'function'")
                     assert page.evaluate("typeof formatPrice") == "function", (page.url, errors, page.title(), page.locator('body').inner_text()[:200])
                     assert page.evaluate("formatPrice(427.5 * 1.01)") == "431.78"
                     assert page.evaluate("alertPosition({alert_name:'second'}, {status:'ENTERED'}, {alert_name:'first'})") is None
@@ -131,8 +132,9 @@ def main():
                     assert config["high_break_ttl_minutes"] == 2, config
                     assert config["telegram_enabled"] and config["telegram_token_set"], config
                     assert "telegram_bot_token_encrypted" not in config and "telegram_bot_token" not in config, config
-                    reloaded = page.reload(wait_until="networkidle")
+                    reloaded = page.reload(wait_until="domcontentloaded")
                     assert reloaded.status == 200, (reloaded.status, page.url)
+                    page.wait_for_function("typeof openCfg === 'function' && typeof formatPrice === 'function'")
                     assert page.evaluate("typeof openCfg") == "function", (page.url, errors, page.title())
                     page.evaluate("openCfg()")
                     page.evaluate("name => fillCfg(name)", config_key)

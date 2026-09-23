@@ -425,27 +425,33 @@ class HistoricalDataTests(unittest.IsolatedAsyncioTestCase):
             await worker.stop()
 
     async def test_slow_market_data_does_not_block_order_worker(self) -> None:
-        import time
+        import threading
 
         order_worker = OrderWorker()
         market_worker = MarketDataWorker(max_concurrency=2)
         await order_worker.start()
+        loop = asyncio.get_running_loop()
+        started = asyncio.Event()
+        release_data = threading.Event()
 
         def slow_data() -> str:
-            time.sleep(0.15)
+            loop.call_soon_threadsafe(started.set)
+            if not release_data.wait(15):
+                raise TimeoutError("Test did not release market-data worker")
             return "data"
 
+        data_task = asyncio.create_task(market_worker.submit(slow_data))
         try:
-            data_task = asyncio.create_task(market_worker.submit(slow_data))
-            await asyncio.sleep(0.01)
-            started = time.perf_counter()
-            result = await order_worker.submit(lambda: "order")
-            elapsed = time.perf_counter() - started
+            await asyncio.wait_for(started.wait(), timeout=5)
+            result = await asyncio.wait_for(order_worker.submit(lambda: "order"), timeout=5)
             self.assertEqual(result, "order")
-            self.assertLess(elapsed, 0.05)
-            await data_task
+            self.assertFalse(data_task.done(), "Order must finish while market data is still blocked")
         finally:
-            await order_worker.stop()
+            release_data.set()
+            try:
+                await asyncio.wait_for(data_task, timeout=5)
+            finally:
+                await order_worker.stop()
 
     async def test_candle_fetch_uses_worker_keyword_arguments(self) -> None:
         engine = TradeEngine(1, InMemoryStore(), token_resolver=lambda _symbol: 123)
