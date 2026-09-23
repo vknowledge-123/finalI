@@ -30,7 +30,7 @@ with sync_playwright() as playwright:
             page.goto((ROOT / "BOOK.html").as_uri())
             page.wait_for_function("Array.from(document.images).every(image => image.complete && image.naturalWidth > 0)")
             assert page.evaluate("document.documentElement.scrollWidth <= innerWidth"), name
-            assert page.locator("main h2").filter(has_text=re.compile(r"^Chapter \d+ ")).count() == 46
+            assert page.locator("main h2").filter(has_text=re.compile(r"^Chapter \d+ ")).count() == 60
             page.screenshot(path=str(OUTPUT / f"{name}-opening.png"))
             page.get_by_label("Find a chapter").fill("TOTP")
             matching = page.locator("nav a:visible").filter(has_text="Chapter 15")

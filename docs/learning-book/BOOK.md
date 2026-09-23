@@ -2,13 +2,13 @@
 
 ## A practical book on Python software engineering and Google Cloud
 
-Prepared for Amol. Edition 1, 19 September 2026.
+Prepared for Amol. Expanded edition 2, 23 September 2026.
 
 This book teaches you to rebuild a trading application yourself, beginning with small Python programs and progressing to APIs, databases, secure login, asynchronous services, browser testing, cloud operations, and architecture. The aim is not to memorize your existing source code. It is to understand the decisions behind it, reproduce its useful behavior, and recognize where a different design would be safer.
 
 Your existing application is the case study. You receive Chartink signals, resolve instruments, evaluate strategies, submit broker orders, reconcile actual fills, monitor exits, and show results in a browser. That one workflow contains nearly every difficulty that makes backend engineering interesting: untrusted input, timing, concurrency, partial failure, external contracts, persistent state, and human expectations.
 
-This is a substantial project textbook and workbook, not an encyclopedia of every Python feature or a substitute for every professional cloud exam guide. It gives you a deep common foundation and specialization labs. Completing it is evidence of learning, not a guarantee of employment, seniority, certification, trading profitability, or production safety.
+This is a substantial project textbook and workbook, not an encyclopedia of every Python feature or a substitute for every professional cloud exam guide. This expanded edition adds a worked lesson to each of the original 46 chapters and 14 extended cloud and Kubernetes chapters. It gives you a deep common foundation and specialization labs. Completing it is evidence of learning, not a guarantee of employment, seniority, certification, trading profitability, or production safety.
 
 ### How to use the book
 
@@ -16,7 +16,7 @@ Read in order the first time. For each chapter, explain the concept aloud, imple
 
 The accompanying `lab` directory is a deliberately small reference implementation. It uses a simulated broker and local SQLite. It has no live-order adapter and is not a production deployment. Build your own version in a new repository; use the reference to compare behavior rather than to bypass the exercises. The later chapters specify larger systems you must implement yourself. They do not claim those systems already exist in the reference lab.
 
-Code blocks fall into three categories. The lab's files are runnable together. Short Python examples demonstrate a concept and name their dependencies. Architecture sketches and pseudocode explain contracts, not complete deployable services. Cloud commands create billable resources only where explicitly stated. Run cloud exercises in a disposable project, never in a client's production project.
+Code blocks fall into three categories. The lab's files are runnable together. Short Python examples demonstrate a concept and name their dependencies. Architecture sketches and pseudocode explain contracts, not complete deployable services. Cloud commands create billable resources only where explicitly stated. Run cloud exercises in a disposable project, never in a client's production project. Long code lines can wrap visually in the PDF; consult the editable source and bundled lab files for exact formatting. Install tools only in a separate learning environment.
 
 Keep real access tokens, webhook secrets, client emails, encryption keys, Redis passwords, and trading records out of your learning repository. Use fictional symbols and sanitized fixtures. A secret pasted into a chat or committed to Git needs a rotation plan; deleting the visible text is not rotation. Do not casually rotate an encryption key without first planning how existing encrypted data will be decrypted and re-encrypted.
 
@@ -114,6 +114,25 @@ Zero is a legitimate request for no retries. Missing means the client did not sp
 
 **Exit check:** Explain source file versus process, text versus number, and missing versus zero. Include tests for blank input, negative quantity, and malformed price.
 
+### Worked lesson tracing a program by hand
+
+Before typing, create a table with columns line, names, and output. Step through this example as the interpreter would:
+
+```python
+price = 100
+quantity = 2
+notional = price * quantity
+price = 105
+print(notional)
+print(price * quantity)
+```
+
+The outputs are 200 and 210. `notional` does not contain a spreadsheet formula that updates when price changes. It contains the result of an earlier multiplication. This matters when a dashboard displays an entry-time value instead of recalculating on ticks.
+
+Now add `enabled = False` and an `if enabled:` branch. Indentation defines the suite controlled by the condition. Use four spaces consistently. A syntax error prevents interpretation; a runtime error occurs on an executed path; a logic error produces an incorrect result without an exception. You need different techniques for each: parser feedback, traceback inspection, and expected-behavior tests.
+
+**Independent exercise:** Write three examples that produce the same printed output but use different types internally. Explain why printed output alone cannot validate a request schema. Then write an assertion about the type as well as the value.
+
 ## Chapter 2 Environments modules and a repeatable setup
 
 A virtual environment isolates Python packages. It does not isolate the operating system, network, or live broker account. A requirements file records dependencies; a lock or fully resolved constraints record makes installations more reproducible. Security updates still require review and tests.
@@ -148,6 +167,37 @@ Your project should contain `src/` or one clear package, `tests/`, a dependency 
 
 **Debug drill:** Deliberately install a package in the wrong interpreter. Compare `python -c "import sys; print(sys.executable)"` with the interpreter used by your service. Learn why "installed successfully" does not imply "available to this process."
 
+### Worked lesson package layout and interpreter identity
+
+Create this layout in your own repository, not inside the production app:
+
+```text
+trading-school/
+  school/
+    __init__.py
+    money.py
+    cli.py
+  tests/
+    test_money.py
+  pyproject.toml
+  .gitignore
+```
+
+In `school/money.py`, define a function. In `school/cli.py`, import it with `from school.money import ...`. Run `python -m school.cli` from the repository root. Running a file from an arbitrary working directory can change which modules Python finds; avoid fixing import problems by scattering `sys.path.append` throughout application code.
+
+Inspect the active environment without printing secrets:
+
+```bash
+python -c "import sys; print(sys.executable); print(sys.version)"
+python -m pip --version
+python -m pip show fastapi
+python -m pip check
+```
+
+The interpreter path, pip path, installed distribution, and compatibility check answer different questions. Save exact dependency versions after a tested installation, review the result, and record the Python version as well. A virtual environment copied between operating systems is not a portable deployment artifact.
+
+**Exercise:** Create a second environment without FastAPI. Predict which command fails in it. Repair the invocation rather than installing packages globally. Add a README command that works in a fresh checkout.
+
 ## Chapter 3 Conditions loops and collections
 
 Conditions choose a path. Loops apply a rule repeatedly. A list preserves order and permits duplicates. A set represents membership without duplicates. A dictionary maps keys to values. A tuple is an immutable sequence, useful for composite identities such as `(exchange, security_id)`.
@@ -181,6 +231,28 @@ Avoid modifying a dictionary while iterating through it. Gather keys to remove, 
 
 **Exit check:** Explain why configuration dictionaries, subscription sets, and append-only fill lists have different purposes. Demonstrate aliasing with a ten-line program.
 
+### Worked lesson grouping without cross strategy leakage
+
+```python
+rows = [
+    {"strategy": "A", "symbol": "RELIANCE", "qty": 2},
+    {"strategy": "B", "symbol": "DABUR", "qty": 3},
+    {"strategy": "A", "symbol": "RELIANCE", "qty": 1},
+]
+totals = {}
+for row in rows:
+    key = (row["strategy"], row["symbol"])
+    totals[key] = totals.get(key, 0) + row["qty"]
+assert totals[("A", "RELIANCE")] == 3
+assert ("A", "DABUR") not in totals
+```
+
+The tuple defines ownership. Replacing it with just `symbol` would merge allocations from different strategies. This example groups already-validated rows; it is not a database transaction or a broker position reconciliation algorithm.
+
+A comprehension is convenient when it remains readable. Use an ordinary loop when you need several validation steps or detailed errors. Clever one-liners are not an engineering objective. Learn dictionary iteration through `.items()`, set intersection for membership checks, and a `deque` for processing oldest events.
+
+**Exercise:** Add account and product to the key. Create two clients with the same strategy name and symbol. Prove they remain separate. Explain why a string such as `account:strategy:symbol` needs careful escaping if any field can contain the separator.
+
 ## Chapter 4 Functions contracts and precise money
 
 A function separates an operation from the details of its caller. Parameters are inputs; a return value is an output. A pure function has no externally visible side effects and depends only on its inputs. Pure sizing and stop calculations are easier to test than functions that also read Redis, call Dhan, and send Telegram messages.
@@ -212,6 +284,35 @@ For capital sizing, `floor(capital / price)` respects the stated allocation befo
 Avoid mutable default arguments such as `def add(x, items=[])`. Defaults are evaluated once, not per call. Use `None` and create a list inside. Use keyword-only parameters for safety-sensitive options, and annotations to document expectations. An annotation alone does not validate a web request.
 
 **Build:** Implement strict sizing, optional minimum-one sizing, target, stop, and P&L as pure functions. Test BUY and SELL, zero, missing, infinity, NaN, invalid sides, and very small ticks. Explain the policy differences before optimizing anything.
+
+### Worked lesson weighted average and invariants
+
+```python
+from decimal import Decimal
+
+def average_fill(fills):
+    if not fills:
+        raise ValueError("No fills")
+    quantity = 0
+    value = Decimal("0")
+    for qty, price in fills:
+        if type(qty) is not int or qty <= 0:
+            raise ValueError("Invalid fill quantity")
+        if not price.is_finite() or price <= 0:
+            raise ValueError("Invalid fill price")
+        quantity += qty
+        value += qty * price
+    return quantity, value / quantity
+
+qty, average = average_fill([
+    (2, Decimal("100")), (3, Decimal("102"))
+])
+assert qty == 5 and average == Decimal("101.2")
+```
+
+Trace the running quantity and value after each iteration. The result is not the unweighted average 101 because the two price levels have different quantities. Use the returned confirmed quantity rather than the original requested quantity.
+
+A useful invariant is that an average of positive-weight prices lies between the minimum and maximum prices. Write a property-based test for that claim. Then deliberately feed a duplicate execution twice and observe that arithmetic cannot identify the duplicate by itself. Deduplication belongs before aggregation.
 
 ## Chapter 5 Exceptions files time and logging
 
@@ -250,6 +351,34 @@ A log should answer what happened, to which entity, in which process, and with w
 
 **Exit check:** Explain why a current heartbeat timestamp does not prove that a stock's last tick is current.
 
+### Worked lesson exception boundaries and cleanup
+
+```python
+from contextlib import contextmanager
+
+@contextmanager
+def tracked_resource(events):
+    events.append("opened")
+    try:
+        yield "resource"
+    finally:
+        events.append("closed")
+
+events = []
+try:
+    with tracked_resource(events):
+        raise ValueError("simulated failure")
+except ValueError:
+    events.append("reported")
+assert events == ["opened", "closed", "reported"]
+```
+
+`finally` runs while control leaves the protected block. It does not make an external action reversible. Closing a socket after an order timeout does not cancel an order at the broker.
+
+For a real adapter, translate a provider-specific error into a domain exception with a sanitized reason, preserving the original cause through `raise DomainError(...) from exc`. At the route boundary, produce a safe response and correlation ID. At the worker boundary, persist the failed or unknown state. Do not log the full request just to make diagnosis easy.
+
+**Exercise:** Raise during setup, normal work, and cleanup separately. Explain which exceptions escape. Add a test that resources are released when a coroutine is cancelled.
+
 ## Chapter 6 Objects dataclasses and interfaces
 
 An object groups state with behavior. Use it when that grouping makes an invariant easier to preserve. Do not turn every small arithmetic function into a class. Prefer composition: an execution service has a broker and a repository; it is not a subclass of every broker and database.
@@ -285,6 +414,32 @@ An abstract base class can enforce method implementation at instantiation. A pro
 
 **Build:** Write a paper broker that returns acceptance first and emits a fill later. Inject it into a service through a protocol. Test two instances to prove they do not share accounts accidentally.
 
+### Worked lesson dependency injection with a recording fake
+
+```python
+from dataclasses import dataclass, field
+
+@dataclass
+class RecordingBroker:
+    submitted: list = field(default_factory=list)
+
+    def submit(self, intent):
+        self.submitted.append(intent)
+        return {"order_id": f"paper-{len(self.submitted)}"}
+
+first = RecordingBroker()
+second = RecordingBroker()
+first.submit({"symbol": "DEMO", "quantity": 1})
+assert len(first.submitted) == 1
+assert second.submitted == []
+```
+
+`default_factory` creates an independent list for each object. A recording fake lets a test inspect what the service asked the broker to do. It should not pretend every request is filled; add a separate method to supply execution evidence.
+
+Design the service constructor around small dependencies: repository, broker, clock, and notifier. That makes failure injection straightforward. If a test must patch ten global variables to construct a service, consider whether the production ownership boundaries are too broad.
+
+**Exercise:** Implement a broker that raises before accepting, and another that accepts but raises before returning. Your service must distinguish the certainty available in these scenarios rather than treating both as ordinary rejection.
+
 ## Chapter 7 Iterators decorators typing and Python internals
 
 An iterable can produce an iterator; an iterator yields its next item and eventually raises `StopIteration`. A generator function containing `yield` builds such an iterator lazily. This is useful for large historical data files, but it is not free streaming if you immediately wrap the result in `list()`.
@@ -318,6 +473,39 @@ Use `inspect.signature` on an installed SDK method when checking compatibility. 
 
 **Build:** Stream a million synthetic ticks through a generator, calculating count and extrema without storing them. Measure peak memory. Add a typed protocol and run your type checker. Then implement and test the async timing wrapper.
 
+### Worked lesson asynchronous decorators and cancellation
+
+```python
+import asyncio
+from functools import wraps
+from time import perf_counter
+
+def measured_async(function):
+    @wraps(function)
+    async def wrapper(*args, **kwargs):
+        started = perf_counter()
+        try:
+            return await function(*args, **kwargs)
+        finally:
+            print(function.__name__, perf_counter() - started)
+    return wrapper
+
+@measured_async
+async def sample():
+    await asyncio.sleep(0.01)
+    return 7
+
+async def demo():
+    assert await sample() == 7
+
+if __name__ == "__main__":
+    asyncio.run(demo())
+```
+
+The wrapper awaits the function, so its duration includes the work. The `finally` block also runs on cancellation. Do not catch cancellation and continue executing a trade unless you have a precisely defined ownership protocol.
+
+Inspect `wrapper.__name__` with and without `wraps`. Then implement a generator that yields records from several files. Ask when a file handle closes if the consumer stops early. Practice explicit context management instead of assuming garbage collection happens immediately.
+
 ## Chapter 8 Algorithms complexity and practical data structures
 
 Big-O describes how resource use grows with input size. It is not a stopwatch. An O(n) scan over 23 sectors can be simpler and faster in practice than maintaining a complex distributed ranking structure. A dictionary lookup is expected O(1), but network latency dominates a Redis lookup compared with an in-process dictionary.
@@ -335,6 +523,31 @@ Practice these algorithms using project problems: binary search over sorted cand
 ### Part One review
 
 Without looking at source, explain mutable defaults, aliasing, Decimal, UTC versus elapsed time, exceptions, context managers, generators, protocols, and O(n log n). Write tests for the sizing function from memory. The official [Python tutorial](https://docs.python.org/3/tutorial/) is a companion reference for language details; this book supplies the project exercises and learning sequence.
+
+### Worked lesson a bounded rolling window
+
+```python
+from collections import deque
+
+def rolling_means(values, width):
+    if width <= 0:
+        raise ValueError("Width must be positive")
+    window = deque()
+    total = 0.0
+    for value in values:
+        window.append(value)
+        total += value
+        if len(window) > width:
+            total -= window.popleft()
+        if len(window) == width:
+            yield total / width
+
+assert list(rolling_means([1, 2, 3, 4], 3)) == [2.0, 3.0]
+```
+
+Each item is appended and removed at most once, giving O(n) processing and O(width) storage. This example uses floats for a statistical illustration, not final price settlement. Recomputing each window sum would be O(n times width).
+
+**Exercise:** Add timestamps and reject out-of-order samples under a stated policy. Then support a time window rather than a fixed count. Explain why "last 20 ticks" and "last 20 seconds" are not equivalent for instruments with different activity.
 
 # Part Two APIs Databases and Authentication
 
@@ -362,6 +575,20 @@ An endpoint like `/api/positions?user_id=2` must not trust the requested user ID
 **Build:** Write an OpenAPI-style table for create strategy, receive signal, list positions, request exit, and read feed health. Include one happy response and three failures for each. Set body-size, symbol-count, and string-length limits.
 
 **Exit check:** Explain why an HTTP 200 from `/api/broker-status` says nothing about whether its response body reports `ticker_connected: false`.
+
+### Worked lesson documenting one endpoint completely
+
+For `POST /signals`, write a contract before its implementation: the caller presents a webhook credential; the account is resolved server-side; the payload contains source event identity, alert name, symbols, and source time; a bounded durable job is written; the response contains a receipt ID. Repeated delivery of the same event must not produce a new entry.
+
+```bash
+curl -i -X POST http://127.0.0.1:8015/api/signals \
+  -H 'Content-Type: application/json' \
+  -d '{"event_id":"practice-01","strategy":"Practice","symbol":"DEMO","price":"100"}'
+```
+
+This command targets the unauthenticated local paper lab only. Its supplied synthetic price is not a production webhook trust model. Save `Practice` first. Repeat the request and compare receipt identity, then change price while retaining the ID and observe conflict.
+
+A webhook sender may not supply a convenient unique ID. Define your deduplication window and canonical payload identity carefully; hashing only the symbol forever would suppress legitimate future entries. Bound replay by strategy, account, event time, and known delivery semantics rather than assuming any hash makes a request safe.
 
 ## Chapter 10 FastAPI validation and dependency injection
 
@@ -397,6 +624,34 @@ An `async def` route runs on an event loop. Calling blocking SDK code directly i
 Create a test-only application factory, `create_app(settings, repository, broker)`, instead of mutating global production state. Production should fail startup when required secrets or storage are absent, not silently switch to a test backend.
 
 **Build:** Add schema validation to your calculator API. Test unknown fields, missing names, boolean quantity, zero retry count, negative stop, and unexpected content types. Document whether configuration edits affect existing positions or only future entries.
+
+### Worked lesson replace a dependency in a test
+
+```python
+from fastapi import Depends, FastAPI
+from fastapi.testclient import TestClient
+
+app = FastAPI()
+
+def current_account():
+    raise RuntimeError("Real authentication belongs here")
+
+@app.get("/whoami")
+def whoami(account=Depends(current_account)):
+    return {"account_id": account["id"]}
+
+def test_dependency_override():
+    app.dependency_overrides[current_account] = lambda: {"id": "test-1"}
+    try:
+        with TestClient(app) as client:
+            assert client.get("/whoami").json() == {"account_id": "test-1"}
+    finally:
+        app.dependency_overrides.clear()
+```
+
+The test override is explicit and removed afterward. Do not implement an internet-accessible header such as `X-Test-Admin: true` as a convenient substitute. Test-only shortcuts must never be enabled by production request input.
+
+**Exercise:** Add a second dependency that checks ownership of a strategy. Return 403 for an authenticated account requesting someone else's strategy. Test both paths without replacing the authorization rule itself.
 
 ## Chapter 11 Relational database design
 
@@ -450,6 +705,26 @@ Normalize repeated facts instead of copying credentials into every strategy. JSO
 
 **Build:** Draw the entity relationships. Create migrations with Alembic and SQLAlchemy after first writing equivalent SQL manually. Add unique constraints, check constraints, and indexes. Make the database reject duplicate fills even when two workers race.
 
+### Worked lesson querying and indexing the ledger
+
+```sql
+CREATE INDEX fill_account_time
+ON fill (account_id, executed_at DESC);
+
+SELECT broker_order_id,
+       SUM(quantity) AS filled_quantity,
+       SUM(quantity * price) / SUM(quantity) AS average_price
+FROM fill
+WHERE account_id = $1
+GROUP BY broker_order_id;
+```
+
+`$1` represents a bound parameter in this SQL illustration; use the placeholder convention of your chosen driver. The query aggregates fills for one account. An index on `(account_id, executed_at)` supports account/time access patterns, but does not automatically optimize every grouping query. Read `EXPLAIN` on realistic data before adding more indexes.
+
+Every index consumes storage and adds work to writes. A wide JSON document with an index on every possible property is not a substitute for deliberate access patterns. Use foreign keys for ownership relationships and a unique execution identity to prevent double accounting.
+
+**Exercise:** Populate 100,000 synthetic fills, inspect query plans before and after an index, and measure execution time in a warmed and cold-ish cache scenario. Record that timings are machine- and data-dependent.
+
 ## Chapter 12 Transactions concurrency and the outbox
 
 Consider two requests that both read "no position" and then submit an entry. An application-level check alone does not prevent both. You need a serialized decision, durable reservation, or other concurrency control at the ownership boundary. A transaction cannot roll back an order already submitted to an external broker.
@@ -466,6 +741,24 @@ Learn parameterized SQL. `WHERE name = ?` or driver-specific placeholders keep d
 
 **Build:** Launch two concurrent entry requests and prove exactly one local intent is reserved. Crash a publisher after send but before acknowledgment and prove duplicate consumption does not duplicate position quantity. Add a migration rollback exercise on a disposable database, then explain why destructive rollback may not be safe for real fills.
 
+### Worked lesson a conditional transition
+
+```sql
+UPDATE position_allocation
+SET state = 'EXIT_REQUESTED', version = version + 1
+WHERE id = $1
+  AND account_id = $2
+  AND state = 'OPEN'
+  AND version = $3
+RETURNING id, version;
+```
+
+This example assumes your own position table with those columns. One returned row means this transaction won the state transition. Zero rows can mean a competing update, a closed position, or the wrong account; classify it using an authorized follow-up read. Do not call the broker before successfully reserving the intent.
+
+Inside the same transaction, insert an outbox event describing the exit request. Commit before a separate worker performs external I/O. If the worker loses the broker response, preserve `UNKNOWN` and reconcile. The database transaction does not extend across the internet to the broker.
+
+**Exercise:** Use two independent database connections and a barrier to issue the update concurrently. Exactly one should reserve the exit for the expected version. Demonstrate why an in-process Python lock does not protect another process.
+
 ## Chapter 13 Redis as a cache queue and coordination tool
 
 Redis stores typed data structures: strings, hashes, lists, sets, sorted sets, and streams. A key name is a convention, not access control. Scope it with environment and account. `paper:account:17:tick:NSE_EQ:1333` is clearer than a global `ltp` key. Different logical database numbers are not a strong tenant isolation boundary.
@@ -479,6 +772,20 @@ A lock with `SET key token NX PX duration` has an owner token and expiry. Releas
 Connection pools avoid repeated handshakes. Pipelining reduces round trips, but is not automatically a transaction. Measure network latency, command latency, queue wait, and event-loop lag separately before blaming Redis. Your previous `AuthenticationError` was a credentials mismatch, not proof of a slow datastore.
 
 **Build:** Implement a quote cache with a receipt timestamp and TTL; a durable signal queue with a dead-letter path; and a session store. Test restart, lost connections, password mismatch, duplicate delivery, and a lease expiring during a slow operation. Keep critical ledger data outside any eviction policy that can discard it unnoticed.
+
+### Worked lesson safely releasing a Redis lease
+
+```lua
+-- KEYS[1] is the lease key; ARGV[1] is this worker's token.
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return 0
+```
+
+Compare-and-delete must be atomic. A separate GET and DEL can race: your old lease expires, another worker acquires it, then your DEL removes its lease. The script avoids that release bug but does not prevent a paused old worker from making an external call after expiry. That is why lease ownership and uncertain order reconciliation remain separate design problems.
+
+**Exercise:** Use a disposable Redis instance. Acquire a short lease with token A, let it expire, acquire with token B, and run the release script with A. Assert B remains. Then disconnect renewal and observe how the worker stops accepting new work while resolving any in-flight uncertainty.
 
 ## Chapter 14 Email ownership and secure login
 
@@ -519,6 +826,29 @@ Configure SPF for permitted senders, DKIM signing, and a staged DMARC policy for
 
 **Build:** Implement verification and password reset against a fake email sender. Test resend limits, email enumeration, token reuse, concurrent redemption, wrong purpose, provider failure, and link scanning. A failed email send must never expose the OTP as a debugging fallback.
 
+### Worked lesson binding an email OTP to its purpose
+
+```python
+import hashlib
+import hmac
+import secrets
+
+def otp_digest(key, challenge_id, purpose, account_id, code):
+    message = "\x00".join([challenge_id, purpose, account_id, code])
+    return hmac.new(key, message.encode(), hashlib.sha256).hexdigest()
+
+key = secrets.token_bytes(32)
+code = f"{secrets.randbelow(1_000_000):06d}"
+stored = otp_digest(key, "challenge-7", "verify_email", "account-1", code)
+candidate = otp_digest(key, "challenge-7", "verify_email", "account-1", code)
+assert hmac.compare_digest(stored, candidate)
+assert stored != otp_digest(key, "challenge-7", "reset_password", "account-1", code)
+```
+
+This is a digest demonstration, not a complete authentication system. Keep the HMAC key outside the database, validate that identifiers cannot contain the delimiter or use structured serialization, and enforce expiry, rate limits, and atomic single use. A six-digit secret is easy to exhaust without online attempt limits.
+
+**Exercise:** Write a transaction that increments a failed-attempt count without extending original expiry. Two correct simultaneous submissions must not both create sessions. Use a fake mail sender that records messages in test memory; never expose codes through a production response.
+
 ## Chapter 15 TOTP sessions and broker authorization
 
 TOTP calculates a short code from a shared seed and time. Use a maintained library such as PyOTP; do not implement cryptography yourself. Display the enrollment QR only after password verification. Keep enrollment pending until a valid code is confirmed. Encrypt the seed, never log it, and restrict access to it.
@@ -534,6 +864,23 @@ Cookie-authenticated state changes need CSRF defenses. CORS controls browser cro
 Keep application login separate from broker authorization. A logged-in administrator is allowed to manage the app but may still have an expired Dhan token. Broker consent callbacks must bind to a short-lived server-side pending flow and the intended account. Do not consume any callback token on behalf of whichever user ID appears in a query. Only use state or PKCE mechanisms the provider actually supports; add a secure local transaction binding when designing around provider constraints. Check the current [Dhan authentication contract](https://dhanhq.co/docs/v2/authentication/) before implementing its consent flow.
 
 **Build:** Draw the states `UNCONFIGURED`, `PASSWORD_SET`, `MFA_PENDING`, `ACTIVE`, and `RECOVERY_REQUIRED`. Test every forbidden transition. Verify that neither email verification nor a successful broker login accidentally grants an admin application session.
+
+### Worked lesson designing recovery without erasing trades
+
+Separate `admin_identity`, `admin_sessions`, `mfa_enrollment`, and trading state in storage. A recovery operation should revoke the identity's sessions and MFA seeds under an audited authorization path, but leave fills, positions, strategy history, and broker reconciliation evidence intact.
+
+```text
+Trusted operator verifies reset authorization
+  -> disable new admin sessions
+  -> revoke existing sessions and pending MFA challenges
+  -> mark identity recovery required
+  -> record audit event without secrets
+  -> issue a bounded out-of-band setup opportunity
+```
+
+Require a fresh password check for changing a TOTP seed. Protect the enrollment QR from caching and third-party analytics. Reject the same time-step code twice if replay protection is part of the policy, using an atomic compare/update, not two independent reads.
+
+**Exercise:** Sign in in two browsers, perform a recovery operation in the test environment, and show both sessions lose access. Confirm an open paper position still exists and its risk worker still processes ticks. Security recovery should not accidentally stop position accounting.
 
 # Part Three Trading State and Distributed Systems
 
@@ -557,6 +904,30 @@ Every fill needs deduplication. A trade can appear in a live update, a trade-boo
 Separate requested, cumulative filled, cancelled, and remaining quantities. Never reset cumulative filled to zero when a later retry fails. Persist every child order under the same intent. Quantity invariants should be executable tests, for example `0 <= total_confirmed_fill <= requested_quantity` for a simple nonsliced intent.
 
 **Build:** Write a paper broker scenario that accepts an order, fills four shares, loses the update, and later reports the fill in the trade book. Deliver the report twice. Your position must still contain four shares. Explain what evidence is needed before submitting the remaining six.
+
+### Worked lesson cumulative fills across retries
+
+Suppose intent I requests ten shares. Child order A fills four and is confirmed cancelled for its remaining six. Child order B requests six, fills two, and is then rejected for the remainder. The final confirmed position is six shares, not zero, two, ten, or sixteen. Requested quantities and confirmed executions belong in separate fields.
+
+```python
+executions = [
+    ("A", "fill-1", 4),
+    ("B", "fill-2", 2),
+    ("A", "fill-1", 4),
+]
+seen = set()
+confirmed = 0
+for order_id, execution_id, quantity in executions:
+    key = (order_id, execution_id)
+    if key not in seen:
+        seen.add(key)
+        confirmed += quantity
+assert confirmed == 6
+```
+
+The in-memory set is only a teaching device. Use a durable unique constraint in the ledger. A process restart must not forget which fills have already been applied.
+
+**Exercise:** Add a fill arriving after a cancellation request but before cancellation confirmation. Explain why submitting a replacement at the moment you send cancel can overfill the intent. Write an explicit resolution policy before coding a retry loop.
 
 ## Chapter 17 Classic strategy math and exit behavior
 
@@ -587,6 +958,25 @@ Pyramiding adds confirmed quantity, not merely requested quantity. Decide whethe
 Multiple exit rules can fire on one tick. Evaluate reasons deterministically and reserve one exit intent per owned position. A target rule, alert exit, manual exit, and trailing stop must not each send a full sell. Partial exit fills reduce remaining quantity; they do not mark the entire position closed.
 
 **Build:** Test BUY and SELL target equality, stop equality, trailing disabled, cost-only mode, a gap beyond stop, two simultaneous exit requests, partial exits, and pyramid fills at different prices. Add the regression: a BUY stop that reached 101 must never return to 100 after a lower tick.
+
+### Worked lesson a target and trailing replay
+
+BUY entry is 100, target is 110, fixed stop is 98, trailing distance is 2%. Ticks are 100, 103, 105, 104, 102. At 105 the trailing line reaches 102.90. At 104 it remains 102.90. At 102 the exit trigger fires. The simulator can fill at 102; it must not claim an execution at 102.90 merely because that was the trigger.
+
+```python
+prices = [100, 103, 105, 104, 102]
+high = 100
+stop = 98
+history = []
+for price in prices:
+    high = max(high, price)
+    stop = max(stop, high * 0.98)
+    history.append((price, stop, price <= stop))
+assert history[-1][2] is True
+assert history[3][1] == history[2][1]
+```
+
+This float-based trace illustrates the sequence; use the Decimal domain implementation for price-sensitive calculations. Repeat with a SELL and verify the stop moves downward only. Then disable trailing and verify the fixed stop remains unchanged even though the high-water mark can still be recorded for later analysis.
 
 ## Chapter 18 Configuration ownership and the full feature map
 
@@ -621,6 +1011,23 @@ For Telegram, store bot secrets securely, scope destinations, and send only opte
 
 **Build:** Implement one feature per pull request with a saved-configuration roundtrip test and a behavior test. Keep a feature matrix with implemented, tested, documented, and deferred columns. Do not mark a feature complete because its toggle appears on screen.
 
+### Worked lesson stable IDs versus editable names
+
+```json
+{
+  "strategy_id": "strategy-17",
+  "version": 4,
+  "display_name": "Morning Momentum",
+  "entry_alert_name": "morning momentum scanner",
+  "exit_alert_enabled": true,
+  "exit_alert_name": "momentum weakness scanner"
+}
+```
+
+A position references `strategy-17` and the version used at entry. Renaming the display label does not change ownership. Editing the external alert name changes future matching under a documented policy. An exit event must match the configured exit relationship, not whichever alert name currently appears beside a row.
+
+**Exercise:** Create A and B, each holding DEMO. Send A's exit alert. Assert only A's local allocation is reserved for exit. Then reconcile the aggregate broker quantity and prove the remaining allocation still belongs to B. Include a test where the same display name exists on a different client account.
+
 ## Chapter 19 Candles breakout watches and sector ranking
 
 A candle summarizes an interval. For a one-minute signal received at 10:30:03 IST, the previous fully closed interval is 10:29:00 through 10:30:00, usually treated as start-inclusive and end-exclusive. For five minutes at the same instant, anchor to 10:25 through 10:30. Know whether the provider labels a candle by opening time or closing time.
@@ -640,6 +1047,25 @@ Cache the baseline; update the numerator from live validated ticks. A current-da
 Unknown sector mapping should produce an explicit policy outcome only when the filter is enabled. Instrument/security-ID resolution is a different concern and must work independently of membership in your curated sector list.
 
 **Build:** Simulate a Friday-to-Monday cache, an intraday cache refresh, one missing index, equal percentages, and SHORT ranking. Add a watch at 10:30:03, advance a fake clock, and verify it cannot fire after expiry or change reference candle silently.
+
+### Worked lesson anchoring a candle and TTL
+
+```python
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+received = datetime(2026, 9, 18, 10, 30, 3,
+                    tzinfo=ZoneInfo("Asia/Kolkata"))
+current_start = received.replace(second=0, microsecond=0)
+reference_start = current_start - timedelta(minutes=1)
+deadline = received + timedelta(minutes=2)
+assert reference_start.strftime("%H:%M:%S") == "10:29:00"
+assert deadline.strftime("%H:%M:%S") == "10:32:03"
+```
+
+For general intervals, anchor to the exchange session rather than assuming every interval begins at midnight. Obtain the reference high from the completed bar, persist it with its interval, and keep the threshold constant until this watch expires. Do not treat missing candles as high zero.
+
+**Exercise:** Construct sector data with changes 1.4, -2.1, 0.3, and missing. LONG top two should rank 1.4 then 0.3; SHORT bottom two should rank -2.1 then 0.3 unless your policy additionally requires a negative sign. Write that sign policy separately from ranking.
 
 ## Chapter 20 Async concurrency and bounded work
 
@@ -683,6 +1109,36 @@ A queue of obsolete ticks is harmful even if nothing was dropped. Preserve origi
 
 **Build:** Inject a slow candle API while ticks continue. Measure tick handling delay. Cap concurrency, then compare latency before and after. Kill a task during simulated submission and verify your system records uncertainty rather than retrying blindly.
 
+### Worked lesson concurrency is not the same as a rate limit
+
+```python
+import asyncio
+
+async def demo():
+    in_flight = 0
+    peak = 0
+    semaphore = asyncio.Semaphore(2)
+
+    async def fetch(number):
+        nonlocal in_flight, peak
+        async with semaphore:
+            in_flight += 1
+            peak = max(peak, in_flight)
+            try:
+                await asyncio.sleep(0.01)
+                return number
+            finally:
+                in_flight -= 1
+
+    result = await asyncio.gather(*(fetch(i) for i in range(6)))
+    assert result == list(range(6)) and peak == 2
+
+if __name__ == "__main__":
+    asyncio.run(demo())
+```
+
+Two concurrent calls can still create hundreds of requests per second if each finishes quickly. Implement rate limiting separately using provider-specific budgets. Reserve a portion for exits and reconciliation. In a multi-process deployment, a per-process limiter may multiply total request rate; decide where the shared account quota is enforced.
+
 ## Chapter 21 Broker adapters and WebSocket evidence
 
 A broker adapter isolates external request shapes, response validation, error normalization, and version differences. It should expose domain operations without pretending that Dhan and Kite have identical product names, instrument identifiers, depth packets, or authentication.
@@ -700,6 +1156,30 @@ Store both source and receipt time with prices. If a REST fallback is permitted,
 For aggressive limits, use fresh ask depth for BUY and bid depth for SELL; inspect cumulative depth for quantity; apply a bounded buffer; align to instrument tick size; enforce circuit and slippage limits. Depth is a snapshot, not a reservation. No algorithm can guarantee instant execution. Broker rejection must retain its specific reason. [Dhan order contract](https://dhanhq.co/docs/v2/orders/)
 
 **Build:** Maintain a capability table for each SDK version. Replay malformed packets, expired-token disconnects, duplicate subscriptions, stale ticks, and order updates with missing quantities. Assert that malformed broker data cannot create a fill. A package upgrade is a change requiring contract tests, not a routine blind install.
+
+### Worked lesson a capability matrix before an SDK upgrade
+
+```text
+Capability           Dhan adapter       Kite adapter
+Instrument identity  exchange + ID      exchange + token/symbol mapping
+Accepted order       validated order ID validated order ID
+Fill evidence        normalized trades  normalized trades
+Quote freshness      source + times    source + times
+Pending cancel       request + confirm request + confirm
+Token replacement    owner reload      owner reload
+```
+
+Fill this table from the pinned SDK and current provider API. Inspect a method signature locally:
+
+```python
+import inspect
+
+def inspect_method(client):
+    print(type(client).__module__)
+    print(inspect.signature(client.place_order))
+```
+
+This function expects a client passed by your test setup. Do not construct a live client or print its configuration solely to inspect a signature. Add a contract fixture showing the exact request your adapter emits. Test upgrades in a separate environment and compare request fields, response normalization, exception behavior, and feed callbacks before deployment.
 
 ## Chapter 22 Service boundaries recovery and architecture drawings
 
@@ -734,6 +1214,21 @@ Start capacity planning with assumptions: candidate signals per minute, active i
 Use liveness for process viability and readiness for safe work acceptance. A disconnected broker might make new-entry readiness false while the API must remain available for status and recovery. Restarting every component on every failed dependency can amplify an outage.
 
 **Build:** Draw a context diagram, container/process diagram, signal sequence diagram, and order state machine. Annotate each arrow with authentication, timeout, durability, and retry policy. Explain why dashboard WebSocket failure and Dhan WebSocket failure are independent paths.
+
+### Worked lesson capacity calculation with explicit assumptions
+
+Assume 120 candidate jobs per minute and mean processing time 0.4 seconds. The mean arrival rate is two jobs per second. If stable, Little's Law predicts about 0.8 jobs in the system on average. This does not describe a burst of 100 simultaneous signals or a provider call that stalls for 30 seconds.
+
+```python
+arrival_per_second = 120 / 60
+mean_seconds = 0.4
+average_in_system = arrival_per_second * mean_seconds
+assert average_in_system == 0.8
+```
+
+Now assume 500 instruments each produce four ticks per second and each normalized event is about 250 bytes. The raw event payload rate is about 500,000 bytes per second before protocol, copies, storage, and fanout overhead. Measure actual sizes and serialization costs rather than treating this estimate as capacity proof.
+
+**Exercise:** Draw the bottleneck if one worker performs three serial 0.3-second broker calls per signal. Explain what can run concurrently and what must remain ordered per account or position. Add admission limits rather than an unlimited queue.
 
 # Part Four Frontend Integration and Software Testing
 
@@ -770,6 +1265,26 @@ For mobile, test the actual layout at narrow widths. A table may scroll horizont
 
 **Build:** Implement configuration save/reload with server validation errors shown next to the relevant field. Submit zero retries and verify zero survives reload. Display an offline banner without removing the last known position data or pretending it is fresh.
 
+### Worked lesson avoiding stale responses in the browser
+
+Two refresh requests can finish out of order. Request A starts first but takes longer; B returns a newer position, then A overwrites it. Use an entity version from the server or a request-generation guard for a single view.
+
+```javascript
+let generation = 0;
+async function refreshPositions() {
+  const mine = ++generation;
+  const response = await fetch('/api/positions');
+  if (!response.ok) throw new Error('Positions unavailable');
+  const data = await response.json();
+  if (mine !== generation) return;
+  renderPositions(data.positions);
+}
+```
+
+`renderPositions` is your own DOM function. This guard only handles this view's request ordering; it does not solve out-of-order domain events. Include a server-side version or event sequence in WebSocket updates and reject older updates per entity.
+
+**Exercise:** Intercept two responses in a browser test and deliver them backward. Verify a closed position cannot become open again merely because an older response arrives late. Preserve accessible error text while keeping the last known data marked stale.
+
 ## Chapter 24 Unit testing as executable design
 
 A unit test checks a small behavior with controlled inputs. It should explain a rule, not merely execute lines. Arrange the state, act once, and assert the important outcome. Test names should describe behavior such as `test_long_stop_never_decreases` rather than `test_function_7`.
@@ -796,6 +1311,22 @@ Use property-based tests for invariants: aligned prices are multiples of tick si
 
 **Build:** Write a failing test before fixing a bug. For the zero-default bug, assert `retry_count == 0` after a save/reload. For quantity safety, send the same fill twice and assert the ledger is unchanged after the second delivery.
 
+### Worked lesson tests that catch the wrong operator
+
+```python
+import pytest
+
+@pytest.mark.parametrize("price,expected", [(101, False), (102, True), (103, True)])
+def test_target_boundary(price, expected):
+    assert (price >= 102) is expected
+```
+
+Changing `>=` to `>` should fail the equality case. If a mutation tool makes that change and the suite stays green, the tests do not protect the boundary rule. Add examples around threshold, invalid data, and exact expiry time.
+
+Avoid asserting implementation details that do not matter, such as the precise number of helper function calls after a harmless refactor. Assert business evidence: confirmed quantity, deduplicated execution, preserved ownership, and a visible closed status. Use spies only where the call itself is the externally relevant effect.
+
+**Exercise:** Write a deliberately wrong P&L function that ignores SELL direction. Add the smallest test that exposes it, then expand to a parameterized BUY/SELL table with costs clearly excluded or included.
+
 ## Chapter 25 API and real integration tests
 
 Integration tests check collaborating components. Use an actual disposable Redis or PostgreSQL instance when testing transactions, expiry, scripts, locking, or consumer recovery. An in-memory fake is useful for fast tests but may not reproduce atomicity, serialization, network failures, or database constraints.
@@ -815,6 +1346,25 @@ API cases must include unauthenticated and unauthorized access, malformed bodies
 For broker contract tests, pin an SDK version, intercept its HTTP transport, and validate exact serialized requests and parsed responses. Keep fixture metadata identifying API version, instrument, and capture date. Scrub credentials. A contract fixture is not a live sandbox; it detects changes you have modeled, not every future provider behavior.
 
 **Build:** Run the same signal twice and prove only one paper position exists. Reuse its ID with a different payload and require conflict. Save a config, restart the app against the same test database, and retrieve it. Inject a storage error and ensure the API does not claim a durable enqueue succeeded.
+
+### Worked lesson a three boundary integration test
+
+```python
+def test_signal_creates_one_position(client):
+    config = {"name": "Practice", "quantity": 1}
+    assert client.post("/api/configs", json=config).status_code == 200
+    signal = {"event_id": "integration-1", "strategy": "Practice",
+              "symbol": "DEMO", "price": "100"}
+    first = client.post("/api/signals", json=signal).json()
+    second = client.post("/api/signals", json=signal).json()
+    rows = client.get("/api/positions").json()["positions"]
+    assert first["position_id"] == second["position_id"]
+    assert len(rows) == 1
+```
+
+This test uses the temporary-database `client` fixture in the included paper lab. It crosses HTTP validation, persistence, and position creation. It does not test Dhan, Redis, or network partitions. Naming the tested boundary prevents false confidence.
+
+**Exercise:** Repeat against a PostgreSQL repository. Add a second process making the same request and assert the durable uniqueness constraint holds. Do not replace PostgreSQL with a dictionary for the test whose purpose is to verify transaction behavior.
 
 ## Chapter 26 Playwright with Python
 
@@ -847,6 +1397,28 @@ Capture traces and screenshots on failure. Traces may include requests, cookies,
 
 **Build:** Add browser cases for expired session, a 502 HTML response, WebSocket disconnect, zero retries, form reload, and horizontal overflow. Simulate backend messages rather than opening real broker connections. Verify both visible output and backend records.
 
+### Worked lesson browser evidence beyond a screenshot
+
+```python
+from playwright.sync_api import expect
+
+def check_zero_retry_roundtrip(page, base_url):
+    page.goto(base_url)
+    page.get_by_label("Strategy name", exact=True).fill("Zero Retry")
+    page.get_by_label("Retry count", exact=True).fill("0")
+    page.get_by_role("button", name="Save strategy", exact=True).click()
+    expect(page.get_by_role("status")).to_have_text("Saved Zero Retry")
+    response = page.request.get(base_url + "/api/configs")
+    assert response.ok
+    strategy = next(row for row in response.json()["strategies"]
+                    if row["name"] == "Zero Retry")
+    assert strategy["retry_count"] == 0
+```
+
+The visible success message and persisted numeric value are both checked. In a production-auth suite, `page.request` shares the browser context's authentication state; keep isolated contexts per test user. Traces and stored authentication files are credentials-bearing artifacts and should not be committed.
+
+**Exercise:** Add a tablet viewport and keyboard-only form submission. Test a server-side validation failure despite a browser form that appears valid. Then take a screenshot as supporting evidence, not as the only assertion.
+
 ## Chapter 27 Fault injection performance and security tests
 
 Reliable software is tested under failure, not only with fast successful mocks. Inject delayed responses, malformed JSON, lost order updates, duplicate fills, Redis disconnects, clock boundaries, worker termination, and cancellation during an in-flight submission. Record the expected final state before running the experiment.
@@ -873,6 +1445,25 @@ Security tests should try cross-account IDs, session replay after logout, TOTP r
 
 **Build:** Write a failure matrix with evidence links. Stop an isolated worker during every important state transition. Explain why `systemctl active` and a clean error grep cannot prove business correctness.
 
+### Worked lesson interpret a latency distribution
+
+```python
+from statistics import median
+
+samples_ms = [10] * 95 + [800] * 5
+ordered = sorted(samples_ms)
+def nearest_rank(percent):
+    from math import ceil
+    return ordered[max(0, ceil(percent * len(ordered)) - 1)]
+
+assert median(samples_ms) == 10
+assert nearest_rank(0.99) == 800
+```
+
+The median looks excellent while one percent of requests can still be very slow. Percentile definitions vary for finite samples, so state the method and use an appropriate histogram in production. Include timeouts and failed requests in reliability analysis rather than measuring only successes.
+
+**Exercise:** Run a synthetic load test for five minutes and a soak test for an hour. Compare memory, thread count, open descriptors, queue length, and p99 latency at the beginning and end. A test that slowly accumulates resources may pass a short demonstration and fail during an entire market session.
+
 ## Chapter 28 CI and evidence based release decisions
 
 Continuous integration should run formatting, static checks, unit tests, integration tests, contract tests, and selected browser tests on every proposed change. Separate fast feedback from slower scheduled fault and soak tests. Treat flaky tests as defects; endless retries can hide a real race.
@@ -886,6 +1477,31 @@ Database migrations need compatibility planning. Add new optional fields before 
 For a trading deployment, pause new entries during ownership handover, preserve exit monitoring, drain or reconcile in-flight intents, restart with a known version, and check feed and queue readiness before resuming. Do not deploy two live execution owners as a conventional blue-green test without explicit fencing and account isolation.
 
 **Build:** Write a CI workflow for the learning repository and deliberately introduce a failed zero-value test, a syntax error, and an accidental secret placeholder matching your scanner rule. Verify each fails for the intended reason. Present a release checklist that another person can follow without knowing your terminal history.
+
+### Worked lesson a CI job with an honest boundary
+
+```yaml
+name: paper-lab
+on: [push, pull_request]
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: docs/learning-book/lab
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r requirements.txt
+      - run: python -m playwright install --with-deps chromium
+      - run: python -m pytest -q tests
+```
+
+This is a teaching workflow, not an assertion that these action tags will always be current. Production pipelines should pin reviewed immutable action revisions and periodically update them. The included browser suite falls back to installed Playwright Chromium when a Chrome channel is unavailable.
+
+**Exercise:** Add separate artifacts for failure traces, restrict retention, and ensure no broker secret is available to pull-request jobs from untrusted branches. Record the test Python/package versions. A green paper-lab job is not authorization to trade live.
 
 # Part Five Google Cloud and Production Operations
 
@@ -903,6 +1519,20 @@ Learn the difference between quota and capacity. Quota is a project/account limi
 
 **Lab:** In a disposable project, list enabled APIs, assigned IAM roles, regions, zones, and billing linkage. Draw which resources are global, regional, and zonal. Explain what would survive deleting a VM versus deleting its boot disk versus deleting the project.
 
+### Worked lesson inspect scope before creating resources
+
+```bash
+gcloud auth list
+gcloud config list
+gcloud projects describe "$PROJECT_ID"
+gcloud services list --enabled --project="$PROJECT_ID"
+gcloud compute instances list --project="$PROJECT_ID"
+```
+
+Run these read-only commands before a lab. Confirm the account, project ID, and region variables. A project display name is not necessarily its immutable ID. Avoid assuming that the Cloud Shell prompt and every command's explicit `--project` refer to the same project.
+
+**Exercise:** Draw two client projects with separate billing linkage, secrets, VM identities, and data stores. Mark the developer's access explicitly. Then remove developer access in the diagram and explain how client operations and billing continue. Discuss source-code visibility honestly: a client with VM administrative access can inspect deployed source.
+
 ## Chapter 30 IAM service accounts and secrets
 
 A service account represents a workload, not a person. Attach a minimally privileged service account to the VM instead of distributing long-lived JSON keys. Local development can use Application Default Credentials or controlled impersonation. Human administrator privileges and application runtime privileges should be separate. [Google Cloud service accounts](https://docs.cloud.google.com/iam/docs/service-account-overview)
@@ -916,6 +1546,24 @@ Secret Manager stores versioned secrets and provides access auditing. Grant the 
 Encryption at rest for disks does not replace application protection of broker tokens or transport encryption. A Fernet key stored beside ciphertext protects against some accidental exposures but not a full compromise that reads both. Plan rotation and backup access together: losing the only decrypting key can make credentials unrecoverable.
 
 **Lab:** Create two service accounts, one for the API and one for an analytics export. Grant the exporter access to a test bucket but not broker secrets. Prove a forbidden read fails. Record the denied audit event. Revoke permission and verify what happens to already-issued credentials and cached secrets.
+
+### Worked lesson separate deployer and runtime permissions
+
+The deployer may need to create a VM and attach a service account. The runtime needs only its application resources. The ability to impersonate a powerful service account can become privilege escalation even when the human's direct role looks narrow.
+
+```bash
+gcloud iam service-accounts create paper-runtime \
+  --display-name='Paper application runtime' \
+  --project="$PROJECT_ID"
+
+gcloud iam service-accounts describe \
+  "paper-runtime@$PROJECT_ID.iam.gserviceaccount.com" \
+  --project="$PROJECT_ID"
+```
+
+This creates an identity but grants it no application permissions. Add only the required resource-scoped bindings in the relevant lab. Do not download a JSON key simply because it is easy. Prefer workload identity on managed infrastructure and controlled impersonation for humans.
+
+**Exercise:** Produce a permission matrix for deployer, API, execution, analytics, and support reader. Explain why support staff can inspect sanitized logs without decrypting broker credentials. Test a denied permission and record its expected error.
 
 ## Chapter 31 Network design and a safe VM exercise
 
@@ -950,6 +1598,22 @@ The one-line commands avoid the trailing-backslash whitespace problem you encoun
 Do not run the unauthenticated reference lab on public port 80. Initially access it using an SSH tunnel to its loopback port. Public HTTPS deployment is a later exercise after your authentication chapters are implemented and tested.
 
 **Lab:** Run `df -h /`, `free -h`, `lsblk`, and `ss -ltnp` on the VM. Explain disk space versus RAM versus swap. Swap can reduce an abrupt out-of-memory failure, but disk-backed paging can severely delay a real-time application. It is not extra fast RAM.
+
+### Worked lesson follow a packet
+
+For a browser request to your public VM: DNS resolves the name, routing reaches the external address, firewall policy permits 443, Nginx terminates TLS, the proxy connects to loopback Uvicorn, and the application checks the session. A failure at any hop can resemble "the app is down" but requires different evidence.
+
+```bash
+gcloud compute addresses describe "$IP_NAME" \
+  --region="$REGION" --project="$PROJECT_ID"
+gcloud compute instances describe "$VM_NAME" \
+  --zone="$ZONE" --project="$PROJECT_ID" \
+  --format='get(networkInterfaces[0].accessConfigs[0].natIP)'
+```
+
+Compare reservation and attachment. On the VM, `ss -ltnp` distinguishes a listening process from a firewall problem. A route for outbound traffic does not automatically allow inbound requests. Cloud NAT supports outbound connections for appropriate private workloads; it is not an inbound public reverse proxy.
+
+**Exercise:** Deliberately use the wrong port in a local proxy configuration, then distinguish connection refused from authentication denied. Do not edit a production firewall merely to reproduce the lab.
 
 ## Chapter 32 Linux process supervision and deployment
 
@@ -991,6 +1655,21 @@ Deploy an immutable release or a reviewed commit, install dependencies in the in
 
 **Lab:** Deliberately point a test unit at a missing module and inspect `journalctl`. Then use a wrong Redis password and distinguish import failure from authentication failure. Repair the source configuration, restart only the needed service, and confirm readiness rather than repeatedly restarting everything.
 
+### Worked lesson restart evidence
+
+```bash
+sudo systemctl show ashuchart-api \
+  -p MainPID -p ExecStart -p EnvironmentFiles --no-pager
+sudo systemctl status ashuchart-api --no-pager -l
+sudo journalctl -u ashuchart-api -b -n 80 --no-pager
+```
+
+`MainPID` identifies the running process. `ExecStart` identifies the interpreter and command. `EnvironmentFiles` identifies configuration sources. None of these alone proves the application's dependencies are healthy. Inspect a sanitized readiness response and broker state separately.
+
+A unit edit requires daemon-reload; an environment-value edit requires process replacement to load the value. Repeated restarts without understanding the failure can conceal the original error and create execution ownership contention.
+
+**Exercise:** In a disposable service, log only a nonsecret configuration version at startup. Change the environment file without restart and prove the old process retains its old configuration. Restart deliberately, then verify the new version and PID.
+
 ## Chapter 33 Nginx HTTPS and browser WebSockets
 
 Nginx can terminate TLS and proxy requests to loopback Uvicorn. The dashboard WebSocket traverses this proxy; the outbound broker WebSocket does not. This explains why fixing browser `426 Upgrade Required` does not by itself repair a Dhan connection.
@@ -1027,6 +1706,26 @@ Before using a certificate tool, replace the example domain with a domain you co
 Enable secure cookies when HTTPS is active. Trust forwarded headers only from your actual proxy. Do not allow arbitrary internet clients to spoof trusted client-IP or scheme headers by exposing the application port publicly.
 
 **Lab:** Remove the upgrade header in a disposable deployment, observe the browser failure, restore it, and verify HTTP 101 in browser developer tools. Stop Uvicorn and observe the difference: Nginx may return 502, which is an upstream failure rather than a WebSocket-only failure.
+
+### Worked lesson distinguish three connection failures
+
+```text
+HTTP 401/403: application identity or permission was rejected
+HTTP 426: ordinary HTTP reached a WebSocket-only path
+HTTP 502: proxy could not obtain a valid upstream response
+```
+
+These are diagnostic categories, not an exhaustive mapping of every proxy implementation. Inspect browser network details, API logs, and Nginx error logs together. A normal `curl` request to a WebSocket endpoint does not perform the browser's authenticated upgrade handshake.
+
+```bash
+sudo nginx -t
+sudo journalctl -u nginx --since '10 minutes ago' --no-pager
+sudo tail -n 60 /var/log/nginx/error.log
+```
+
+Redact request URLs if they contain secrets before sharing output. Prefer webhook credentials in supported headers; if an external sender requires a query credential, minimize its exposure in access logs and rotate it under a controlled process.
+
+**Exercise:** Make a browser test verify that an unauthorized WebSocket connection is rejected while an authorized one opens. Then stop the broker simulator and prove the dashboard remains available to report degraded broker status.
 
 ## Chapter 34 Observability scheduling backups and cost
 
@@ -1073,6 +1772,25 @@ Estimate monthly cost as `running_hours * compute_rate + provisioned_storage + I
 
 **Lab:** Restore a database backup, compare row counts and fill totals, and document recovery time and data-loss window. Then inventory and remove your disposable resources explicitly. Stopping a VM is not cleanup of disks, reserved addresses, buckets, or endpoints.
 
+### Worked lesson write a restore acceptance test
+
+A backup drill must specify what success means. For a trading ledger: all strategy versions referenced by open positions exist; execution IDs remain unique; total owned quantity matches the restored fill ledger; credentials can be recovered through the approved key process; and the restarted worker does not replay already-submitted orders blindly.
+
+```text
+Restore checkpoint
+  record backup timestamp and schema version
+  restore into an isolated database
+  run integrity and quantity queries
+  start paper workers with external network orders disabled
+  replay duplicate broker evidence
+  compare before and after totals
+  record elapsed recovery time
+```
+
+Choose RPO and RTO from business requirements, then measure whether the backup and deployment process can meet them. A claimed five-minute RTO is not credible if restoring the database takes forty minutes.
+
+**Exercise:** Produce a monthly cost worksheet with compute, persistent disk, snapshots, public IP, logging, database, and network entries. Set one workload to eight hours per weekday but keep persistent resources billed for their actual retention. Explain why scheduling is not a universal budget cap.
+
 ## Chapter 35 Containers Terraform and managed runtime choices
 
 A container packages a process and its filesystem dependencies, not a whole independent kernel. Build a non-root image, avoid secrets in layers, keep dependencies pinned, and scan the resulting artifact. Docker Compose is useful for a local API, Redis, PostgreSQL, and fake broker stack. It is not automatically high availability.
@@ -1096,6 +1814,22 @@ Learn service selection by workload:
 | Analytics across large history | BigQuery | Query economics, not order-path OLTP |
 
 **Lab:** Containerize the paper API, then deploy only that API to a managed runtime. Keep its database external, document cold-start and connection-pool behavior, and test a rollout. Compare this with the VM deployment using measured complexity and cost, not fashion.
+
+### Worked lesson image versus container versus Pod
+
+An image is a versioned filesystem and startup description. A container is a process instance created from it. A Pod is Kubernetes' scheduling unit that can contain one or more containers sharing networking and selected volumes. A Deployment describes how controllers maintain and replace Pods.
+
+```text
+Python source -> container image -> registry digest
+                                   |
+                            Deployment specification
+                                   |
+                           ReplicaSet -> Pod -> process
+```
+
+Use an image digest or a controlled immutable tag for releases. A mutable `latest` tag makes it harder to know what code is running. A restart is not a database migration, and scaling a Deployment does not make an embedded SQLite database shared.
+
+**Exercise:** Follow the extended Kubernetes labs later in this edition. Explain which examples are intentionally single-replica and why. Do not enable an HPA for the SQLite lab simply because autoscaling appears in an exam objective.
 
 # Part Six Data Engineering Machine Learning and Certification
 
@@ -1124,6 +1858,25 @@ Do not claim these dates contain real trading results. Generate synthetic data f
 
 **Lab:** Generate 10,000 paper fills and latency events, write a partitioned archive, load an analytics table, and verify duplicate imports do not double totals. Simulate one-hour-late data. Explain why an at-least-once pipeline needs business-key deduplication even if transport is reliable.
 
+### Worked lesson event schema evolution
+
+```json
+{
+  "event_id": "paper-fill-17",
+  "schema_version": 2,
+  "type": "fill_confirmed",
+  "account_id": "synthetic-account",
+  "event_time": "2026-09-18T04:00:00Z",
+  "ingested_at": "2026-09-18T04:00:02Z",
+  "quantity": 2,
+  "price": "100.25"
+}
+```
+
+Event time describes the business occurrence; ingestion time describes your observation pipeline. Late arrivals can change historical aggregates. Additive schema changes are often easier than changing the meaning of an existing field, but consumers still need validation and version policy.
+
+**Exercise:** Add a fee field without breaking a version-one consumer. Then change price from a decimal string to a nested object and demonstrate why it is a breaking change. Quarantine invalid records with sanitized reasons and replay them after repair without duplicating accepted events.
+
 ## Chapter 37 Statistics and honest backtesting
 
 Before ML, learn mean, median, variance, standard deviation, quantiles, probability, conditional probability, correlation, sampling, and confidence intervals. Learn how a small number of outliers can make average latency or average trade return misleading. Correlation does not establish causation.
@@ -1137,6 +1890,23 @@ Include transaction costs, slippage assumptions, delayed entries, partial fills,
 Track drawdown, turnover, exposure, distribution of returns, and sensitivity to costs rather than only win rate. A strategy can win often and lose money because occasional losses dominate. A promising backtest is not evidence that a system is safe to trade live or compliant with applicable rules.
 
 **Lab:** Generate a synthetic trending and a synthetic random-walk price series. Implement a simple moving-average signal with next-bar execution. Then deliberately introduce look-ahead by using future data, observe the improvement, and explain why it is invalid. Repeat with higher costs and report the change honestly.
+
+### Worked lesson compute drawdown
+
+```python
+equity = [100, 110, 105, 90, 108, 120]
+peak = equity[0]
+worst = 0.0
+for value in equity:
+    peak = max(peak, value)
+    drawdown = (peak - value) / peak
+    worst = max(worst, drawdown)
+assert round(worst * 100, 2) == 18.18
+```
+
+This curve has a decline from 110 to 90 before reaching a new high. A positive final return does not reveal the depth of interim loss. Track both returns and risk measures, and state whether the curve includes fees and unrealized marks.
+
+**Exercise:** Change execution from same-bar close to next-bar open and observe the difference. Include a missing candle and a gap. If target and stop both lie within one bar, implement a conservative ambiguity policy and compare results with finer-grained data where available.
 
 ## Chapter 38 Machine learning and MLOps
 
@@ -1153,6 +1923,25 @@ Map the workflow to Google's managed ML services: store data, run a training job
 MLOps applies software and data controls to models. Version code, data, features, parameters, and artifacts together. Training-serving skew occurs when the feature pipeline differs between training and inference. Data drift means the input distribution changed; concept drift means the relationship with the target changed. Neither automatically proves retraining will help.
 
 **Lab:** Train an advisory latency-anomaly model, publish a model card with limitations, and compare batch predictions against a rule baseline. Deploy only in a disposable project, set resource limits, then remove the endpoint after the exercise. Real-time endpoints and accelerators can keep accruing cost even when you are not using the browser.
+
+### Worked lesson a leakage resistant baseline pipeline
+
+```python
+# Requires scikit-learn in a separate ML learning environment.
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+
+def fit_baseline(features, labels, split_index):
+    model = make_pipeline(StandardScaler(), LogisticRegression(max_iter=500))
+    model.fit(features[:split_index], labels[:split_index])
+    probabilities = model.predict_proba(features[split_index:])
+    return model, probabilities
+```
+
+The scaler is fit only on the training slice because it is inside the fitted pipeline. This is only a basic chronological split; overlapping target windows and delayed feature availability can still leak information. Require both classes in training and validate the feature schema.
+
+**Exercise:** Use synthetic operational metrics, not real client data, and compare the model with a simple threshold rule. Report precision and recall for the rare failure class. Add an abstain policy when required features are missing rather than filling them with invented zeros.
 
 ## Chapter 39 Embeddings vector databases and retrieval
 
@@ -1185,6 +1974,22 @@ Compare a local PostgreSQL vector extension or other local engine with a managed
 
 **Lab:** Index 20 sanitized incident notes, define 15 questions with expected source passages, and evaluate retrieval recall. Add a malicious instruction in a document and verify the assistant treats it as content. Give the assistant no broker, shell, secret-store, or production write credentials.
 
+### Worked lesson evaluate retrieval separately from generation
+
+```python
+expected = {"q1": {"runbook-redis"}, "q2": {"runbook-ws", "runbook-nginx"}}
+retrieved = {"q1": ["runbook-auth", "runbook-redis"], "q2": ["runbook-ws"]}
+recalls = []
+for question, relevant in expected.items():
+    found = set(retrieved[question])
+    recalls.append(len(found & relevant) / len(relevant))
+assert sum(recalls) / len(recalls) == 0.75
+```
+
+This measures retrieval coverage for a tiny labeled example, not answer correctness. Evaluate whether a generated answer cites the retrieved evidence faithfully and distinguishes current from historical instructions. A correct-sounding answer with the wrong client account context is still a security failure.
+
+**Exercise:** Add tenant metadata and a query from a different account. Verify filtering occurs before results reach the model. Test document deletion and re-indexing so removed sensitive text does not remain retrievable indefinitely.
+
 ## Chapter 40 Choose a certification path
 
 There is no single Google Cloud exam that certifies Python, software architecture, data engineering, ML, security, networking, and business leadership together. Use the attachment as a menu. For your goal, begin with engineering fundamentals and Associate Cloud Engineer, then choose Cloud Developer, Cloud Architect, or DevOps according to your work. Choose Data Engineer or ML Engineer after the data chapters and additional specialization practice.
@@ -1213,6 +2018,19 @@ Your VM project does not exercise every exam product. Maintain a gap sheet for p
 Week 1: resource hierarchy, projects, APIs, quota, billing, and budgets. Week 2: IAM, service accounts, impersonation, OS Login, and least privilege. Week 3: VPCs, routes, firewalls, DNS, load balancing, NAT, and private connectivity. Week 4: Compute Engine, disks, snapshots, managed instance groups, and scheduling. Week 5: containers, GKE basics, Cloud Run, and event triggers. Week 6: storage and database selection, backup, and restore. Week 7: monitoring, logs, troubleshooting, and cost investigation. Week 8: timed original practice questions, official sample questions, gap repair, and a fresh end-to-end lab without notes.
 
 These weeks are revision blocks after practical study, not a promise that a beginner can skip experience. Mark each objective as explainable, labbed, and reviewed. Practice question percentages are your study feedback, not an official pass prediction.
+
+### Worked lesson build an exam gap tracker
+
+```csv
+objective,explain_without_notes,lab_evidence,review_date,next_action
+IAM least privilege,yes,iam-denied-read.md,2026-09-23,repeat with workload identity
+GKE probes,no,,2026-09-23,complete probe failure lab
+Database restore,yes,restore-report.md,2026-09-23,repeat timed restore
+```
+
+The tracker records evidence rather than a vague feeling of readiness. Add every objective from the current guide for the exam you actually intend to take. Recheck the standard guide versus renewal guide; they can have different scope and format.
+
+**Exercise:** Pick one incorrect practice answer and trace it to an objective, a misunderstood rule, and a small lab. Explain why the wrong choices fail the scenario constraints. Memorizing a product name without its constraints is weak preparation.
 
 ## Chapter 41 Professional specialization labs
 
@@ -1250,6 +2068,14 @@ For [Cloud Network Engineer](https://cloud.google.com/learn/certification/cloud-
 
 Workspace administration is a different specialization around an organization's collaboration environment. It is not necessary to add Workspace administration features to your trading app. Likewise, foundational leadership certifications can be studied conceptually without pretending they are prerequisites for every engineering certification. Check the [current certification catalog](https://cloud.google.com/learn/certification) because offerings and names change.
 
+### Worked lesson one problem three professional perspectives
+
+Scenario: a client requires recovery after a zonal outage, restricted access to broker secrets, and audit history for all executions. The architect defines recovery goals, ownership, and a costed design. The DevOps engineer implements deployment, monitoring, failover drills, and safe handover. The security engineer reviews identities, secret access, evidence retention, and recovery abuse.
+
+The database engineer tests backup consistency and ledger integrity. The network engineer investigates private connectivity and egress identity. The data engineer governs downstream analytics. The ML engineer ensures advisory models do not learn from leaked or unavailable-at-decision data. These roles overlap, but they are not identical exams or interchangeable job titles.
+
+**Exercise:** Write one page from each of three perspectives, then identify a conflict. For example, broader log retention can help incident investigation but increase sensitive-data exposure and cost. Resolve it with scoped retention and redaction rather than pretending one requirement cancels the other.
+
 ## Chapter 42 Original practice questions with explanations
 
 These are original study questions, not exam dumps or official exam questions. Choose the best answer under the stated constraints, then explain why the alternatives are weaker.
@@ -1276,6 +2102,20 @@ These are original study questions, not exam dumps or official exam questions. C
 20. All unit tests pass. Are production secrets, DNS, proxy upgrade headers, and provider permissions proven correct? **No.** Those require deployment and integration evidence at their own boundaries.
 
 For every wrong answer, identify the misunderstood concept, repeat a small lab, and explain the repaired reasoning aloud. Read every objective in your chosen official exam guide; this question set cannot certify coverage or predict an exam outcome.
+
+### Additional scenario questions
+
+**Question:** A Pod is Running but not Ready. Should you immediately increase replicas? **Answer:** Inspect readiness and dependency evidence first. More copies of the same misconfiguration will not repair it.
+
+**Question:** An HPA has no CPU utilization value. What do you inspect? **Answer:** Metrics availability and resource requests, then HPA events. The target is calculated relative to requests for the relevant configuration, not an arbitrary machine percentage.
+
+**Question:** A PVC survived Pod replacement. Is it a backup? **Answer:** No. It is persistent storage; deletion, corruption, and regional failure still need a backup and restore plan.
+
+**Question:** An image push succeeded but a Pod reports ImagePullBackOff. What differs? **Answer:** The identity and network path pulling the image may differ from the deployer's push identity. Check reference, permissions, registry, and events.
+
+**Question:** You enabled two replicas of a websocket owner. Is twice the feed availability guaranteed? **Answer:** No. You may exceed broker connection limits or create conflicting subscriptions. Partition ownership deliberately.
+
+**Exercise:** Turn each answer into a reproducible paper-only failure drill and write the evidence that distinguishes it from a similar symptom.
 
 # Part Seven Your Rebuild Workbook
 
@@ -1341,6 +2181,22 @@ Export sanitized events to an analytical store and add one advisory ML or RAG fe
 
 Ask another engineer to use the app, inspect one transaction race, attempt an unauthorized request in the test environment, and follow your recovery guide. Record findings, fix them, and add regressions. Senior-level growth includes responding to evidence and feedback, not merely producing more code.
 
+### Worked lesson definition of done for one milestone
+
+For breakout monitoring, done means the saved configuration roundtrips; a closed candle is selected correctly; its threshold is persisted; TTL and entry-end boundaries are honored; duplicate signals do not create duplicate watches; a restart preserves the remaining deadline; one threshold crossing creates at most one intent; a kill switch blocks the entry; and the browser displays waiting, expired, and triggered states distinctly.
+
+```text
+Milestone evidence
+  specification.md
+  decision-record.md
+  tests for normal and boundary cases
+  one failure injection report
+  browser screenshot or trace where applicable
+  limitations.md
+```
+
+**Exercise:** Apply the same definition-of-done method to email verification, CNC restoration, and a cloud backup job. A feature's existence in a menu is not its acceptance criterion.
+
 ## Chapter 44 Guided debugging cases and answer notes
 
 ### Case A Configuration exists on screen but an alert says missing
@@ -1385,6 +2241,22 @@ Distinguish pending, rejected, partial, cancelled, and unknown. Read broker-prov
 
 **Expected reasoning:** Retry only under a bounded policy with fresh data and reconciled remaining quantity. Never retry an unknown outcome as though it were a confirmed rejection. Broker protection mechanisms and rules must be checked against the current provider contract.
 
+### Worked lesson evidence driven incident notes
+
+```text
+Observed: dashboard /ws/feed returned HTTP 426
+Impact: browser did not receive live dashboard messages
+Known: HTTP API routes returned responses
+Unknown: whether Dhan ticks reached the market-feed process
+Hypothesis: proxy did not forward upgrade headers
+Next check: inspect active Nginx configuration and authenticated handshake
+Containment: do not assume dashboard prices are fresh
+```
+
+Separate facts from inference. Later append the confirmed cause, fix, validation, and prevention. Avoid rewriting the original uncertainty as though you knew the cause at the beginning. This habit makes incident reports credible and prevents premature fixes to unrelated components.
+
+**Exercise:** Write the same structure for `AuthenticationError`, `CFG_MISSING`, and `UNKNOWN_ORDER_OUTCOME`. Include a safe diagnostic command and a dangerous action you explicitly avoid, such as deleting Redis state or resubmitting blindly.
+
 ## Chapter 45 Senior developer interview preparation
 
 A senior engineer is expected to make trade-offs, debug across boundaries, communicate uncertainty, and improve how a team delivers software. Learning one project deeply can be powerful evidence, but years of operational judgment are not compressed into a certificate. Prepare to discuss decisions and failures honestly, including the role AI played in the original implementation.
@@ -1416,6 +2288,22 @@ Use the structure requirement, alternatives, decision, evidence, consequence. Av
 
 Include a sanitized architecture document, a runnable paper demo, migration files, meaningful test results, one load report, a threat model, a restore report, and two incident postmortems. Record which code you wrote independently and which reference material you consulted. Never publish client credentials, brokerage screenshots with personal data, or private production logs.
 
+### Worked lesson an architecture decision record
+
+```text
+Decision: keep the broker feed owner on a supervised VM initially
+Context: one client, modest subscription set, continuous outbound socket
+Alternatives: VM worker, GKE worker, request-driven managed service
+Chosen because: straightforward ownership and predictable process lifecycle
+Costs: VM patching, single-instance limitation, explicit recovery work
+Revisit when: measured scale or availability goals exceed this design
+Evidence: reconnect soak test and operational runbook
+```
+
+This is stronger than saying a VM is always better than Kubernetes. An interview answer should be conditional on requirements and measured constraints. Explain which failure you accept, which you mitigate, and how you know the mitigation works.
+
+**Exercise:** Present your design in ten minutes. Ask a peer to introduce one new constraint, such as 100 clients or regional outage recovery. Revise the design without abandoning established quantity and ownership invariants.
+
 ## Chapter 46 Completion rubric and daily practice
 
 Score each skill from 0 to 3. Zero means unfamiliar. One means you can follow instructions. Two means you can implement and explain independently. Three means you can diagnose failure, compare alternatives, and review another person's implementation. This is a personal learning rubric, not a hiring or certification standard.
@@ -1437,6 +2325,700 @@ Score each skill from 0 to 3. Zero means unfamiliar. One means you can follow in
 A productive daily session can be 20 minutes reviewing yesterday's concept, 50 minutes coding, 30 minutes testing, and 20 minutes explaining and recording decisions. Change the durations to fit your schedule. The important habit is producing your own reasoning, not consuming endless videos.
 
 When using AI, first write your prediction and test. Ask for a hint, a counterexample, or a review rather than a full replacement. After reading help, close it and reimplement the concept. If you cannot explain the failure case that motivated the code, you have not yet learned that code.
+
+### Worked lesson self assessment through independent implementation
+
+Choose a small feature, close the book, and implement it from a written specification. Run tests you prepared before coding. Explain the design to another person, then ask them to change a requirement. Being able to adapt is stronger evidence than reproducing memorized source.
+
+Use this sequence for a monthly review: implement a pure rule; add a validated route; persist it; test concurrent access; demonstrate it in a browser; deploy it to a disposable environment; inject failure; recover; and write a short explanation. Repeat with a different feature so the exercise tests transferable skill.
+
+**Exercise:** Maintain a learning journal with one incorrect assumption per week and the evidence that changed it. Examples include assuming every green status badge proves live data, assuming accepted equals filled, or assuming a budget alert stops billing. The goal is better judgment, not a claim that you never make mistakes.
+
+# Part Eight Extended Google Cloud and Kubernetes Labs
+
+## Chapter 47 Networking from addresses to application requests
+
+### The mental model
+
+A network address identifies an interface within a routing context. A port identifies an application endpoint on that address. `127.0.0.1:8015` is loopback on the machine where the command runs, not automatically your VM. A browser on your laptop reaches the VM only through a routable endpoint, an authenticated tunnel, or a proxy.
+
+TCP establishes a reliable byte stream; it does not understand whether bytes represent a valid order. TLS protects the connection and verifies the server identity when configured correctly. HTTP adds request semantics. WebSocket upgrades an HTTP handshake into a bidirectional message channel. Each layer can succeed while a higher layer fails.
+
+Use CIDR notation to describe a network prefix. For `10.42.0.0/24`, 24 bits are the network prefix. Cloud providers reserve some addresses in each subnet, so do not assume every mathematically available address can be assigned to a VM.
+
+```python
+from ipaddress import ip_network, ip_address
+
+subnet = ip_network("10.42.0.0/24")
+assert ip_address("10.42.0.8") in subnet
+assert ip_address("10.43.0.8") not in subnet
+assert subnet.num_addresses == 256
+```
+
+### Trace a private database connection
+
+Suppose the API has a private address and Cloud SQL is reached privately. You need identity permission, a valid database credential or IAM database identity, a reachable network path, compatible connection settings, and database authorization. The Cloud SQL Auth Proxy authenticates and encrypts its connection but does not magically create missing private network reachability. Distinguish IAM permission to connect from SQL permission to select a table.
+
+### Diagnose in layers
+
+Start with the exact destination and port. Resolve DNS. Inspect the listening process. Check route and firewall policy. Check TLS hostnames. Then inspect application authentication and response data. Do not disable every firewall rule to determine whether a login password is wrong.
+
+```bash
+# On your learning VM, read-only diagnostics:
+hostname
+ip address
+ip route
+ss -ltn
+curl --max-time 5 -i http://127.0.0.1:8015/health
+```
+
+Expected response from the paper lab contains `PAPER_ONLY`. A timeout, connection refusal, 401, and 502 are different evidence. Write down the observed category before changing configuration.
+
+### Exercise and interview checkpoint
+
+Draw laptop, IAP tunnel, VM, Nginx, API, and database. Label private and public addresses, ports, TLS termination, and identity checks. Explain how a request reaches a private VM without exposing SSH globally. Explain why allowing ingress port 443 does not grant access to the broker account.
+
+## Chapter 48 Containerize the paper application
+
+### Prerequisites and scope
+
+Install Docker using its official platform instructions, use Linux containers, and confirm `docker version` shows both client and server. On Windows, the local runtime may use WSL2. Do not mix Windows container images with the Linux example. Docker is not installed in the authoring environment, so the following build is a lab you must run; it is not reported as already executed.
+
+Build from `docs/learning-book/lab`. The Dockerfile copies only the learning package and runtime dependencies. It does not copy the production app or its credentials.
+
+```dockerfile
+FROM python:3.12-slim
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PAPERLAB_DB=/data/paperlab.sqlite3
+WORKDIR /app
+COPY requirements-runtime.txt ./
+RUN python -m pip install --no-cache-dir -r requirements-runtime.txt \
+    && groupadd --gid 10001 paper \
+    && useradd --uid 10001 --gid paper --no-create-home paper \
+    && mkdir /data \
+    && chown paper:paper /data
+COPY --chown=paper:paper paperlab ./paperlab
+USER 10001:10001
+EXPOSE 8015
+CMD ["python", "-m", "uvicorn", "paperlab.api:default_app", "--factory", "--host", "0.0.0.0", "--port", "8015"]
+```
+
+### Read the Dockerfile line by line
+
+The base image supplies Python and Linux userspace. `WORKDIR` sets the process working directory. Copying the small dependency file before application source allows unchanged dependencies to reuse a cached build layer. A non-root user limits some consequences of compromise. `EXPOSE` is metadata; it does not publish a port by itself.
+
+The JSON-array CMD launches Python directly, improving signal delivery compared with hiding the process behind an unnecessary shell. Binding Uvicorn to `0.0.0.0` inside the container makes it reachable through container networking. The host publishing rule below still binds only to laptop loopback.
+
+```bash
+docker build -t paper-school:lesson1 .
+docker run --rm --name paper-school-local \
+  -p 127.0.0.1:8015:8015 paper-school:lesson1
+```
+
+Open `http://127.0.0.1:8015`, save a strategy, and send a synthetic signal as described in the lab README. In another terminal:
+
+```bash
+docker logs --tail 50 paper-school-local
+docker stats --no-stream paper-school-local
+docker inspect paper-school-local --format '{{.Config.User}}'
+```
+
+Expected configured user is `10001:10001`. The database currently lives in the container's writable storage. Removing this container removes that synthetic data. Do not interpret this as a production persistence design.
+
+### Reproducibility and security
+
+The image tag `python:3.12-slim` can move. For a release, record and review a digest, rebuild for security updates, scan dependencies, and run tests. The teaching dependency versions mirror the small lab; they are not a certification of current production security. Never COPY `.env` into an image and then delete it in a later layer, because earlier layers can retain the content.
+
+### Exercise
+
+Stop the local container with `docker stop paper-school-local`. Run it again and check which records remain. Then mount a named volume at `/data`, create another record, and repeat. Explain the difference between process lifetime, container filesystem lifetime, and named-volume lifetime. Remove only the named teaching volume after confirming the synthetic data is disposable.
+
+## Chapter 49 What Kubernetes actually controls
+
+Kubernetes is a desired-state control system. You submit objects to an API server. Controllers compare desired and observed state and take action. The scheduler chooses suitable nodes for unscheduled Pods; the kubelet manages containers on a node. Cluster state is maintained through the control plane. Kubernetes does not understand whether a broker order is duplicated or whether a strategy's target was reached. [Kubernetes components](https://kubernetes.io/docs/concepts/overview/components/)
+
+```text
+kubectl -> API server -> persisted object state
+                         |
+                 controllers observe difference
+                         |
+                 scheduler selects a node
+                         |
+                 kubelet starts container
+                         |
+                 status returns to API server
+```
+
+### Objects and reconciliation
+
+A manifest contains `apiVersion`, `kind`, `metadata`, and usually `spec`. Status is observed state; do not put a fabricated healthy status into a manifest. Labels are key-value selectors used to associate objects. An annotation carries metadata that is not intended as a selector.
+
+Namespaces organize names and policy scope. They are not complete security isolation by themselves. Two client namespaces still require network controls, RBAC, resource limits, and data/secret separation. If administrators share unrestricted cluster access, they may see both clients.
+
+### Failure thought experiment
+
+When a container exits, the Pod's restart policy may restart it. When a Pod disappears, its controlling workload may create a replacement. When a node fails, recovery depends on the cluster and storage design. None of these actions repairs a corrupt ledger or determines whether an order was accepted before the crash.
+
+**Exercise:** Write two columns: orchestration responsibility and application responsibility. Put replacing a failed API Pod in the first, and reconciling an unknown order in the second. Place database failover and secret rotation carefully: both involve infrastructure and application behavior.
+
+## Chapter 50 Your first local cluster with kind
+
+Use kind to run a local Kubernetes learning cluster in containers. Install a supported Docker runtime, kind, and kubectl from their official instructions, then confirm version compatibility. The [kind quick start](https://kind.sigs.k8s.io/docs/user/quick-start/) documents cluster creation and loading local images. Do not use this cluster to hold real broker credentials.
+
+### Create and inspect
+
+From the paper lab directory, build the image first, then run:
+
+```bash
+kind create cluster --name paper-school
+kubectl --context kind-paper-school cluster-info
+kubectl --context kind-paper-school get nodes
+kind load docker-image paper-school:lesson1 --name paper-school
+kubectl --context kind-paper-school apply -f k8s/namespace.yaml
+```
+
+Using `--context` explicitly reduces accidental changes to a client cluster. Always inspect `kubectl config current-context` before destructive operations. Your kubeconfig can contain access credentials; treat it as sensitive.
+
+The namespace manifest is:
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: paper-school
+  labels:
+    purpose: learning-only
+    pod-security.kubernetes.io/enforce: restricted
+```
+
+### Apply and understand the output
+
+`created` means the API accepted a new object. `configured` means an existing object was updated. Neither means the image pulled, container started, or application is ready. Use workload status and events for those questions.
+
+```bash
+kubectl --context kind-paper-school apply -f k8s/paper.yaml
+kubectl --context kind-paper-school -n paper-school get pods -o wide
+kubectl --context kind-paper-school -n paper-school get events \
+  --sort-by=.metadata.creationTimestamp
+```
+
+### Cleanup boundary
+
+When the exercises are finished and synthetic data is no longer needed, `kind delete cluster --name paper-school` removes that named local cluster. It does not remove every Docker image on your computer. Do not use broad Docker prune commands against a machine that also hosts unrelated work.
+
+**Exercise:** Intentionally use an image tag that does not exist. Inspect events and describe the difference between object creation and successful execution. Repair the image reference, then wait for rollout readiness.
+
+## Chapter 51 Deployments labels and a complete paper manifest
+
+A Deployment manages a changing set of Pods through ReplicaSets. Its selector must match its Pod-template labels. A Service uses its own selector to find Pods. A typo between those labels can produce a healthy-looking Pod with no reachable Service endpoints. [Deployment reference](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/)
+
+The supplied lab deliberately uses one replica and `Recreate`. It stores a disposable SQLite file in `emptyDir`. This avoids presenting multiple uncoordinated SQLite instances as a scalable system. Pod replacement loses the synthetic database. Production durability is a later design, not a hidden property of this example.
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: paper-api
+  namespace: paper-school
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: paper-settings
+  namespace: paper-school
+data:
+  PAPERLAB_DB: /data/paperlab.sqlite3
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: paper-api
+  namespace: paper-school
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: paper-api
+  template:
+    metadata:
+      labels:
+        app: paper-api
+    spec:
+      serviceAccountName: paper-api
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: api
+          image: paper-school:lesson1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8015
+          envFrom:
+            - configMapRef:
+                name: paper-settings
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+              ephemeral-storage: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+              ephemeral-storage: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: temporary
+              mountPath: /tmp
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: temporary
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: paper-api
+  namespace: paper-school
+spec:
+  type: ClusterIP
+  selector:
+    app: paper-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+```
+
+### Understand each group
+
+The ServiceAccount names the Kubernetes workload identity and disables automatic API-token mounting because the lab does not call Kubernetes. The ConfigMap supplies a nonsecret database path. The Pod security context uses non-root UID and group values, an appropriate seccomp profile, and a group for mounted-volume access. The container drops capabilities and uses a read-only image filesystem; `/data` and `/tmp` remain writable mounts.
+
+Requests describe scheduling needs. Limits constrain usage. The probe paths refer to the lab's actual `/health` endpoint. The Service remains `ClusterIP`, so no public load balancer is created for an unauthenticated learning application.
+
+### Verification
+
+```bash
+kubectl --context kind-paper-school -n paper-school rollout status \
+  deployment/paper-api --timeout=180s
+kubectl --context kind-paper-school -n paper-school get deployment,replicaset,pod,service
+kubectl --context kind-paper-school -n paper-school logs deployment/paper-api --tail=60
+```
+
+**Exercise:** Change a harmless annotation on the Deployment itself, then on the Pod template, and observe which causes replacement. Predict the result before running. Do not scale this SQLite exercise above one replica; first implement an external shared ledger and test concurrency.
+
+## Chapter 52 Resource requests limits and health probes
+
+A request helps the scheduler place a workload. A CPU limit can cause throttling; a memory limit can lead to termination when exceeded. Increasing a memory limit does not repair an unbounded queue. Record actual working set, event-loop lag, and peak load before choosing values.
+
+In the lab, `250m` means one quarter of a CPU unit requested. `256Mi` is a memory request, distinct from decimal megabytes. The example values are starting points for measurement, not capacity guarantees for the real trading app. Autopilot or admission policy may adjust resource settings; inspect the admitted Pod.
+
+### Three probe questions
+
+Startup asks whether initialization has completed. Readiness asks whether traffic should be sent to this Pod. Liveness asks whether restarting the process is warranted. A startup probe can protect slow initialization from premature liveness failure. Failed readiness removes normal Service traffic eligibility but does not by itself restart the process. [Probe documentation](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+
+The small lab uses `/health` for all three because it has no live provider dependency. A production rebuild should distinguish them. A disconnected broker should not automatically cause the dashboard process to restart, and a database outage should not cause every Pod to enter a synchronized restart loop.
+
+### Commands and interpretation
+
+```bash
+kubectl -n paper-school describe pod POD_NAME
+kubectl -n paper-school logs POD_NAME --previous
+kubectl -n paper-school top pods
+```
+
+Replace `POD_NAME` with an actual name and verify your context first. `--previous` inspects the previous container instance after a restart. `top` requires a working metrics pipeline, which a basic local cluster may not include. Missing metrics is not the same as zero usage.
+
+**Exercise:** Use a separate test deployment with a wrong readiness path and observe Running but not Ready. Then repair it. Inject slow startup and tune startup-probe allowance. Document why liveness should not make a fresh broker order call on every probe.
+
+## Chapter 53 Services DNS and private browser access
+
+Pod addresses change. A Service provides a stable discovery abstraction for matching workloads. ClusterIP is internal; NodePort and LoadBalancer expose different paths with different infrastructure implications. A Service does not create application authentication. [Service documentation](https://kubernetes.io/docs/concepts/services-networking/service/)
+
+### Open the paper lab safely
+
+```bash
+kubectl --context kind-paper-school -n paper-school port-forward \
+  service/paper-api 8015:80
+```
+
+Open `http://127.0.0.1:8015`. Keep the port-forward process running while using the browser. Ctrl+C stops the tunnel, not the Pod. Port-forward is an operator debugging path and is not a test of ordinary Service load-balancing behavior or network-policy enforcement.
+
+Inspect the Service and EndpointSlices:
+
+```bash
+kubectl --context kind-paper-school -n paper-school get service paper-api -o yaml
+kubectl --context kind-paper-school -n paper-school get endpointslices \
+  -l kubernetes.io/service-name=paper-api
+```
+
+No ready endpoint can indicate selector mismatch or readiness failure. A DNS name resolving to a Service address does not prove there is a ready backend. Inside the namespace, `paper-api` is a useful short service name; cross-namespace access requires the intended namespace-qualified name under cluster DNS conventions.
+
+### Public traffic is a later exercise
+
+Ingress and Gateway resources require compatible controllers. Merely applying an Ingress object does not install a controller or a certificate. Before exposing your rebuild, add tested authentication, authorization, HTTPS, request limits, session policy, and WebSocket support for the chosen controller. Do not expose the supplied unauthenticated lab through LoadBalancer.
+
+**Exercise:** In an isolated cluster, change the Service selector to a nonexistent label. Observe Service existence with no matching backends. Restore it and explain why restarting the application was unnecessary.
+
+## Chapter 54 Configuration secrets RBAC and network policy
+
+Use ConfigMaps for nonsecret settings. Use a controlled secret mechanism for credentials. Kubernetes Secret data commonly appears base64-encoded in manifests; encoding is not encryption. Restrict RBAC, enable appropriate at-rest protection, and avoid committing secret manifests to Git. [Kubernetes Secret practices](https://kubernetes.io/docs/concepts/security/secrets-good-practices/)
+
+Environment variables loaded at container start do not automatically update when a ConfigMap changes. Mounted configuration has different update behavior, but applications must still reload it safely. Broker-token rotation needs a versioned, explicit handover; it is not solved by editing one Kubernetes object.
+
+### Minimal RBAC lesson
+
+The paper API does not need Kubernetes API permissions. For a separate observer service, a namespaced Role can permit only reading Pod status:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pod-observer
+  namespace: paper-school
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+```
+
+A RoleBinding must attach it to the intended identity before it grants access. Do not bind it to every service account. `kubectl auth can-i` can help test permissions, but impersonation checks require privileges of their own. Reading Secrets is a different permission; do not grant it to a log viewer by habit.
+
+### NetworkPolicy lesson
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: paper-api-isolated
+  namespace: paper-school
+spec:
+  podSelector:
+    matchLabels:
+      app: paper-api
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              role: paper-test-client
+      ports:
+        - protocol: TCP
+          port: 8015
+  egress: []
+```
+
+This selects the paper API, allows ingress only from labeled test-client Pods in the same namespace on 8015, and allows no egress. It is optional and requires a network implementation that actually enforces policy. Default kind networking may not. The paper app has no external dependency, so denying egress is an intentional lesson. A real broker worker would need carefully designed DNS and broker/Google API egress. [NetworkPolicy semantics](https://kubernetes.io/docs/concepts/services-networking/network-policies/)
+
+**Exercise:** Use a policy-enforcing cluster to compare two test Pods, one carrying the allowed label and one without it. Verify allowed and denied communication through the normal Service path, not just port-forward. Record the CNI and policy behavior used by the test.
+
+## Chapter 55 Persistent storage and database placement
+
+`emptyDir` belongs to a Pod's lifetime. Container restarts within that Pod can preserve it, while Pod replacement removes it. A persistent volume claim asks for storage independent of one Pod. Its storage class, access modes, reclaim policy, and topology affect actual behavior. A PVC is not a backup. [Persistent volumes](https://kubernetes.io/docs/concepts/storage/persistent-volumes/)
+
+### A teaching claim
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: paper-data
+  namespace: paper-school
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+```
+
+This assumes a default storage class and compatible provisioner; otherwise specify a supported class or expect Pending. To use it, replace only the `data` volume's `emptyDir` with `persistentVolumeClaim: {claimName: paper-data}` in a separate teaching manifest. Keep one replica. ReadWriteOnce generally describes node attachment access, not an application-level single-writer guarantee across every possible Pod arrangement.
+
+### Why not put every database in Kubernetes immediately
+
+A StatefulSet provides stable identities and storage relationships; it does not implement database replication, backup consistency, schema migration, or failover correctness for you. Self-managed PostgreSQL and Redis require operational expertise. A managed database may be preferable when its cost and constraints fit.
+
+For the next rebuild stage, place the authoritative ledger in PostgreSQL and keep API Pods stateless with bounded connection pools. Let Redis hold cache and coordination data under a defined persistence policy. Keep schema migration as a controlled deployment step, not a race executed independently by every Pod at startup.
+
+**Exercise:** Create a paper record, restart a container, replace a Pod, and compare outcomes with emptyDir and with a PVC. Back up the database, delete a test record, restore into an isolated instance, and verify totals. Explain the difference between persistence, replication, and recovery.
+
+## Chapter 56 Rollouts autoscaling jobs and safe ownership
+
+Stateless HTTP services can often use rolling replacement. Your execution owner is different: overlapping old and new workers can be unsafe without account ownership and reconciliation. The paper SQLite lab uses Recreate and remains single-replica. Even Recreate is not a substitute for an application ownership protocol in the real system.
+
+```bash
+kubectl -n paper-school rollout history deployment/paper-api
+kubectl -n paper-school rollout status deployment/paper-api --timeout=180s
+kubectl -n paper-school rollout undo deployment/paper-api
+```
+
+Use these only after checking context and whether the earlier revision and its data assumptions are valid. Code rollback does not undo broker side effects or reverse a destructive migration.
+
+### HPA as a separate stateless exercise
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: stateless-dashboard
+  namespace: paper-school
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: stateless-dashboard
+  minReplicas: 2
+  maxReplicas: 4
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+```
+
+This refers to a future `stateless-dashboard` deployment you must implement with external state and CPU requests. It is not applicable to the supplied SQLite lab. HPA needs a metrics source; CPU utilization targets depend on requests. Autoscaling cannot fix a provider's fixed account rate limit. [HPA documentation](https://kubernetes.io/docs/concepts/workloads/autoscaling/horizontal-pod-autoscale/)
+
+### Jobs and schedules
+
+A Job runs finite work; a CronJob creates scheduled Jobs. Use a migration Job with explicit approval, a bounded retry policy, and idempotent logic. For a morning task, specify `timeZone: Asia/Kolkata` on a supported cluster and define missed-run behavior. `concurrencyPolicy: Forbid` reduces overlap for that CronJob but does not make the task globally exactly once. [CronJob documentation](https://kubernetes.io/docs/concepts/workloads/controllers/cron-jobs/)
+
+**Exercise:** Run a synthetic cache-refresh Job twice and prove its idempotent result. Then schedule it, suspend the CronJob, and inspect its state. Explain why a cluster CronJob cannot start a completely stopped cluster or VM on which it depends.
+
+## Chapter 57 Deploy the paper image to GKE
+
+### Cost and prerequisites
+
+This is an optional billable exercise. Complete the local cluster first. Use a disposable project with billing, budget alerts, quota, and administrator-approved IAM. GKE can exceed a small single-VM monthly budget; the book does not promise a rupee ceiling. Read the current [Autopilot creation guide](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/creating-an-autopilot-cluster) and regional pricing before proceeding.
+
+Run in Cloud Shell or a workstation with gcloud, Docker, kubectl, and the GKE authentication plugin available. Confirm versions and authorized project. The operator needs permissions for enabling APIs, creating the repository/cluster, building or pushing the image, and accessing the cluster. Do not solve missing permissions by granting Owner indiscriminately.
+
+```bash
+export PROJECT_ID="REPLACE_WITH_DISPOSABLE_PROJECT"
+export REGION="asia-south1"
+export CLUSTER="paper-school-gke"
+test "$PROJECT_ID" != "REPLACE_WITH_DISPOSABLE_PROJECT" || exit 1
+gcloud config set project "$PROJECT_ID"
+gcloud services enable container.googleapis.com \
+  artifactregistry.googleapis.com --project="$PROJECT_ID"
+
+gcloud artifacts repositories create paper-school \
+  --repository-format=docker --location="$REGION" \
+  --project="$PROJECT_ID"
+
+gcloud auth configure-docker "$REGION-docker.pkg.dev"
+export IMAGE="$REGION-docker.pkg.dev/$PROJECT_ID/paper-school/paper-api:lesson1"
+docker build -t "$IMAGE" .
+docker push "$IMAGE"
+```
+
+The working directory must be the paper lab containing the Dockerfile. Authentication for pushing an image is not automatically authentication for nodes pulling it. Grant the cluster's actual image-pull identity repository reader access when required, and inspect ImagePullBackOff events instead of assuming the deployer's credentials are reused. [Artifact Registry image operations](https://docs.cloud.google.com/artifact-registry/docs/docker/pushing-and-pulling)
+
+### Create and access the cluster
+
+```bash
+gcloud container clusters create-auto "$CLUSTER" \
+  --region="$REGION" --project="$PROJECT_ID"
+gcloud container clusters get-credentials "$CLUSTER" \
+  --region="$REGION" --project="$PROJECT_ID"
+kubectl config current-context
+kubectl apply -f k8s/namespace.yaml
+```
+
+For this exercise, create `paper-gke.yaml` from `k8s/paper.yaml` and replace its `image: paper-school:lesson1` with the exact Artifact Registry image you just pushed. Keep the other safety properties. Inspect the resulting file before applying it:
+
+```bash
+kubectl apply -f paper-gke.yaml
+kubectl -n paper-school rollout status deployment/paper-api --timeout=300s
+kubectl -n paper-school get pods -o wide
+kubectl -n paper-school port-forward service/paper-api 8015:80
+```
+
+Do not deploy the unresolved local-only image name to GKE. After deployment, inspect the actual Pod image reference and events. A registry image exists independently of your local kind image cache.
+
+Keep access through the local port-forward or Cloud Shell's authorized preview. Do not create a public LoadBalancer for this lab. Test health, strategy save, one synthetic entry, and one synthetic target exit. Record admitted resource settings and workload events.
+
+### Cleanup
+
+After verifying the project/context and deciding the synthetic data is disposable:
+
+```bash
+gcloud container clusters delete "$CLUSTER" \
+  --region="$REGION" --project="$PROJECT_ID"
+gcloud artifacts repositories delete paper-school \
+  --location="$REGION" --project="$PROJECT_ID"
+```
+
+These commands are destructive to the named learning resources and prompt for confirmation. Review any retained disks, addresses, log retention, and other resources separately. Deleting a cluster is not proof that every related charge has stopped.
+
+## Chapter 58 Workload identity Cloud SQL and delivery pipelines
+
+### Workload identity instead of key files
+
+Workload Identity Federation for GKE lets workloads use Google Cloud authorization without baking service-account keys into images. Kubernetes service accounts and Google Cloud service accounts are distinct identities. Follow the current [GKE workload identity guide](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/workload-identity) for the chosen direct-principal or impersonation approach.
+
+The following direct-principal example grants one service account access to one existing synthetic secret. It assumes an appropriately configured GKE workload identity pool and a Kubernetes service account named `paper-api` in `paper-school`. The base paper image does not read Secret Manager, so this is an identity exercise for an extended test workload, not a required permission for the original lab.
+
+```bash
+export PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" \
+  --format='value(projectNumber)')"
+export PRINCIPAL="principal://iam.googleapis.com/projects/$PROJECT_NUMBER/locations/global/workloadIdentityPools/$PROJECT_ID.svc.id.goog/subject/ns/paper-school/sa/paper-api"
+
+gcloud secrets add-iam-policy-binding paper-demo-secret \
+  --project="$PROJECT_ID" \
+  --member="$PRINCIPAL" \
+  --role=roles/secretmanager.secretAccessor
+```
+
+Create only a harmless demonstration secret beforehand, enable Secret Manager, and use a reviewed Google client library in a separate test Pod. Validate allowed access and denial to a different secret. Do not print the retrieved value into shared logs; report only the outcome. Understand the cluster's metadata access and policy requirements before adding a deny-all egress policy.
+
+### Cloud SQL connection reasoning
+
+The Cloud SQL Auth Proxy or supported connectors can simplify authenticated encrypted connections. They still require instance connectivity, IAM permissions, and database authorization. A proxy process failing to connect does not mean a SQL password is wrong; distinguish infrastructure authentication, network reachability, and database login. [Cloud SQL Auth Proxy](https://docs.cloud.google.com/sql/docs/postgres/connect-auth-proxy)
+
+Store a durable ledger in Cloud SQL only after implementing migrations and bounded pools. Estimate total possible connections as maximum Pods times pool size plus background and administrative clients. An autoscaling API can exhaust a database even when each Pod seems modest. Use graceful pool shutdown and retry only safe transactional operations.
+
+### CI delivery without broker credentials
+
+Separate build identity, deploy identity, and runtime identity. The build runs tests and creates an immutable image. The deployer updates a reviewed workload specification. The runtime reads only its scoped resources. Untrusted pull requests must not access client secrets or deploy to production. Use workload federation for CI where supported rather than long-lived downloaded keys.
+
+**Exercise:** Write a pipeline diagram showing where source, dependencies, test artifacts, image digest, approvals, and deployment identity enter. Add a failure before rollout and another after partial rollout. Explain the rollback behavior without assuming a database migration can always be undone.
+
+## Chapter 59 Infrastructure as code observability and cost control
+
+### Terraform as a reviewed plan
+
+This small example creates only a network and subnet in a disposable project. Install Terraform and a supported Google provider, authenticate through an approved method, then review the plan. It does not deploy the trading application.
+
+```hcl
+terraform {
+  required_providers {
+    google = {
+      source = "hashicorp/google"
+    }
+  }
+}
+
+variable "project_id" { type = string }
+
+provider "google" {
+  project = var.project_id
+  region  = "asia-south1"
+}
+
+resource "google_compute_network" "school" {
+  name                    = "paper-iac-network"
+  auto_create_subnetworks  = false
+}
+
+resource "google_compute_subnetwork" "school" {
+  name          = "paper-iac-subnet"
+  ip_cidr_range = "10.77.0.0/24"
+  region        = "asia-south1"
+  network       = google_compute_network.school.id
+}
+```
+
+After your first reviewed initialization, pin a compatible provider constraint and commit the dependency lock file. Protect state; do not commit local state files containing sensitive resource information. Configure an appropriate protected remote backend and locking before team use. Read the plan for replacements, not merely the number of changed resources.
+
+```bash
+terraform init
+terraform fmt -check
+terraform validate
+terraform plan -var="project_id=$PROJECT_ID" -out=paper.plan
+terraform show paper.plan
+terraform apply paper.plan
+```
+
+The apply command changes cloud resources. Run it only after confirming the learning project and reviewing the plan. At the end, review `terraform plan -destroy` before approving destruction of these named learning resources. Do not run a destroy from a production state directory.
+
+### Operations evidence
+
+Capture deployment version, Pod restarts, unknown orders, reconciliation lag, queue oldest age, active-position freshness, and user-visible request errors. Cluster CPU is not a trading correctness metric. Logs need account-safe correlation but should avoid raw secrets and uncontrolled high-cardinality labels.
+
+```text
+resource.type="k8s_container"
+resource.labels.namespace_name="paper-school"
+severity>=ERROR
+```
+
+This Cloud Logging filter is an exercise starting point. Plain stdout may not map to the severity you expect unless logging is structured appropriately. Search raw message text and inspect sample entries when a severity filter returns nothing.
+
+### Cost and cleanup checklist
+
+Inventory clusters, node/Pod resource billing, Cloud SQL instances, disks/PVC backing volumes, snapshots, external load balancers, NAT, public addresses, Artifact Registry storage, and logs. Set budget alerts, but remember they are not automatic hard caps. A PVC's reclaim policy affects whether backing storage remains. Verify deletion rather than assuming a removed namespace removed every cloud resource.
+
+**Exercise:** Produce a before/after resource inventory and a cost estimate with the date and regional assumptions. Explain why a small VM may remain the better production choice for one client even after you learn Kubernetes thoroughly.
+
+## Chapter 60 A full paper system capstone
+
+### Required architecture
+
+Build an authenticated API with external PostgreSQL, Redis queues, one account-scoped execution owner, a simulated market stream, reconciliation, and a browser dashboard. Package separate processes in containers. Deploy locally first and to a disposable cloud environment only after tests pass. No real broker token is needed.
+
+The deployment should make ownership explicit: API replicas may scale after session and state externalization; strategy evaluation may scale within provider-style quotas; market feeds are partitioned by account; execution is serialized or fenced per account under a documented protocol; reconciliation deduplicates evidence; notifications are independent.
+
+### Acceptance scenario
+
+1. Provision infrastructure and schema from reviewed definitions.
+2. Bootstrap one admin, verify email through a fake inbox, enroll TOTP, and sign in.
+3. Save two strategies with different exit alerts and zero retries on one.
+4. Deliver a duplicate signal and prove one intent is created.
+5. Simulate a partial fill and a lost update, then reconcile the missing evidence.
+6. Disconnect the dashboard while ticks and risk checks continue.
+7. Replace the feed owner and restore subscriptions without forgetting positions.
+8. Trigger one strategy's exit alert and preserve the other strategy's allocation.
+9. Kill a worker after uncertain submission and recover without duplicate quantity.
+10. Restore the ledger into an isolated environment and compare all accounting totals.
+
+### Evidence to deliver
+
+Include a context diagram, a deployment diagram, one transaction sequence diagram, an order state machine, a threat model, a test report, an incident report, a restore report, and a dated cost model. Show the exact software versions and which cloud steps you executed. Label unsupported assumptions instead of hiding them.
+
+### Original Kubernetes review questions
+
+Why can a Service exist without ready endpoints? Because its selectors may match nothing or its Pods may be unready. Why can a Pod be Pending? Scheduling, quota, resources, image/storage preparation, and policy can be involved; events narrow the cause. Why does a failed liveness probe differ from a failed readiness probe? One can cause restart; the other controls traffic eligibility. Why is a Secret not safe just because it is base64? Encoding is reversible and access policy still matters.
+
+Why does HPA not solve a single broker's fixed quota? More workers can exceed the same external budget. Why is a StatefulSet not a database backup? Stable identity and volumes do not preserve an independent recoverable history. Why must an execution worker handle SIGTERM carefully? Stopping the local process does not cancel an in-flight external side effect. Why is `kubectl apply` not an acceptance test? It confirms object submission, not end-to-end business correctness.
+
+### Certification boundary
+
+These labs build practical evidence relevant to Google Cloud engineering, architecture, operations, and security. They do not replace every objective in the current exam guide. Kubernetes-specific certifications have their own current task scope and exam environment; verify those official guides separately if you choose that path. Keep the goal concrete: explain, implement, test, deploy, break, recover, and defend your design.
 
 ## Appendix A Glossary
 
@@ -1487,3 +3069,422 @@ Use official documentation as a reference while building, not as a reason to pos
 For brokers, use the [DhanHQ API documentation](https://dhanhq.co/docs/v2/) and [Kite Connect API documentation](https://kite.trade/docs/connect/v3/), together with the exact installed SDK source. Do not assume SDK documentation with a different version number matches your pinned package.
 
 For cloud study, follow the current landing page and linked guide for your chosen certification. Product names and weights change. Keep a dated objective checklist and explicitly identify topics not exercised by the trading project. Official sample questions teach format; they do not guarantee your exam result.
+
+## Appendix C Complete paper lab source walkthrough
+
+These listings let you study a complete small vertical slice without switching files. They are the same paper-only reference used by the accompanying tests. They do not connect to a broker, authenticate public users, or provide production durability. Type your own implementation first, then compare contracts and tests.
+
+### The domain module
+
+Read this module first. It has no FastAPI, Redis, SQLite, or broker import. Its inputs are explicit, making money and risk behavior testable in isolation. `RiskState` records the previous protective state; `advance` returns a new state and an optional trigger. A trigger is only simulated as an immediate fill by the local API, not by a real broker adapter.
+
+```python
+from dataclasses import dataclass
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
+
+
+def positive(value: Decimal) -> Decimal:
+    if not value.is_finite() or value <= 0:
+        raise ValueError("Expected a finite positive number")
+    return value
+
+
+def strict_quantity(capital: Decimal, price: Decimal) -> int:
+    positive(price)
+    if not capital.is_finite() or capital < 0:
+        raise ValueError("Invalid capital")
+    return int(capital // price)
+
+
+def align_price(price: Decimal, tick: Decimal, side: str) -> Decimal:
+    positive(price)
+    positive(tick)
+    if side not in {"BUY", "SELL"}:
+        raise ValueError("Invalid side")
+    rounding = ROUND_CEILING if side == "BUY" else ROUND_FLOOR
+    result = (price / tick).to_integral_value(rounding=rounding) * tick
+    return positive(result)
+
+
+@dataclass(frozen=True)
+class RiskState:
+    side: str
+    entry: Decimal
+    target: Decimal
+    stop: Decimal
+    high_water: Decimal
+    low_water: Decimal
+    initial_stop_pct: Decimal
+    trailing_enabled: bool
+    trailing_pct: Decimal
+    cost_enabled: bool
+    cost_rr: Decimal
+
+
+def advance(state: RiskState, price: Decimal) -> tuple[RiskState, str | None]:
+    positive(price)
+    if state.side not in {"BUY", "SELL"}:
+        raise ValueError("Invalid side")
+    high = max(state.high_water, price)
+    low = min(state.low_water, price)
+    stop = state.stop
+    hundred = Decimal("100")
+    if state.side == "BUY":
+        if state.trailing_enabled:
+            stop = max(stop, high * (1 - state.trailing_pct / hundred))
+        if state.cost_enabled and high >= state.entry * (
+            1 + state.initial_stop_pct * state.cost_rr / hundred
+        ):
+            stop = max(stop, state.entry)
+        reason = "TARGET" if price >= state.target else "STOP" if price <= stop else None
+    else:
+        if state.trailing_enabled:
+            stop = min(stop, low * (1 + state.trailing_pct / hundred))
+        if state.cost_enabled and low <= state.entry * (
+            1 - state.initial_stop_pct * state.cost_rr / hundred
+        ):
+            stop = min(stop, state.entry)
+        reason = "TARGET" if price <= state.target else "STOP" if price >= stop else None
+    updated = RiskState(
+        state.side, state.entry, state.target, stop, high, low,
+        state.initial_stop_pct, state.trailing_enabled, state.trailing_pct,
+        state.cost_enabled, state.cost_rr,
+    )
+    return updated, reason
+
+
+def marked_pnl(side: str, entry: Decimal, price: Decimal, quantity: int) -> Decimal:
+    if side not in {"BUY", "SELL"}:
+        raise ValueError("Invalid side")
+    if quantity <= 0:
+        raise ValueError("Invalid quantity")
+    positive(entry)
+    positive(price)
+    return (price - entry) * quantity * (1 if side == "BUY" else -1)
+```
+
+### The API and SQLite transaction boundary
+
+Read model validation, then `transaction`, then each route. Every database connection is scoped and closed. `BEGIN IMMEDIATE` serializes the small SQLite teaching workload. It is not a scalable replacement for designing PostgreSQL transactions and queues. The unique open-position index and durable receipt table demonstrate two different invariants: one open allocation per strategy/symbol, and one effect per event identity.
+
+Configuration is copied into each new position, so later changes do not silently rewrite its entry-time rules. The input price is synthetic and caller-supplied only because this is a simulator. Never transfer that trust assumption to a live webhook.
+
+```python
+"""Paper-only API. Bind to loopback; authentication is a later assignment."""
+from contextlib import contextmanager
+from decimal import Decimal
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import sqlite3
+from typing import Literal
+import uuid
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from .domain import RiskState, advance, marked_pnl
+
+
+class Strategy(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(min_length=1, max_length=120)
+    side: Literal["BUY", "SELL"] = "BUY"
+    quantity: int = Field(default=1, strict=True, gt=0, le=10000)
+    target_pct: Decimal = Field(default=Decimal("2"), gt=0, lt=100, allow_inf_nan=False)
+    stop_pct: Decimal = Field(default=Decimal("1"), gt=0, lt=100, allow_inf_nan=False)
+    trailing_enabled: bool = False
+    trailing_pct: Decimal = Field(default=Decimal("1"), gt=0, lt=100, allow_inf_nan=False)
+    cost_enabled: bool = False
+    cost_rr: Decimal = Field(default=Decimal("2"), gt=0, le=100, allow_inf_nan=False)
+    retry_count: int = Field(default=0, strict=True, ge=0, le=3)
+
+    @field_validator("name")
+    @classmethod
+    def clean_name(cls, value):
+        value = " ".join(value.split())
+        if not value:
+            raise ValueError("Strategy name is required")
+        return value
+
+
+class Signal(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    event_id: str = Field(min_length=1, max_length=100)
+    strategy: str = Field(min_length=1, max_length=120)
+    symbol: str = Field(min_length=1, max_length=30)
+    price: Decimal = Field(gt=0, le=Decimal("10000000"), allow_inf_nan=False)
+
+    @field_validator("symbol")
+    @classmethod
+    def clean_symbol(cls, value):
+        value = value.strip().upper()
+        if not re.fullmatch(r"[A-Z0-9&.-]{1,30}", value):
+            raise ValueError("Invalid paper symbol")
+        return value
+
+
+class Tick(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    symbol: str = Field(min_length=1, max_length=30)
+    price: Decimal = Field(gt=0, le=Decimal("10000000"), allow_inf_nan=False)
+
+
+def canonical(name):
+    return " ".join(name.split()).casefold()
+
+
+def create_app(database: str | Path) -> FastAPI:
+    database = Path(database)
+    database.parent.mkdir(parents=True, exist_ok=True)
+
+    @contextmanager
+    def transaction():
+        connection = sqlite3.connect(database, timeout=5, isolation_level=None)
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            yield connection
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    with transaction() as db:
+        db.execute("CREATE TABLE IF NOT EXISTS configs (name TEXT PRIMARY KEY, payload TEXT NOT NULL)")
+        db.execute("CREATE TABLE IF NOT EXISTS receipts (event_id TEXT PRIMARY KEY, digest TEXT NOT NULL, position_id TEXT NOT NULL)")
+        db.execute("""CREATE TABLE IF NOT EXISTS positions (
+            id TEXT PRIMARY KEY, strategy TEXT NOT NULL, symbol TEXT NOT NULL,
+            status TEXT NOT NULL, payload TEXT NOT NULL)""")
+        db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS one_open_position
+            ON positions(strategy, symbol) WHERE status = 'OPEN'""")
+
+    app = FastAPI(title="Trading School Paper Lab")
+
+    @app.exception_handler(HTTPException)
+    async def http_error(request, exc):
+        return JSONResponse(status_code=exc.status_code, content={"ok": False, "detail": str(exc.detail)})
+
+    @app.get("/health")
+    def health():
+        return {"ok": True, "mode": "PAPER_ONLY"}
+
+    @app.get("/", response_class=HTMLResponse)
+    def home():
+        return Path(__file__).with_name("dashboard.html").read_text(encoding="utf-8")
+
+    @app.post("/api/configs")
+    def save_strategy(config: Strategy):
+        data = config.model_dump(mode="json")
+        with transaction() as db:
+            db.execute("""INSERT INTO configs(name, payload) VALUES (?, ?)
+                ON CONFLICT(name) DO UPDATE SET payload=excluded.payload""",
+                (canonical(config.name), json.dumps(data)))
+        return {"ok": True, "strategy": data}
+
+    @app.get("/api/configs")
+    def configs():
+        with transaction() as db:
+            rows = db.execute("SELECT payload FROM configs ORDER BY name").fetchall()
+        return {"ok": True, "strategies": [json.loads(row[0]) for row in rows]}
+
+    @app.post("/api/signals")
+    def signal(payload: Signal):
+        name = canonical(payload.strategy)
+        normalized = payload.model_dump(mode="json")
+        normalized["strategy"] = name
+        normalized["price"] = str(payload.price.normalize())
+        digest = hashlib.sha256(json.dumps(normalized, sort_keys=True).encode()).hexdigest()
+        with transaction() as db:
+            previous = db.execute("SELECT * FROM receipts WHERE event_id=?", (payload.event_id,)).fetchone()
+            if previous:
+                if previous["digest"] != digest:
+                    raise HTTPException(409, "EVENT_ID_CONFLICT")
+                return {"ok": True, "duplicate": True, "position_id": previous["position_id"]}
+            row = db.execute("SELECT payload FROM configs WHERE name=?", (name,)).fetchone()
+            if not row:
+                raise HTTPException(404, "CONFIG_NOT_FOUND")
+            config = Strategy.model_validate_json(row[0])
+            existing = db.execute("SELECT id FROM positions WHERE strategy=? AND symbol=? AND status='OPEN'",
+                                  (name, payload.symbol)).fetchone()
+            if existing:
+                raise HTTPException(409, "ALREADY_OPEN")
+            sign = Decimal("1") if config.side == "BUY" else Decimal("-1")
+            position_id = uuid.uuid4().hex
+            # The local simulator fills immediately at the supplied synthetic price.
+            # A real adapter must wait for independent broker fill evidence.
+            position = {
+                "id": position_id, "strategy": config.name, "symbol": payload.symbol,
+                "side": config.side, "quantity": config.quantity,
+                "entry": str(payload.price), "ltp": str(payload.price),
+                "target": str(payload.price * (1 + sign * config.target_pct / 100)),
+                "stop": str(payload.price * (1 - sign * config.stop_pct / 100)),
+                "high_water": str(payload.price), "low_water": str(payload.price),
+                "config": config.model_dump(mode="json"), "pnl": "0",
+                "status": "OPEN", "exit_reason": None,
+            }
+            db.execute("INSERT INTO positions VALUES (?, ?, ?, ?, ?)",
+                       (position_id, name, payload.symbol, "OPEN", json.dumps(position)))
+            db.execute("INSERT INTO receipts VALUES (?, ?, ?)", (payload.event_id, digest, position_id))
+        return {"ok": True, "duplicate": False, "position_id": position_id}
+
+    @app.post("/api/ticks")
+    def tick(payload: Tick):
+        changed = []
+        with transaction() as db:
+            rows = db.execute("SELECT payload FROM positions WHERE symbol=? AND status='OPEN'",
+                              (payload.symbol.strip().upper(),)).fetchall()
+            for row in rows:
+                position = json.loads(row[0])
+                config = Strategy.model_validate(position["config"])
+                state = RiskState(
+                    position["side"], Decimal(position["entry"]), Decimal(position["target"]),
+                    Decimal(position["stop"]), Decimal(position["high_water"]), Decimal(position["low_water"]),
+                    config.stop_pct, config.trailing_enabled, config.trailing_pct,
+                    config.cost_enabled, config.cost_rr,
+                )
+                updated, reason = advance(state, payload.price)
+                position.update(
+                    ltp=str(payload.price), stop=str(updated.stop),
+                    high_water=str(updated.high_water), low_water=str(updated.low_water),
+                    pnl=str(marked_pnl(state.side, state.entry, payload.price, position["quantity"])),
+                )
+                if reason:
+                    position.update(status="CLOSED", exit_reason=reason, exit_price=str(payload.price))
+                db.execute("UPDATE positions SET status=?, payload=? WHERE id=?",
+                           (position["status"], json.dumps(position), position["id"]))
+                changed.append(position)
+        return {"ok": True, "positions": changed}
+
+    @app.get("/api/positions")
+    def positions():
+        with transaction() as db:
+            rows = db.execute("SELECT payload FROM positions ORDER BY rowid").fetchall()
+        return {"ok": True, "positions": [json.loads(row[0]) for row in rows]}
+
+    return app
+
+
+def default_app():
+    return create_app(os.environ.get("PAPERLAB_DB", "paperlab.sqlite3"))
+```
+
+### The browser integration test
+
+This test launches its own loopback server against a temporary database, interacts with the real form, sends synthetic events through the API, and observes the resulting table. Notice cleanup in `finally`, readiness waiting with a deadline, no broker secret, and separate mobile/desktop runs. The final test deliberately returns HTML where the browser expected JSON.
+
+```python
+"""Real browser against a disposable server and a synthetic paper broker."""
+import os
+from pathlib import Path
+import socket
+import subprocess
+import sys
+import time
+import uuid
+
+import httpx
+import pytest
+from playwright.sync_api import expect, sync_playwright
+
+
+@pytest.fixture(scope="module")
+def server(tmp_path_factory):
+    temp = tmp_path_factory.mktemp("paper-browser")
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    base = f"http://127.0.0.1:{port}"
+    env = {**os.environ, "PAPERLAB_DB": str(temp / "paper.sqlite3")}
+    root = Path(__file__).resolve().parents[1]
+    with (temp / "server.log").open("w", encoding="utf-8") as output:
+        process = subprocess.Popen([
+            sys.executable, "-m", "uvicorn", "paperlab.api:default_app", "--factory",
+            "--host", "127.0.0.1", "--port", str(port),
+        ], cwd=root, env=env, stdout=output, stderr=subprocess.STDOUT)
+        try:
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    raise RuntimeError("Paper test server exited; inspect its temporary log")
+                try:
+                    if httpx.get(base + "/health", timeout=1).status_code == 200:
+                        break
+                except httpx.HTTPError:
+                    pass
+                time.sleep(0.1)
+            else:
+                raise RuntimeError("Paper test server did not become ready")
+            yield base
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+
+
+@pytest.mark.parametrize("viewport", [{"width": 1440, "height": 1000}, {"width": 390, "height": 844}])
+def test_form_to_backend_to_closed_position(server, viewport):
+    with sync_playwright() as playwright:
+        try:
+            browser = playwright.chromium.launch(channel="chrome", headless=True)
+        except Exception:
+            browser = playwright.chromium.launch(headless=True)
+        context = browser.new_context(viewport=viewport)
+        page = context.new_page()
+        errors = []
+        page.on("pageerror", lambda error: errors.append(str(error)))
+        try:
+            page.goto(server)
+            name = "Browser " + uuid.uuid4().hex[:8]
+            symbol = "DEMO" + str(viewport["width"])
+            page.get_by_label("Strategy name", exact=True).fill(name)
+            page.get_by_role("button", name="Save strategy", exact=True).click()
+            expect(page.get_by_role("status")).to_have_text("Saved " + name)
+            with httpx.Client(base_url=server) as client:
+                configs = client.get("/api/configs").json()["strategies"]
+                assert next(item for item in configs if item["name"] == name)["retry_count"] == 0
+                response = client.post("/api/signals", json={
+                    "event_id": uuid.uuid4().hex, "strategy": name, "symbol": symbol, "price": "100",
+                })
+                assert response.status_code == 200
+                page.get_by_role("button", name="Refresh positions").click()
+                row = page.get_by_role("row").filter(has=page.get_by_role("cell", name=symbol, exact=True))
+                expect(row).to_contain_text("OPEN")
+                assert client.post("/api/ticks", json={"symbol": symbol, "price": "103"}).status_code == 200
+                page.get_by_role("button", name="Refresh positions").click()
+                expect(row).to_contain_text("CLOSED")
+                expect(row).to_contain_text("TARGET")
+            assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+            assert not errors
+        finally:
+            context.close()
+            browser.close()
+
+
+def test_html_gateway_failure_is_readable(server):
+    with sync_playwright() as playwright:
+        try:
+            browser = playwright.chromium.launch(channel="chrome", headless=True)
+        except Exception:
+            browser = playwright.chromium.launch(headless=True)
+        page = browser.new_page()
+        try:
+            page.route("**/api/positions", lambda route: route.fulfill(
+                status=502, content_type="text/html", body="<h1>Bad Gateway</h1>"))
+            page.goto(server)
+            expect(page.get_by_role("status")).to_have_text("Unexpected server response (502)")
+        finally:
+            browser.close()
+```
+
+### Exercises after reading the listings
+
+Add strategy enabled/disabled without changing existing persisted positions. Add an API test and browser test for it. Then separate acceptance from simulated fill so `/api/signals` no longer immediately creates a position. Introduce a paper-order ledger and an explicit synthetic execution endpoint. Deliver duplicate fill events and verify quantity is unchanged. Finally replace SQLite with a repository interface and implement PostgreSQL without changing your pure domain rules.

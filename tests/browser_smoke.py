@@ -46,10 +46,41 @@ def main():
                     page = context.new_page()
                     errors = []
                     page.on("pageerror", lambda error: errors.append(str(error)))
-                    page.goto(f"http://127.0.0.1:{port}/dashboard", wait_until="networkidle")
+                    loaded = page.goto(f"http://127.0.0.1:{port}/dashboard", wait_until="networkidle")
+                    assert loaded.status == 200, (loaded.status, page.url)
+                    assert page.evaluate("typeof formatPrice") == "function", (page.url, errors, page.title(), page.locator('body').inner_text()[:200])
+                    assert page.evaluate("formatPrice(427.5 * 1.01)") == "431.78"
+                    assert page.evaluate("alertPosition({alert_name:'second'}, {status:'ENTERED'}, {alert_name:'first'})") is None
+                    assert page.evaluate("alertPosition({alert_name:'first'}, {status:'ENTERED',trade_id:'old'}, {alert_name:'first',trade_id:'new'})") is None
                     if width < 640:
                         page.locator("#topbarMoreBtn").click()
                     page.locator('button[onclick="openCfg()"]').click()
+                    webhook_route = "**/api/webhook-url?*"
+                    page.route(webhook_route, lambda route: route.fulfill(json={
+                        "ok": True, "url": "http://192.0.2.10/webhook/chartink?user_id=1&secret=test-secret",
+                        "base_url_source": "PUBLIC_BASE_URL", "secret_required": True,
+                    }))
+                    page.evaluate("openCfg()")
+                    expect(page.locator("#webhook_url_status")).to_contain_text("Verify PUBLIC_BASE_URL")
+                    expect(page.locator("#webhook_url_status")).to_contain_text("http://192.0.2.10")
+                    assert "test-secret" not in page.locator("#webhook_url_status").inner_text()
+                    page.screenshot(path=str(artifacts / f"webhook-mismatch-{width}.png"))
+                    page.unroute(webhook_route)
+                    page.route(webhook_route, lambda route: route.fulfill(
+                        status=502, content_type="text/html", body="<h1>Bad Gateway</h1>"))
+                    page.evaluate("openCfg()")
+                    expect(page.locator("#webhook_copy")).to_be_disabled()
+                    expect(page.locator("#webhook_url")).to_have_value("")
+                    expect(page.locator("#webhook_url_status")).to_contain_text("Could not load")
+                    page.unroute(webhook_route)
+                    page.route(webhook_route, lambda route: route.fulfill(json={
+                        "ok": True, "url": f"http://127.0.0.1:{port}/webhook/chartink?user_id=1&secret=test-secret",
+                        "base_url_source": "REQUEST", "secret_required": True,
+                    }))
+                    page.evaluate("openCfg()")
+                    expect(page.locator("#webhook_copy")).to_be_enabled()
+                    expect(page.locator("#webhook_url_status")).to_be_hidden()
+                    page.unroute(webhook_route)
                     page.locator("#cfg_alert").fill(f"Browser Smoke {width}")
                     page.locator("#cfg_prod").select_option("CNC")
                     page.locator("#cfg_qtymode").select_option("QTY")
@@ -100,7 +131,9 @@ def main():
                     assert config["high_break_ttl_minutes"] == 2, config
                     assert config["telegram_enabled"] and config["telegram_token_set"], config
                     assert "telegram_bot_token_encrypted" not in config and "telegram_bot_token" not in config, config
-                    page.reload(wait_until="networkidle")
+                    reloaded = page.reload(wait_until="networkidle")
+                    assert reloaded.status == 200, (reloaded.status, page.url)
+                    assert page.evaluate("typeof openCfg") == "function", (page.url, errors, page.title())
                     page.evaluate("openCfg()")
                     page.evaluate("name => fillCfg(name)", config_key)
                     assert page.locator("#cfg_tsl_on").input_value() == "false"
@@ -152,7 +185,13 @@ def main():
                         await application.store.upsert_position(1, "SBIN", position)
                         await application.store.save_alert(1, {
                             "alert_name": position["alert_name"], "time": datetime.now(timezone.utc).isoformat(),
-                            "result": [{"symbol": "SBIN", "status": "ENTERED", "side": "BUY", "reason": "ORDER_EXECUTED"}],
+                            "result": [
+                                {"symbol": "SBIN", "status": "ENTERED", "side": "BUY", "reason": "ORDER_EXECUTED"},
+                                {"symbol": "SBIN", "status": "SKIPPED", "reason": "HIGH_BREAK_CANDLE_NOT_READY"},
+                                {"symbol": "SBIN", "status": "ERROR", "reason": "ORDER_REJECTED_INSUFFICIENT_FUNDS"},
+                                {"symbol": "SBIN", "side": "BUY", "status": "WAITING_FOR_BREAKOUT",
+                                 "reason": "WAITING_FOR_CANDLE", "break_level": None, "breakout_expires_at": time.time() + 60},
+                            ],
                         })
 
                     asyncio.run_coroutine_threadsafe(seed_position(), application.APP_LOOP).result(5)
@@ -166,8 +205,25 @@ def main():
                     }), application.APP_LOOP).result(5)
                     expect(ltp).to_have_text("101.50")
                     expect(pnl).to_have_text("3.00")
+                    strategy_rows = page.locator('#alertsBody tr').filter(has_text=f'Browser Smoke {width}')
+                    skipped = strategy_rows.filter(has_text='HIGH_BREAK_CANDLE_NOT_READY')
+                    expect(skipped.locator('[data-label="Status"]')).to_contain_text('SKIPPED')
+                    expect(skipped.locator('[data-label="P&L"]')).to_have_text('--')
+                    expect(skipped.locator('[data-label="TSL"]')).to_have_text('--')
+                    expect(skipped.locator('button')).to_have_count(0)
+                    rejected = strategy_rows.filter(has_text='ORDER_REJECTED_INSUFFICIENT_FUNDS')
+                    expect(rejected.locator('[data-label="Status"]')).to_contain_text('ERROR')
+                    expect(rejected.locator('[data-label="Qty"]')).to_have_text('--')
+                    pending_candle = strategy_rows.filter(has_text='WAITING FOR CANDLE')
+                    expect(pending_candle).to_have_count(1)
+                    expect(pending_candle.locator('[data-label="P&L"]')).to_have_text('--')
                     expect(page.locator(".atsl-SBIN").first).to_have_text("99.00")
                     assert page.evaluate("POS_SNAPSHOT.SBIN.ltp") == 101.5
+                    # Clearing alert history must not remove access to an open position.
+                    page.evaluate("window.savedSmokeAlerts = [...ALERTS]; ALERTS.length = 0; renderAlerts()")
+                    expect(page.locator('#alertsBody')).to_contain_text('OPEN_POSITION')
+                    expect(page.locator('#alertsBody button[data-squareoff="SBIN"]')).to_have_count(1)
+                    page.evaluate("ALERTS.push(...window.savedSmokeAlerts); renderAlerts()")
                     page.evaluate("window.scrollTo(0, 0)")
                     layout = page.evaluate("""() => {
                         const nav = document.querySelector('nav').getBoundingClientRect();

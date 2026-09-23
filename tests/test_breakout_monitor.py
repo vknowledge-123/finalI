@@ -71,6 +71,80 @@ class BreakoutMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["reason"], "BREAKOUT_TTL_EXPIRED")
         self.engine._place_order_with_execution.assert_not_awaited()
 
+    async def test_delayed_candle_retries_original_bar_without_extending_ttl(self):
+        candles = self.engine._fetch_historical_candles.return_value
+        self.engine._fetch_historical_candles.return_value = []
+        watch = await self.watch()
+        self.assertIsNone(watch["level"])
+        row = (await self.store.get_recent_alerts(1))[0]["result"][0]
+        self.assertEqual(row["reason"], "WAITING_FOR_CANDLE")
+        await self.monitor.poll_once()
+        self.assertEqual(self.engine._fetch_historical_candles.await_count, 1)
+        # A later forming/new candle must not replace the alert's reference bar.
+        self.engine._fetch_historical_candles.return_value = candles + [{
+            "date": self.at.replace(second=0), "high": 999, "low": 1,
+        }]
+        await self.store.save_breakout_watch(dict(watch, candle_retry_at=0))
+        await self.monitor.poll_once()
+        fresh = await self.store.get_breakout_watch(watch["id"])
+        self.assertEqual(fresh["level"], "100.1")
+        self.assertEqual(fresh["expires_at"], watch["expires_at"])
+        self.assertEqual(fresh["alert_time"], watch["alert_time"])
+        row = (await self.store.get_recent_alerts(1))[0]["result"][0]
+        self.assertEqual(row["reason"], "WAITING_FOR_BREAKOUT")
+        self.assertEqual(row["break_level"], 100.1)
+        self.engine._place_order_with_execution.assert_not_awaited()
+        await self.cross()
+        await self.monitor.poll_once()
+        self.engine._place_order_with_execution.assert_awaited_once()
+
+    async def test_pending_candle_expiry_and_config_change_never_place(self):
+        self.engine._fetch_historical_candles.return_value = []
+        watch = await self.watch()
+        await self.store.save_breakout_watch(dict(watch, expires_at=time.time() - 1, candle_retry_at=0))
+        await self.monitor.poll_once()
+        self.assertEqual((await self.store.get_breakout_watch(watch["id"]))["result"]["reason"], "BREAKOUT_TTL_EXPIRED")
+        self.engine._place_order_with_execution.assert_not_awaited()
+        self.assertEqual(self.engine._fetch_historical_candles.await_count, 1)
+        watch = await self.watch()
+        await self.store.save_alert_config(1, dict(self.cfg, qty=5))
+        await self.monitor.poll_once()
+        self.assertEqual((await self.store.get_breakout_watch(watch["id"]))["result"]["reason"], "BREAKOUT_CONFIG_CHANGED")
+        self.engine._place_order_with_execution.assert_not_awaited()
+
+    async def test_pending_candle_restart_and_duplicate_preserve_watch(self):
+        self.engine._fetch_historical_candles.return_value = []
+        watch = await self.watch(monitor_owner="execution")
+        duplicate = await self.watch(monitor_owner="execution")
+        self.assertEqual(watch, duplicate)
+        subscribe = AsyncMock()
+        monitor = BreakoutMonitor(lambda: self.store, AsyncMock(return_value=self.engine),
+                                  owner="execution", subscribe_symbols=subscribe)
+        await monitor.recover()
+        subscribe.assert_awaited_once_with(1, ["SBIN"])
+        self.engine._fetch_historical_candles.side_effect = RuntimeError("simulated data outage")
+        await self.store.save_breakout_watch(dict(watch, candle_retry_at=0))
+        await monitor.poll_once()
+        fresh = await self.store.get_breakout_watch(watch["id"])
+        self.assertEqual(fresh["phase"], "WAITING")
+        self.assertEqual(fresh["candle_reason"], "HIGH_BREAK_DATA_UNAVAILABLE")
+        self.assertEqual(fresh["expires_at"], watch["expires_at"])
+        self.engine._place_order_with_execution.assert_not_awaited()
+
+    async def test_missing_candle_for_one_symbol_does_not_skip_other_candidates(self):
+        self.engine._fetch_historical_candles.side_effect = [[], self.engine._fetch_historical_candles.return_value]
+        results = await self.engine.on_chartink_alert("ttl test", ["SBIN", "TCS"], self.at.isoformat())
+        self.assertEqual([r["reason"] for r in results], ["WAITING_FOR_CANDLE", "WAITING_FOR_BREAKOUT"])
+        self.assertEqual(len(await self.store.list_breakout_watches()), 2)
+        self.engine._place_order_with_execution.assert_not_awaited()
+
+    async def test_bad_candle_is_terminal_not_an_entry(self):
+        self.engine._fetch_historical_candles.return_value[0]["low"] = 110
+        results = await self.engine.on_chartink_alert("ttl test", ["SBIN"], self.at.isoformat())
+        self.assertEqual(results[0]["reason"], "HIGH_BREAK_CANDLE_INVALID")
+        self.assertEqual((await self.store.get_breakout_watch(results[0]["breakout_watch_id"]))["phase"], "DONE")
+        self.engine._place_order_with_execution.assert_not_awaited()
+
     async def test_short_strict_cross_below_low_minus_buffer(self):
         self.cfg["direction"] = "SHORT"
         await self.store.save_alert_config(1, self.cfg)

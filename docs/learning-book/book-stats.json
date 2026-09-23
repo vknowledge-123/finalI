@@ -1,7 +1,8 @@
 {
-  "chapters": 46,
-  "source_files": 8,
-  "prose_words_approx": 18486,
-  "python_examples_syntax_checked": 17,
-  "code_blocks": 31
+  "chapters": 60,
+  "source_files": 9,
+  "prose_words_approx": 28372,
+  "python_examples_syntax_checked": 43,
+  "worked_chapter_expansions": 46,
+  "code_blocks": 107
 }

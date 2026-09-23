@@ -1476,8 +1476,9 @@
             <label class="block text-xs font-semibold text-cyan-400 uppercase mb-1.5">Chartink Webhook URL</label>
             <div class="flex gap-2">
               <input id="webhook_url" class="input-field font-mono text-[11px]" readonly>
-              <button type="button" onclick="copyWebhookUrl()" class="btn btn-secondary px-3 text-xs">Copy</button>
+              <button id="webhook_copy" type="button" onclick="copyWebhookUrl()" class="btn btn-secondary px-3 text-xs" disabled>Copy</button>
             </div>
+            <p id="webhook_url_status" role="status" class="text-xs text-amber-300 mt-1 break-words hidden"></p>
           </div>
           <div class="col-span-2 md:col-span-1">
             <label class="block text-xs font-semibold text-cyan-400 uppercase mb-1.5">Alert Name</label>
@@ -2246,19 +2247,38 @@
     async function openCfg() {
       document.getElementById("cfgModal").classList.remove("hidden");
 
-      // Populate Webhook URL
-      const proto = location.protocol;
-      const host = location.host;
-      let url = `${proto}//${host}/webhook/chartink?user_id=${USER_ID}`;
       const el = document.getElementById("webhook_url");
+      const copyButton = document.getElementById("webhook_copy");
+      const status = document.getElementById("webhook_url_status");
+      // Only offer the server-generated URL: a local fallback may omit the secret.
+      el.value = "";
+      el.placeholder = "Loading webhook URL...";
+      copyButton.disabled = true;
+      status.textContent = "";
+      status.classList.add("hidden");
       try {
-        const resp = await fetch(`/api/webhook-url?user_id=${USER_ID}`);
+        const resp = await fetch(`/api/webhook-url?user_id=${USER_ID}`, { cache: "no-store" });
         const d = await readJsonResponse(resp);
-        if (d && d.url) url = d.url;
+        if (!d || d.ok !== true || !d.url) throw new Error("WEBHOOK_URL_UNAVAILABLE");
+        const destination = new URL(d.url);
+        if (!["http:", "https:"].includes(destination.protocol) || destination.username || destination.password) {
+          throw new Error("WEBHOOK_URL_INVALID");
+        }
+        if (d.secret_required && !destination.searchParams.get("secret")) {
+          throw new Error("WEBHOOK_SECRET_MISSING");
+        }
+        el.value = d.url;
+        copyButton.disabled = false;
+        if (destination.origin !== location.origin) {
+          const setting = d.base_url_source === "PUBLIC_BASE_URL" ? "PUBLIC_BASE_URL" : "server/proxy settings";
+          status.textContent = `Webhook destination ${destination.origin} differs from this dashboard (${location.origin}). Verify ${setting} on this VM before using it in Chartink.`;
+          status.classList.remove("hidden");
+        }
       } catch (e) {
-        console.error("Failed to load webhook URL", e);
+        el.placeholder = "Webhook URL unavailable";
+        status.textContent = "Could not load the webhook URL. Check PUBLIC_BASE_URL and your admin session, then reopen Configure Alert.";
+        status.classList.remove("hidden");
       }
-      if (el) el.value = url;
 
       loadCfgList();
       loadPnlExitCfg();
@@ -3539,6 +3559,24 @@
       return (symbol || '').replace(/[^a-zA-Z0-9]/g, '_');
     }
 
+    const priceFormatter = new Intl.NumberFormat('en-US', {
+      useGrouping: false, minimumFractionDigits: 2, maximumFractionDigits: 2
+    });
+    function formatPrice(value) {
+      return Number.isFinite(Number(value)) ? priceFormatter.format(Number(value)) : '--';
+    }
+
+    function alertPosition(alert, result, position) {
+      if (!position) return null;
+      if (!['ENTERED', 'PENDING_ENTRY', 'PENDING ENTRY'].includes(result.status) && result.reason !== 'ALREADY_OPEN') return null;
+      const key = value => String(value || '').replace(/[\u200B-\u200D\uFEFF]/g, '')
+        .toLowerCase().replace(/[_-]/g, ' ').replace(/\s+/g, ' ').trim();
+      if (key(alert.alert_name) !== key(position.alert_name)) return null;
+      if (result.trade_id && result.trade_id !== position.trade_id) return null;
+      if (result.order_id && position.entry_order_id && String(result.order_id) !== String(position.entry_order_id)) return null;
+      return position;
+    }
+
     function renderAlerts() {
       const tbody = document.getElementById('alertsBody');
       const countEl = document.getElementById('alertCount');
@@ -3553,14 +3591,27 @@
         countEl.textContent = `${count} Alert${count !== 1 ? 's' : ''}`;
       }
 
-      if (ALERTS.length === 0) {
+      const displayAlerts = ALERTS.slice(0, 100);
+      Object.values({ ...POS_SNAPSHOT, ...POS_MAP }).forEach(position => {
+        if (!['PENDING_ENTRY', 'OPEN', 'EXITING', 'EXIT_CONDITIONS_MET', 'ERROR'].includes(position.status)) return;
+        const represented = displayAlerts.some(alert => (alert.result || []).some(result =>
+          (result.execution_symbol || result.symbol) === position.symbol && alertPosition(alert, result, position)));
+        if (!represented) {
+          displayAlerts.unshift({
+            alert_name: position.alert_name, time: position.alert_time || Number(position.created_ts || 0) * 1000,
+            result: [{symbol: position.symbol, status: 'ENTERED', side: position.side,
+              trade_id: position.trade_id, order_id: position.entry_order_id, reason: 'OPEN_POSITION'}]
+          });
+        }
+      });
+      if (displayAlerts.length === 0) {
         tbody.innerHTML = `<tr><td colspan="14" class="text-center py-12 text-slate-500 italic">Waiting for incoming signals...</td></tr>`;
         return;
       }
 
       tbody.innerHTML = `
-        ${ALERTS.slice(0, 100).map(a => {
-        const timeStr = new Date(a.time).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        ${displayAlerts.map(a => {
+        const timeStr = a.time ? new Date(a.time).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '--';
         const timeClass = "text-slate-500";
         const symbolClass = "font-bold text-slate-200";
 
@@ -3575,14 +3626,16 @@
           // Check for live position updates
           const sym = (r.symbol || '').trim();
           const symLabel = sym || '--';
-          const livePos = POS_MAP[sym] || POS_SNAPSHOT[sym];
+          const livePos = alertPosition(a, r, POS_MAP[r.execution_symbol || sym] || POS_SNAPSHOT[r.execution_symbol || sym]);
           let statusLabel = r.status;
           let statusReason = r.reason;
           let sideLabel = r.side; // keep original side
           if (statusLabel === 'WAITING_FOR_BREAKOUT') {
-            statusLabel = 'WAITING FOR BREAKOUT';
+            statusLabel = r.break_level == null ? 'WAITING FOR CANDLE' : 'WAITING FOR BREAKOUT';
             const until = new Date(Number(r.breakout_expires_at) * 1000).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false });
-            statusReason = `${sideLabel === 'SELL' ? 'Below' : 'Above'} ${Number(r.break_level).toFixed(2)} | until ${until}`;
+            statusReason = r.break_level == null
+              ? `${r.candle_reason || 'Candle data pending'} | until ${until}`
+              : `${sideLabel === 'SELL' ? 'Below' : 'Above'} ${formatPrice(r.break_level)} | until ${until}`;
           }
 
           // Override if live position has interesting status
@@ -3619,6 +3672,7 @@
               case 'ENTERED': return 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20';
               case 'PENDING ENTRY': return 'bg-amber-500/10 text-amber-300 border border-amber-500/30 animate-pulse';
               case 'WAITING FOR BREAKOUT': return 'bg-cyan-500/10 text-cyan-300 border border-cyan-500/30';
+              case 'WAITING FOR CANDLE': return 'bg-cyan-500/10 text-cyan-300 border border-cyan-500/30';
               case 'SKIPPED': return 'bg-yellow-500/10 text-yellow-400 border border-yellow-500/20';
               case 'ERROR': return 'bg-rose-500/10 text-rose-400 border border-rose-500/20';
               case 'CONDITIONS MET': return 'bg-gradient-to-r from-orange-500/20 to-amber-500/20 text-orange-200 border border-orange-500/40 shadow-[0_0_10px_rgba(251,146,60,0.3)] animate-pulse';
@@ -3637,11 +3691,7 @@
                 : 'hover:bg-white/[0.04]';
 
           // Position fields (filled when livePos exists)
-          const snapshot = POS_SNAPSHOT[sym] || null;
-          const p = livePos || snapshot || null;
-          if (livePos) {
-            POS_SNAPSHOT[sym] = { ...livePos };
-          }
+          const p = livePos;
           const qty = p
             ? (Number(p.initial_qty || 0) > Number(p.qty || 0)
               ? `${p.qty}/${p.initial_qty}`
@@ -3650,9 +3700,9 @@
           const pyramidInfo = p && p.pyramid_enabled
             ? `Adds ${Number(p.pyramid_add_count || 0)}/${Number(p.pyramid_max_adds || 0)} @ ${Number(p.pyramid_step_pct || 0).toFixed(2)}%`
             : '';
-          const entry = p ? Number(p.entry_price || 0).toFixed(2) : null;
-          const tgt = p ? Number(p.target_price || 0).toFixed(2) : null;
-          const sl = p ? Number(p.sl_price || 0).toFixed(2) : null;
+          const entry = p ? formatPrice(p.entry_price || 0) : null;
+          const tgt = p ? formatPrice(p.target_price || 0) : null;
+          const sl = p ? formatPrice(p.sl_price || 0) : null;
           const pnlNum = p ? Number(p.pnl || 0) : null;
           const pnl = p ? pnlNum.toFixed(2) : null;
           const prod = p ? (p.product || 'MIS') : null;
@@ -3693,7 +3743,7 @@
                 tslPrice = anchor * (1.0 + tslPct / 100.0);
               }
             }
-            if (tslPrice > 0) tslVal = tslPrice.toFixed(2);
+            if (tslPrice > 0) tslVal = formatPrice(tslPrice);
           }
 
           return `
@@ -3722,8 +3772,8 @@
               <td data-label="Entry" class="px-3 py-3 text-right ${p ? 'text-slate-200' : 'text-slate-300'}">${entry ?? '--'}</td>
               <td data-label="Target" class="px-3 py-3 text-right ${p ? 'text-emerald-400 font-bold' : 'text-slate-600'}">${tgt ?? '--'}</td>
               <td data-label="SL" class="px-3 py-3 text-right ${p ? 'text-rose-400 font-bold' : 'text-slate-600'}">${sl ?? '--'}</td>
-              <td data-label="TSL" class="px-3 py-3 text-right ${p ? 'text-amber-400 font-bold' : 'text-slate-600'} atsl-${safeId(sym)}">${tslVal ?? '--'}</td>
-              <td data-label="P&L" class="px-3 py-3 text-right ${p ? pnlClass : 'text-slate-600'}" data-symbol="${escapeHtml(sym)}" data-field="pnl">${pnl ?? '--'}</td>
+              <td data-label="TSL" class="px-3 py-3 text-right ${p ? `text-amber-400 font-bold atsl-${safeId(p.symbol)}` : 'text-slate-600'}">${tslVal ?? '--'}</td>
+              <td data-label="P&L" class="px-3 py-3 text-right ${p ? pnlClass : 'text-slate-600'}" data-symbol="${p ? escapeHtml(p.symbol) : ''}" data-field="pnl">${pnl ?? '--'}</td>
               <td data-label="Status" class="px-3 py-3 text-center">
                 <div class="flex flex-col items-center gap-1">
                   <span class="px-2.5 py-1 rounded-full ${statusLabel === 'LIVE' ? 'text-[10px]' : 'text-[8px]'} font-black tracking-widest ${getStatusClass(statusLabel)}">
@@ -3988,7 +4038,7 @@
                 : (tslEnabled ? Number(p.trail_price || 0) : 0);
 
               if (tslPrice > 0) {
-                const tslVal = tslPrice.toFixed(2);
+                const tslVal = formatPrice(tslPrice);
                 document.querySelectorAll(`.atsl-${sid}`).forEach(el => el.innerText = tslVal);
               } else if (!tslEnabled) {
                 document.querySelectorAll(`.atsl-${sid}`).forEach(el => el.innerText = '--');

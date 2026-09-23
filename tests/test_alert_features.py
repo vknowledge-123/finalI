@@ -153,14 +153,16 @@ class CandleBreakoutTests(unittest.IsolatedAsyncioTestCase):
                     engine._fetch_historical_candles.assert_not_awaited()
                 await engine.close()
 
-    async def test_candle_fetch_failure_skips_order(self):
+    async def test_candle_fetch_failure_waits_without_order(self):
         store = store_with_cipher()
         await store.save_alert_config(1, config(store, high_break_enabled=True))
         engine = TradeEngine(1, store)
         engine._fetch_historical_candles = AsyncMock(side_effect=RuntimeError("broker unavailable"))
         engine._place_order_with_execution = AsyncMock()
         result = await engine.on_chartink_alert("feature test", ["SBIN"], NOW.isoformat())
-        self.assertEqual(result[0]["reason"], "HIGH_BREAK_DATA_UNAVAILABLE")
+        self.assertEqual(result[0]["reason"], "WAITING_FOR_CANDLE")
+        self.assertEqual(result[0]["candle_reason"], "HIGH_BREAK_DATA_UNAVAILABLE")
+        self.assertIsNone(result[0]["break_level"])
         engine._place_order_with_execution.assert_not_awaited()
         await engine.close()
 

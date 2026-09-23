@@ -12,8 +12,10 @@ def config_signature(config):
 
 def waiting_result(watch):
     return {"symbol": watch["symbol"], "side": watch["side"], "status": "WAITING_FOR_BREAKOUT",
-            "reason": "WAITING_FOR_BREAKOUT", "breakout_watch_id": watch["id"],
-            "break_level": float(watch["level"]), "breakout_expires_at": watch["expires_at"]}
+            "reason": "WAITING_FOR_CANDLE" if watch.get("level") is None else "WAITING_FOR_BREAKOUT",
+            "candle_reason": watch.get("candle_reason", ""), "breakout_watch_id": watch["id"],
+            "break_level": float(watch["level"]) if watch.get("level") is not None else None,
+            "breakout_expires_at": watch["expires_at"]}
 
 
 def project_alerts(alerts, watches, user_id):
@@ -33,6 +35,8 @@ def project_alerts(alerts, watches, user_id):
                         item.update(status="PENDING ENTRY", reason="BREAKOUT_ORDER_SUBMITTING")
                     elif time.time() >= watch["expires_at"]:
                         item.update(status="SKIPPED", reason="BREAKOUT_TTL_EXPIRED")
+                    else:
+                        item.update(waiting_result(watch))
                 results.append(item)
             row["result"] = results
         projected.append(row)

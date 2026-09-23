@@ -73,17 +73,21 @@ class BreakoutMonitor:
         if reason:
             await self.finish(record, {"symbol": symbol, "status": "SKIPPED", "reason": reason})
             return
-        tick = await store.load_latest_tick(uid, symbol)
-        try:
-            price = float(tick.get("ltp") or 0)
-            age = float(tick.get("age_sec", 999999))
-            if not math.isfinite(price) or price <= 0 or not 0 <= age <= 5:
+        if record.get("level") is None:
+            if time.time() < record.get("candle_retry_at", 0):
                 return
-            level = Decimal(record["level"])
-            if not (Decimal(str(price)) > level if record["side"] == "BUY" else Decimal(str(price)) < level):
+        else:
+            tick = await store.load_latest_tick(uid, symbol)
+            try:
+                price = float(tick.get("ltp") or 0)
+                age = float(tick.get("age_sec", 999999))
+                if not math.isfinite(price) or price <= 0 or not 0 <= age <= 5:
+                    return
+                level = Decimal(record["level"])
+                if not (Decimal(str(price)) > level if record["side"] == "BUY" else Decimal(str(price)) < level):
+                    return
+            except (TypeError, ValueError):
                 return
-        except (TypeError, ValueError):
-            return
         engine = await self.ensure_engine(uid)
         results = await engine.on_chartink_alert(record["alert_name"], [symbol], ts=record["alert_time"],
                                                 breakout_watch_id=record["id"], monitor_owner=self.owner)

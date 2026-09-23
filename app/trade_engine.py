@@ -1044,6 +1044,8 @@ class TradeEngine:
 
         self.order_worker = OrderWorker()
         self.market_data_worker = MarketDataWorker(max_concurrency=4)
+        self._history_request_lock = asyncio.Lock()
+        self._history_next_request = 0.0
 
         # exit guards
         self._exit_inflight: Dict[str, bool] = {}
@@ -2221,6 +2223,16 @@ class TradeEngine:
             await asyncio.sleep(0.5)
         return 0.0
 
+    async def _submit_history(self, fn, **kwargs):
+        # Pace candle reads independently from quotes/exits. This is per engine;
+        # broker limits shared by other processes still require error handling.
+        async with self._history_request_lock:
+            delay = self._history_next_request - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self._history_next_request = time.monotonic() + 0.3
+        return await self.market_data_worker.submit(fn, **kwargs)
+
     async def _fetch_historical_candles(
         self,
         symbol: str,
@@ -2240,7 +2252,7 @@ class TradeEngine:
                 pass
             ist = pytz.timezone("Asia/Kolkata")
             now = datetime.now(ist)
-            start_day = now - timedelta(days=min(90, max(1, int(lookback_days))))
+            start_day = now - timedelta(days=min(90, max(0, int(lookback_days))))
             start = start_day.replace(hour=9, minute=15, second=0, microsecond=0)
             exchange_segment = getattr(self.dhan, "INDEX", "IDX_I") if DHAN_INSTRUMENTS.is_index_symbol(symbol) else self.dhan.NSE
             instrument_type = "INDEX" if DHAN_INSTRUMENTS.is_index_symbol(symbol) else "EQUITY"
@@ -2273,8 +2285,9 @@ class TradeEngine:
 
         ist = pytz.timezone("Asia/Kolkata")
         now = datetime.now(ist)
-        start = now - timedelta(days=max(7, int(lookback_days)))
-        rows = await self.market_data_worker.submit(
+        start = (now.replace(hour=9, minute=15, second=0, microsecond=0) if lookback_days == 0
+                 else now - timedelta(days=max(7, int(lookback_days))))
+        rows = await self._submit_history(
             self.kite.historical_data,
             instrument_token=int(token),
             from_date=start,
@@ -2440,7 +2453,7 @@ class TradeEngine:
             from_bound = max(start_ist, day_start)
             to_bound = min(end_ist, day_end)
             if from_bound <= to_bound:
-                response = await self.market_data_worker.submit(
+                response = await self._submit_history(
                     self.dhan.intraday_minute_data,
                     security_id=str(security_id),
                     exchange_segment=exchange_segment,
@@ -2852,11 +2865,11 @@ class TradeEngine:
                     results.append({"symbol": sym, "status": "SKIPPED", "reason": "ALREADY_OPEN"})
                     continue
 
-                break_level = Decimal(watch["level"]) if watch else None
+                break_level = Decimal(watch["level"]) if watch and watch.get("level") is not None else None
                 if watch and side != watch["side"]:
                     results.append({"symbol": sym, "status": "SKIPPED", "reason": "BREAKOUT_DIRECTION_CHANGED"})
                     continue
-                if not watch and feature_enabled(cfg_raw.get("high_break_enabled")):
+                if break_level is None and feature_enabled(cfg_raw.get("high_break_enabled")):
                     try:
                         minutes = int(cfg_raw.get("high_break_timeframe_minutes", 1))
                         if minutes not in (1, 5):
@@ -2867,19 +2880,45 @@ class TradeEngine:
                         buffer = float(cfg_raw.get("high_break_buffer", 0)) if feature_enabled(cfg_raw.get("high_break_buffer_enabled")) else 0.0
                         if not math.isfinite(buffer) or buffer < 0:
                             raise ValueError("HIGH_BREAK_SETTINGS_INVALID")
-                        candles = await self._fetch_historical_candles(sym, f"{minutes}minute", 1)
-                        break_level = breakout_level(candles, received_at, minutes, side, buffer)
+                    except Exception as exc:
+                        results.append({"symbol": sym, "status": "SKIPPED", "reason": "HIGH_BREAK_SETTINGS_INVALID"})
+                        continue
+                    if not watch:
+                        watch = {"id": uuid.uuid4().hex, "user_id": self.user_id, "alert_name": alert_key,
+                                 "symbol": sym, "side": side, "level": None,
+                                 "created_at": monitor_started_at, "expires_at": monitor_started_at + ttl * 60,
+                                 "alert_time": received_at.isoformat(), "owner": monitor_owner,
+                                 "phase": "WAITING", "config_signature": config_signature(cfg_raw)}
+                        await self.store.save_breakout_watch(watch)
+                    if time.time() >= watch["expires_at"]:
+                        results.append({"symbol": sym, "status": "SKIPPED", "reason": "BREAKOUT_TTL_EXPIRED"})
+                        continue
+                    if time.time() < watch.get("candle_retry_at", 0):
+                        results.append(waiting_result(watch))
+                        continue
+                    try:
+                        candles = await self._fetch_historical_candles(sym, f"{minutes}minute", 0)
+                        break_level = breakout_level(candles, alert_time(watch["alert_time"]), minutes, side, buffer)
                     except Exception as exc:
                         reason = str(exc) if isinstance(exc, ValueError) and str(exc).startswith("HIGH_BREAK_") else "HIGH_BREAK_DATA_UNAVAILABLE"
-                        log.warning("HIGH_BREAK_SKIP | user=%s symbol=%s reason=%s", self.user_id, sym, reason)
-                        results.append({"symbol": sym, "status": "SKIPPED", "reason": reason})
+                        log.warning("HIGH_BREAK_CANDLE_WAIT | user=%s symbol=%s reason=%s detail=%s",
+                                    self.user_id, sym, reason, _safe_error(exc))
+                        if reason == "HIGH_BREAK_CANDLE_INVALID":
+                            results.append({"symbol": sym, "status": "SKIPPED", "reason": reason})
+                            continue
+                        updated = dict(watch, candle_retry_at=time.time() + 5, candle_reason=reason)
+                        if await self.store.transition_breakout_watch(watch["id"], "WAITING", updated):
+                            watch = updated
+                        results.append(waiting_result(watch))
                         continue
-                    watch = {"id": uuid.uuid4().hex, "user_id": self.user_id, "alert_name": alert_key,
-                             "symbol": sym, "side": side, "level": str(break_level),
-                             "created_at": monitor_started_at, "expires_at": monitor_started_at + ttl * 60,
-                             "alert_time": str(ts or received_at.isoformat()), "owner": monitor_owner,
-                             "phase": "WAITING", "config_signature": config_signature(cfg_raw)}
-                    await self.store.save_breakout_watch(watch)
+                    updated = dict(watch, level=str(break_level), candle_reason="", candle_retry_at=0)
+                    if not await self.store.transition_breakout_watch(watch["id"], "WAITING", updated):
+                        results.append({"symbol": sym, "status": "SKIPPED", "reason": "BREAKOUT_WATCH_INACTIVE"})
+                        continue
+                    watch = updated
+                    if time.time() >= watch["expires_at"]:
+                        results.append({"symbol": sym, "status": "SKIPPED", "reason": "BREAKOUT_TTL_EXPIRED"})
+                        continue
 
                 feed_ok, feed_reason, live_ltp = await self._wait_for_entry_feed_ready(sym)
                 if not feed_ok:
@@ -3115,6 +3154,7 @@ class TradeEngine:
                         "side": side,
                         "qty": executed_qty,
                         "order_id": str(oid),
+                        "trade_id": pos.trade_id,
                         "order_status": str(execution.status or "COMPLETE"),
                         "order_retries": max(0, int(execution.attempts) - 1),
                         "ltp": entry,

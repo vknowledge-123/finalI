@@ -16,7 +16,7 @@ import datetime
 import subprocess
 import sys
 import uuid
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 from typing import Any, Dict, List, Optional, Set, Tuple
 import httpx
@@ -323,6 +323,19 @@ def _webhook_secret_valid(request: Request) -> bool:
 def _public_base_url(request: Request) -> str:
     configured = str(os.getenv("PUBLIC_BASE_URL") or "").strip().rstrip("/")
     if configured:
+        try:
+            parsed = urlparse(configured)
+            valid = (
+                parsed.scheme in {"http", "https"} and parsed.hostname
+                and not parsed.username and not parsed.password
+                and not parsed.query and not parsed.fragment and not parsed.params
+                and not any(char.isspace() for char in configured)
+            )
+            parsed.port
+        except ValueError:
+            valid = False
+        if not valid:
+            raise HTTPException(status_code=503, detail="PUBLIC_BASE_URL_INVALID")
         return configured
     return str(request.base_url).rstrip("/")
 
@@ -2329,16 +2342,17 @@ async def broker_config(user_id: int = 1) -> Dict[str, Any]:
 
 
 @app.get("/api/webhook-url")
-async def webhook_url(request: Request, user_id: int = 1) -> Dict[str, Any]:
+async def webhook_url(request: Request, user_id: int = 1) -> JSONResponse:
     base_url = _public_base_url(request)
-    url = f"{base_url}/webhook/chartink?user_id={int(user_id)}"
+    params = {"user_id": str(int(user_id))}
     if WEBHOOK_SECRET:
-        url = f"{url}&secret={WEBHOOK_SECRET}"
-    return {
+        params["secret"] = WEBHOOK_SECRET
+    return JSONResponse({
         "ok": True,
-        "url": url,
+        "url": f"{base_url}/webhook/chartink?{urlencode(params)}",
+        "base_url_source": "PUBLIC_BASE_URL" if os.getenv("PUBLIC_BASE_URL", "").strip() else "REQUEST",
         "secret_required": bool(WEBHOOK_SECRET),
-    }
+    }, headers={"Cache-Control": "no-store"})
 
 
 @app.post("/api/broker-config")

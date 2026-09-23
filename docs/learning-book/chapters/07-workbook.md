@@ -209,3 +209,30 @@ For brokers, use the [DhanHQ API documentation](https://dhanhq.co/docs/v2/) and 
 
 For cloud study, follow the current landing page and linked guide for your chosen certification. Product names and weights change. Keep a dated objective checklist and explicitly identify topics not exercised by the trading project. Official sample questions teach format; they do not guarantee your exam result.
 
+## Appendix C Complete paper lab source walkthrough
+
+These listings let you study a complete small vertical slice without switching files. They are the same paper-only reference used by the accompanying tests. They do not connect to a broker, authenticate public users, or provide production durability. Type your own implementation first, then compare contracts and tests.
+
+### The domain module
+
+Read this module first. It has no FastAPI, Redis, SQLite, or broker import. Its inputs are explicit, making money and risk behavior testable in isolation. `RiskState` records the previous protective state; `advance` returns a new state and an optional trigger. A trigger is only simulated as an immediate fill by the local API, not by a real broker adapter.
+
+{{include:lab/paperlab/domain.py|python}}
+
+### The API and SQLite transaction boundary
+
+Read model validation, then `transaction`, then each route. Every database connection is scoped and closed. `BEGIN IMMEDIATE` serializes the small SQLite teaching workload. It is not a scalable replacement for designing PostgreSQL transactions and queues. The unique open-position index and durable receipt table demonstrate two different invariants: one open allocation per strategy/symbol, and one effect per event identity.
+
+Configuration is copied into each new position, so later changes do not silently rewrite its entry-time rules. The input price is synthetic and caller-supplied only because this is a simulator. Never transfer that trust assumption to a live webhook.
+
+{{include:lab/paperlab/api.py|python}}
+
+### The browser integration test
+
+This test launches its own loopback server against a temporary database, interacts with the real form, sends synthetic events through the API, and observes the resulting table. Notice cleanup in `finally`, readiness waiting with a deadline, no broker secret, and separate mobile/desktop runs. The final test deliberately returns HTML where the browser expected JSON.
+
+{{include:lab/tests/test_browser.py|python}}
+
+### Exercises after reading the listings
+
+Add strategy enabled/disabled without changing existing persisted positions. Add an API test and browser test for it. Then separate acceptance from simulated fill so `/api/signals` no longer immediately creates a position. Introduce a paper-order ledger and an explicit synthetic execution endpoint. Deliver duplicate fill events and verify quantity is unchanged. Finally replace SQLite with a repository interface and implement PostgreSQL without changing your pure domain rules.

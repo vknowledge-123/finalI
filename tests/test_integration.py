@@ -5,6 +5,7 @@ import unittest
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, patch
 from subprocess import CompletedProcess
+from urllib.parse import parse_qs, urlparse
 
 # Ensure app startup uses in-memory store (no Redis/Kite required)
 os.environ.setdefault("APP_TESTING", "1")
@@ -90,6 +91,39 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn('id="dhan_api_secret"', r.text)
         self.assertIn('id="dhan_redirect_url"', r.text)
         self.assertIn("const displayName = c.alert_name_raw || c.alert_name || name;", r.text)
+
+    def test_webhook_url_uses_current_host_when_no_public_override(self) -> None:
+        with patch.dict(os.environ, {"PUBLIC_BASE_URL": ""}), patch.object(main_module, "WEBHOOK_SECRET", "test-secret"):
+            response = self.client.get("/api/webhook-url?user_id=1", headers={"host": "35.234.213.109"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["url"], "http://35.234.213.109/webhook/chartink?user_id=1&secret=test-secret")
+        self.assertEqual(response.json()["base_url_source"], "REQUEST")
+        self.assertEqual(response.headers["cache-control"], "no-store")
+
+    def test_webhook_url_keeps_explicit_canonical_host_and_identifies_source(self) -> None:
+        # A domain can intentionally differ from the IP used to open the dashboard.
+        with patch.dict(os.environ, {"PUBLIC_BASE_URL": "https://trading.example.com/"}):
+            response = self.client.get("/api/webhook-url?user_id=1")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["url"].startswith("https://trading.example.com/webhook/chartink?"))
+        self.assertEqual(response.json()["base_url_source"], "PUBLIC_BASE_URL")
+
+    def test_webhook_url_preserves_special_characters_in_secret(self) -> None:
+        secret = "test+secret&fragment#percent%space value"
+        with patch.dict(os.environ, {"PUBLIC_BASE_URL": ""}), patch.object(main_module, "WEBHOOK_SECRET", secret):
+            response = self.client.get("/api/webhook-url?user_id=1")
+        parsed = urlparse(response.json()["url"])
+        self.assertEqual(parse_qs(parsed.query), {"user_id": ["1"], "secret": [secret]})
+        self.assertEqual(parsed.fragment, "")
+
+    def test_webhook_url_rejects_invalid_public_base_without_exposing_it(self) -> None:
+        for base in ("YOUR_DOMAIN", "javascript:alert(1)", "https://user:private@example.com",
+                     "https://example.com?secret=private", "https://example.com:invalid", "http://bad host"):
+            with self.subTest(base=base), patch.dict(os.environ, {"PUBLIC_BASE_URL": base}):
+                response = self.client.get("/api/webhook-url?user_id=1")
+            self.assertEqual(response.status_code, 503)
+            self.assertIn("PUBLIC_BASE_URL_INVALID", response.text)
+            self.assertNotIn("private", response.text)
 
     def test_unhandled_api_exception_returns_json(self) -> None:
         old_store = main_module.store

@@ -510,6 +510,7 @@ def normalize_dhan_holdings(response: Any) -> List[Dict[str, Any]]:
 
 
 def normalize_dhan_candles(response: Any, interval_minutes: int) -> List[Dict[str, Any]]:
+    ensure_no_broker_error(response, "DHAN_CANDLES_FAILED")
     data = response_data(response)
     if isinstance(data, list):
         rows: List[Dict[str, Any]] = []
@@ -543,13 +544,17 @@ def normalize_dhan_candles(response: Any, interval_minutes: int) -> List[Dict[st
             )
         return rows
     if not isinstance(data, dict):
-        return []
+        raise ValueError("DHAN_CANDLES_INVALID_RESPONSE")
+    if not all(isinstance(data.get(key), list) for key in ("open", "high", "low", "close")):
+        raise ValueError("DHAN_CANDLES_INVALID_RESPONSE")
     opens = data.get("open") or []
     highs = data.get("high") or []
     lows = data.get("low") or []
     closes = data.get("close") or []
     volumes = data.get("volume") or []
     stamps = data.get("timestamp") or data.get("start_Time") or []
+    if not isinstance(stamps, list) or len({len(opens), len(highs), len(lows), len(closes), len(stamps)}) != 1:
+        raise ValueError("DHAN_CANDLES_INVALID_RESPONSE")
     size = min(len(opens), len(highs), len(lows), len(closes), len(stamps))
     ist = pytz.timezone("Asia/Kolkata")
     now = datetime.now(ist)

@@ -9,10 +9,45 @@ import markdown
 
 ROOT = Path(__file__).resolve().parent
 chapters = sorted((ROOT / "chapters").glob("*.md"))
-source = "\n\n".join(path.read_text(encoding="utf-8").rstrip() for path in chapters) + "\n"
+parts = []
+appendix = ""
+for path in chapters:
+    part = path.read_text(encoding="utf-8").rstrip()
+    if "## Appendix A" in part:
+        part, rest = part.split("## Appendix A", 1)
+        appendix = "## Appendix A" + rest
+    parts.append(part)
+source = "\n\n".join(parts) + "\n\n" + appendix + "\n"
+
+expansions = {}
+for path in sorted((ROOT / "worked-examples").glob("*.md")):
+    for number, content in re.findall(r"^## Expansion (\d+)\n(.*?)(?=^## Expansion |\Z)",
+                                      path.read_text(encoding="utf-8"), re.MULTILINE | re.DOTALL):
+        if int(number) in expansions:
+            raise ValueError(f"Duplicate expansion {number}")
+        expansions[int(number)] = content.strip()
+if set(expansions) != set(range(1, 47)):
+    raise ValueError("Each original chapter must have a worked expansion")
+
+def add_expansion(match):
+    number = int(match.group(1))
+    original = match.group(0).rstrip()
+    extra = expansions.get(number, "")
+    return original + ("\n\n" + extra if extra else "") + "\n\n"
+
+source = re.sub(r"^## Chapter (\d+) [^\n]+\n.*?(?=^## Chapter |^# Part |^## Appendix |\Z)",
+                add_expansion, source, flags=re.MULTILINE | re.DOTALL)
+
+def include_file(match):
+    path = (ROOT / match.group(1)).resolve()
+    if not path.is_relative_to(ROOT):
+        raise ValueError("Include outside book directory")
+    return f"```{match.group(2)}\n{path.read_text(encoding='utf-8').rstrip()}\n```"
+
+source = re.sub(r"\{\{include:([^|}]+)\|([^}]+)\}\}", include_file, source)
 chapter_names = re.findall(r"^## Chapter \d+ .+$", source, re.MULTILINE)
-if len(chapter_names) != 46:
-    raise ValueError(f"Expected 46 chapters, found {len(chapter_names)}")
+if len(chapter_names) != 60:
+    raise ValueError(f"Expected 60 chapters, found {len(chapter_names)}")
 if source.count("```") % 2:
     raise ValueError("Unbalanced Markdown code fences")
 python_blocks = re.findall(r"```python\n(.*?)\n```", source, re.DOTALL)
@@ -33,6 +68,7 @@ counts = {
     "source_files": len(chapters),
     "prose_words_approx": len(re.findall(r"\b[\w'-]+\b", prose)),
     "python_examples_syntax_checked": len(python_blocks),
+    "worked_chapter_expansions": len(expansions),
     "code_blocks": len(re.findall(r"^```\w", source, re.MULTILINE)),
 }
 (ROOT / "BOOK.md").write_text(source, encoding="utf-8")
@@ -106,7 +142,7 @@ figcaption { font:13px/1.5 system-ui,sans-serif; color:var(--muted); margin-top:
 <a class="skip" href="#reading">Skip to book</a>
 <div class="layout"><aside>
 <div class="brand">Trading Application Engineering</div>
-<p class="edition">A practical book for Amol<br>Edition 1 / September 2026</p>
+<p class="edition">A practical book for Amol<br>Expanded edition 2 / September 2026</p>
 <label for="chapter-search">Find a chapter</label><input id="chapter-search" type="search" placeholder="Python, TOTP, testing, cloud...">
 <nav aria-label="Book contents">__TOC__</nav>
 </aside><main id="reading">

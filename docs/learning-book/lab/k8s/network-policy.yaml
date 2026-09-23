@@ -1,0 +1,19 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: paper-api-isolated
+  namespace: paper-school
+spec:
+  podSelector:
+    matchLabels:
+      app: paper-api
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              role: paper-test-client
+      ports:
+        - protocol: TCP
+          port: 8015
+  egress: []
