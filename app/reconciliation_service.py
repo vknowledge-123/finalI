@@ -38,6 +38,8 @@ def _fresh_ws_tick(tick):
 
 
 async def _reconcile_position(store, registry: EngineRegistry, user_id: int, row: Dict[str, Any]) -> None:
+    if str(row.get("paper_trading", False)).lower() in {"true", "1", "on"}:
+        return
     if str(row.get("status") or "").upper() not in {"OPEN", "EXIT_CONDITIONS_MET"}:
         return
     # Delivery carry is reconciled against holdings by the carry-position path.
@@ -53,6 +55,9 @@ async def _reconcile_position(store, registry: EngineRegistry, user_id: int, row
     engine = await registry.get(user_id)
     broker_qty_signed = await engine._fetch_broker_symbol_qty(symbol, product=str(row.get("product") or "MIS"))
     if broker_qty_signed is None:
+        return
+    current = await store.get_position(user_id, symbol)
+    if current and (current.get("trade_id") != row.get("trade_id") or current.get("paper_trading")):
         return
     broker_qty = abs(int(broker_qty_signed))
     expected_sign = -1 if str(row.get("side") or "BUY").upper() == "SELL" else 1

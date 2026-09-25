@@ -1,0 +1,429 @@
+{
+  "pages": 76,
+  "chapter_bookmarks": 40,
+  "issues": [],
+  "chapter_pages": {
+    "Chapter 1. The Application, the Learner and the Safety Boundary": 5,
+    "Chapter 2. Testing Foundations, SDLC and STLC": 6,
+    "Chapter 3. Requirements, Test Plans and Traceability": 7,
+    "Chapter 4. Test Design Techniques with Worked Tables": 9,
+    "Chapter 5. Manual Testing, Exploration, Accessibility and Defects": 10,
+    "Chapter 6. Environment, Interpreter and Your First Program": 12,
+    "Chapter 7. Values, Operators, Strings and Formatting": 13,
+    "Chapter 8. Conditions, Loops and Collections": 14,
+    "Chapter 9. Functions, Scope, Modules and Packages": 15,
+    "Chapter 10. OOP, Inheritance, Polymorphism and Abstraction": 16,
+    "Chapter 11. Files, JSON, CSV and Excel Test Data": 18,
+    "Chapter 12. Exceptions, Logging and Debugging": 19,
+    "Chapter 13. Advanced Python for Reliable Automation": 20,
+    "Chapter 14. Your First Pytest Tests and Assertions": 22,
+    "Chapter 15. Fixtures, Scope and Safe Cleanup": 23,
+    "Chapter 16. Parameterization, Markers, Coverage and Async Tests": 24,
+    "Chapter 17. Mocks, Fakes, Spies and Broker Contract Tests": 26,
+    "Chapter 18. Database, Redis, Transactions and Concurrency Tests": 27,
+    "Chapter 19. The Web, DOM, Browser and First End-to-End Test": 29,
+    "Chapter 20. CSS, XPath, Shadow DOM and Selector Tools": 30,
+    "Chapter 21. Inputs, Radios, Checkboxes and Dropdowns": 31,
+    "Chapter 22. Static Tables, Dynamic Rows and Pagination": 32,
+    "Chapter 23. Date Pickers, Dialogs and Frames": 33,
+    "Chapter 24. Mouse, Keyboard, Uploads and Downloads": 34,
+    "Chapter 25. Browser Contexts, Tabs and Authentication State": 35,
+    "Chapter 26. Waiting, Screenshots, Video, Traces and Flaky Tests": 36,
+    "Chapter 27. Network Mocking and WebSocket Evidence": 37,
+    "Chapter 28. Mobile, Cross-Browser and Parallel Testing": 39,
+    "Chapter 29. Page Object Model and Framework Design, Part One": 40,
+    "Chapter 30. Framework Design, Parts Two and Three: Data, Reports and Maintenance": 41,
+    "Chapter 31. HTTP, REST and CRUD API Testing": 42,
+    "Chapter 32. Headers, Cookies and JSON Schema Validation": 43,
+    "Chapter 33. Authentication, Email Verification, TOTP and Authorization": 44,
+    "Chapter 34. Frontend-to-Backend Integration and Security Testing": 46,
+    "Chapter 35. Git, GitHub and Reviewable Test Changes": 48,
+    "Chapter 36. GitHub Actions and Jenkins Pipelines": 49,
+    "Chapter 37. Codegen, Playwright MCP, PyCharm and Copilot": 50,
+    "Chapter 38. Performance, Resilience and Observability": 51,
+    "Chapter 39. Full-Project Feature Matrix and Capstone": 53,
+    "Chapter 40. From Beginner to SDET: Study Plan and Interview Practice": 54
+  },
+  "page_details": [
+    {
+      "page": 1,
+      "characters": 654,
+      "links": 0
+    },
+    {
+      "page": 2,
+      "characters": 4685,
+      "links": 66
+    },
+    {
+      "page": 3,
+      "characters": 2994,
+      "links": 42
+    },
+    {
+      "page": 4,
+      "characters": 1709,
+      "links": 0
+    },
+    {
+      "page": 5,
+      "characters": 2782,
+      "links": 0
+    },
+    {
+      "page": 6,
+      "characters": 3001,
+      "links": 0
+    },
+    {
+      "page": 7,
+      "characters": 2636,
+      "links": 0
+    },
+    {
+      "page": 8,
+      "characters": 2868,
+      "links": 0
+    },
+    {
+      "page": 9,
+      "characters": 2439,
+      "links": 0
+    },
+    {
+      "page": 10,
+      "characters": 2635,
+      "links": 0
+    },
+    {
+      "page": 11,
+      "characters": 2791,
+      "links": 0
+    },
+    {
+      "page": 12,
+      "characters": 2495,
+      "links": 0
+    },
+    {
+      "page": 13,
+      "characters": 2190,
+      "links": 0
+    },
+    {
+      "page": 14,
+      "characters": 2384,
+      "links": 0
+    },
+    {
+      "page": 15,
+      "characters": 2569,
+      "links": 0
+    },
+    {
+      "page": 16,
+      "characters": 2487,
+      "links": 0
+    },
+    {
+      "page": 17,
+      "characters": 2423,
+      "links": 0
+    },
+    {
+      "page": 18,
+      "characters": 2236,
+      "links": 0
+    },
+    {
+      "page": 19,
+      "characters": 2674,
+      "links": 0
+    },
+    {
+      "page": 20,
+      "characters": 2262,
+      "links": 0
+    },
+    {
+      "page": 21,
+      "characters": 1034,
+      "links": 0
+    },
+    {
+      "page": 22,
+      "characters": 2120,
+      "links": 0
+    },
+    {
+      "page": 23,
+      "characters": 2189,
+      "links": 0
+    },
+    {
+      "page": 24,
+      "characters": 2598,
+      "links": 0
+    },
+    {
+      "page": 25,
+      "characters": 2491,
+      "links": 0
+    },
+    {
+      "page": 26,
+      "characters": 2917,
+      "links": 2
+    },
+    {
+      "page": 27,
+      "characters": 2509,
+      "links": 0
+    },
+    {
+      "page": 28,
+      "characters": 1129,
+      "links": 0
+    },
+    {
+      "page": 29,
+      "characters": 2611,
+      "links": 2
+    },
+    {
+      "page": 30,
+      "characters": 2695,
+      "links": 0
+    },
+    {
+      "page": 31,
+      "characters": 2964,
+      "links": 1
+    },
+    {
+      "page": 32,
+      "characters": 2468,
+      "links": 0
+    },
+    {
+      "page": 33,
+      "characters": 2950,
+      "links": 0
+    },
+    {
+      "page": 34,
+      "characters": 2465,
+      "links": 2
+    },
+    {
+      "page": 35,
+      "characters": 2404,
+      "links": 1
+    },
+    {
+      "page": 36,
+      "characters": 2512,
+      "links": 2
+    },
+    {
+      "page": 37,
+      "characters": 2443,
+      "links": 1
+    },
+    {
+      "page": 38,
+      "characters": 2495,
+      "links": 1
+    },
+    {
+      "page": 39,
+      "characters": 2797,
+      "links": 1
+    },
+    {
+      "page": 40,
+      "characters": 2320,
+      "links": 0
+    },
+    {
+      "page": 41,
+      "characters": 2637,
+      "links": 1
+    },
+    {
+      "page": 42,
+      "characters": 2890,
+      "links": 0
+    },
+    {
+      "page": 43,
+      "characters": 2260,
+      "links": 2
+    },
+    {
+      "page": 44,
+      "characters": 1976,
+      "links": 0
+    },
+    {
+      "page": 45,
+      "characters": 2919,
+      "links": 0
+    },
+    {
+      "page": 46,
+      "characters": 2688,
+      "links": 1
+    },
+    {
+      "page": 47,
+      "characters": 1171,
+      "links": 0
+    },
+    {
+      "page": 48,
+      "characters": 2116,
+      "links": 0
+    },
+    {
+      "page": 49,
+      "characters": 2115,
+      "links": 1
+    },
+    {
+      "page": 50,
+      "characters": 2299,
+      "links": 2
+    },
+    {
+      "page": 51,
+      "characters": 2979,
+      "links": 3
+    },
+    {
+      "page": 52,
+      "characters": 2325,
+      "links": 0
+    },
+    {
+      "page": 53,
+      "characters": 2331,
+      "links": 0
+    },
+    {
+      "page": 54,
+      "characters": 2145,
+      "links": 0
+    },
+    {
+      "page": 55,
+      "characters": 2481,
+      "links": 0
+    },
+    {
+      "page": 56,
+      "characters": 954,
+      "links": 0
+    },
+    {
+      "page": 57,
+      "characters": 2036,
+      "links": 0
+    },
+    {
+      "page": 58,
+      "characters": 1995,
+      "links": 0
+    },
+    {
+      "page": 59,
+      "characters": 744,
+      "links": 0
+    },
+    {
+      "page": 60,
+      "characters": 3053,
+      "links": 0
+    },
+    {
+      "page": 61,
+      "characters": 1764,
+      "links": 0
+    },
+    {
+      "page": 62,
+      "characters": 1390,
+      "links": 0
+    },
+    {
+      "page": 63,
+      "characters": 1737,
+      "links": 0
+    },
+    {
+      "page": 64,
+      "characters": 1557,
+      "links": 0
+    },
+    {
+      "page": 65,
+      "characters": 882,
+      "links": 0
+    },
+    {
+      "page": 66,
+      "characters": 1790,
+      "links": 23
+    },
+    {
+      "page": 67,
+      "characters": 1830,
+      "links": 0
+    },
+    {
+      "page": 68,
+      "characters": 2714,
+      "links": 0
+    },
+    {
+      "page": 69,
+      "characters": 2451,
+      "links": 0
+    },
+    {
+      "page": 70,
+      "characters": 3712,
+      "links": 0
+    },
+    {
+      "page": 71,
+      "characters": 1935,
+      "links": 0
+    },
+    {
+      "page": 72,
+      "characters": 2445,
+      "links": 0
+    },
+    {
+      "page": 73,
+      "characters": 2979,
+      "links": 0
+    },
+    {
+      "page": 74,
+      "characters": 3104,
+      "links": 0
+    },
+    {
+      "page": 75,
+      "characters": 2837,
+      "links": 0
+    },
+    {
+      "page": 76,
+      "characters": 1251,
+      "links": 0
+    }
+  ]
+}

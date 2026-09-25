@@ -83,6 +83,20 @@ def main():
                     expect(page.locator("#webhook_url_status")).to_be_hidden()
                     page.unroute(webhook_route)
                     page.locator("#cfg_alert").fill(f"Browser Smoke {width}")
+                    page.locator("#cfg_paper_on").check()
+                    expect(page.locator("#cfg_turnover_topn")).to_be_disabled()
+                    page.locator("#cfg_turnover_on").check()
+                    page.locator("#cfg_turnover_topn").fill("10")
+                    expect(page.locator("#cfg_turnover_topn")).to_be_enabled()
+                    page.route("**/api/turnover/top?*", lambda route: route.fulfill(json={
+                        "ready": True, "covered": 3200, "total": 3200,
+                        "rows": [{"symbol": "TESTSTOCK", "rank": 1, "turnover": 2500000}],
+                    }))
+                    page.get_by_role("button", name="Refresh Turnover Ranking", exact=True).click()
+                    expect(page.locator("#turnover_status")).to_have_text("Ready | 3200/3200 stocks")
+                    expect(page.locator("#turnover_ranks")).to_contain_text("TESTSTOCK")
+                    page.screenshot(path=str(artifacts / f"paper-turnover-{width}.png"))
+                    page.unroute("**/api/turnover/top?*")
                     page.locator("#cfg_prod").select_option("CNC")
                     page.locator("#cfg_qtymode").select_option("QTY")
                     page.locator("#cfg_qty").fill("2")
@@ -122,6 +136,8 @@ def main():
                     assert f"Browser Smoke {width}" in serialized, configs
                     config_key = f"browser smoke {width}"
                     config = configs["configs"][config_key]
+                    assert config["paper_trading"] and config["turnover_filter_on"], config
+                    assert config["turnover_top_n"] == 10, config
                     assert config["qty"] == 2 and config["product"] == "CNC", config
                     assert config["cost_sl_enabled"] and config["exit_alert_enabled"], config
                     assert config["trailing_sl_enabled"] is False, config
@@ -138,6 +154,11 @@ def main():
                     assert page.evaluate("typeof openCfg") == "function", (page.url, errors, page.title())
                     page.evaluate("openCfg()")
                     page.evaluate("name => fillCfg(name)", config_key)
+                    expect(page.locator("#cfg_paper_on")).to_be_checked()
+                    expect(page.locator("#cfg_turnover_on")).to_be_checked()
+                    expect(page.locator("#cfg_turnover_topn")).to_have_value("10")
+                    page.locator("#cfg_turnover_on").uncheck()
+                    expect(page.locator("#cfg_turnover_topn")).to_be_disabled()
                     assert page.locator("#cfg_tsl_on").input_value() == "false"
                     assert page.locator("#cfg_order_retries").input_value() == "0"
                     assert page.locator("#cfg_order_buffer").input_value() == "0"
@@ -181,6 +202,7 @@ def main():
                         "ltp": 100, "pnl": 0, "realized_pnl": 0, "target_price": 104,
                         "sl_price": 99, "trail_price": 99, "tsl_pct": 1,
                         "trailing_sl_enabled": True, "tsl_stepwise": True, "strategy_mode": "CLASSIC",
+                        "paper_trading": True,
                     }
 
                     async def seed_position():
@@ -207,6 +229,10 @@ def main():
                     }), application.APP_LOOP).result(5)
                     expect(ltp).to_have_text("101.50")
                     expect(pnl).to_have_text("3.00")
+                    expect(page.locator("#alertsBody")).to_contain_text("PAPER OPEN")
+                    expect(page.locator("#alertsBody")).to_contain_text("PAPER / CNC")
+                    expect(page.locator("#totalPnlBadge")).to_contain_text("Paper:")
+                    assert page.locator("#totalPnlBadge .pnl-value").first.inner_text().strip() == "\u20b9 0.00"
                     strategy_rows = page.locator('#alertsBody tr').filter(has_text=f'Browser Smoke {width}')
                     skipped = strategy_rows.filter(has_text='HIGH_BREAK_CANDLE_NOT_READY')
                     expect(skipped.locator('[data-label="Status"]')).to_contain_text('SKIPPED')

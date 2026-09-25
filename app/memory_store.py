@@ -40,6 +40,7 @@ class InMemoryStore:
         self._cnc_carry_positions: Dict[int, Dict[str, Dict[str, Any]]] = {}
         self._pnl_exit_cfg: Dict[int, Dict[str, Any]] = {}
         self._sector_cache: Dict[int, Dict[str, Any]] = {}
+        self._turnover_snapshots = {}
         self._broker_feed_health: Dict[str, Dict[str, Any]] = {}
         self._latest_ticks: Dict[str, Dict[str, Any]] = {}
         self._locks: Dict[str, float] = {}
@@ -233,6 +234,12 @@ class InMemoryStore:
 
     async def load_sector_cache(self, user_id: int) -> Dict[str, Any]:
         return dict(self._sector_cache.get(int(user_id), {}))
+
+    async def save_turnover_snapshot(self, user_id: int, payload: Dict[str, Any]) -> None:
+        self._turnover_snapshots[int(user_id)] = dict(payload)
+
+    async def load_turnover_snapshot(self, user_id: int) -> Dict[str, Any]:
+        return dict(self._turnover_snapshots.get(int(user_id), {}))
 
     def _feed_key(self, user_id: int, broker: str) -> str:
         return f"{int(user_id)}:{str(broker or '').strip().upper()}"

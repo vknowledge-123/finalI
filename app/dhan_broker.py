@@ -34,6 +34,7 @@ except Exception as exc:  # pragma: no cover - exercised only when SDK import fa
         IDX = 0
         NSE_FNO = 2
         Full = 21
+        Quote = 17
 
         def __init__(self, *_args: Any, **_kwargs: Any) -> None:
             raise RuntimeError(f"DHAN_MARKET_FEED_UNAVAILABLE:{compact_msg}")
@@ -133,11 +134,11 @@ class DhanInstrumentRegistry:
 
         mask = ((column("SEM_EXM_EXCH_ID", "EXCH_ID") == "NSE")
                 & column("SEM_SEGMENT", "SEGMENT").isin(["E", "C"])
-                & column("SEM_SERIES", "SERIES").isin(["", "EQ", "BE", "BZ"])
+                & column("SEM_SERIES", "SERIES").isin(["", "EQ", "BE", "BZ", "SM", "ST"])
                 & column("SEM_INSTRUMENT_NAME", "INSTRUMENT").isin(["", "EQUITY", "EQ"]))
         result = []
         for row in frame.loc[mask].to_dict("records"):
-            symbol = norm_symbol(_value(row, "SEM_TRADING_SYMBOL", "TRADING_SYMBOL"))
+            symbol = norm_symbol(_value(row, "SEM_TRADING_SYMBOL", "TRADING_SYMBOL", "SYMBOL_NAME"))
             sid = _value(row, "SEM_SMST_SECURITY_ID", "SECURITY_ID")
             if symbol and sid:
                 result.append((symbol, sid, _value(row, "SEM_TICK_SIZE", "TICK_SIZE")))
@@ -655,6 +656,16 @@ class _SafeDhanOrderUpdate(OrderUpdate):
 
 
 class _QueuedDhanMarketFeed(MarketFeed):
+    def process_quote(self, data):
+        packet = super().process_quote(data)
+        packet["exchange_ts"] = struct.unpack_from("<I", data, 14)[0]
+        return packet
+
+    def process_full(self, data):
+        packet = super().process_full(data)
+        packet["exchange_ts"] = struct.unpack_from("<I", data, 14)[0]
+        return packet
+
     def server_disconnection(self, data):
         code = struct.unpack("<BHBIH", data[:10])[4]
         raise _DhanFeedDisconnect(code)
@@ -775,6 +786,8 @@ class DhanFeedService:
     on_tick: Callable[[Dict[str, Any]], Any]
     on_order_update: Callable[[Dict[str, Any]], Any]
     on_state: Optional[Callable[[bool], None]] = None
+    data_mode: int = MarketFeed.Full
+    include_order_updates: bool = True
 
     def __post_init__(self) -> None:
         self.context = DhanContext(self.client_id, self.access_token)
@@ -838,7 +851,7 @@ class DhanFeedService:
             for i, queue in enumerate(self._tick_queues)
         ]
         instruments = [
-            (segment, security_id, MarketFeed.Full)
+            (segment, security_id, self.data_mode)
             for segment, security_id in sorted(self.security_ids)
         ]
         log.info(
@@ -876,12 +889,13 @@ class DhanFeedService:
         self.feed.delivery_loop = delivery_loop
         self.feed_thread = self.feed.start()
 
-        self.order_update = _SafeDhanOrderUpdate(self.context)
-        self.order_update.on_update = self.on_order_update
-        self.order_task = asyncio.create_task(
-            self._run_order_updates(),
-            name=f"dhan_order_updates_{self.user_id}",
-        )
+        if self.include_order_updates:
+            self.order_update = _SafeDhanOrderUpdate(self.context)
+            self.order_update.on_update = self.on_order_update
+            self.order_task = asyncio.create_task(
+                self._run_order_updates(),
+                name=f"dhan_order_updates_{self.user_id}",
+            )
 
     async def _run_order_updates(self) -> None:
         backoff = FeedBackoff()
@@ -933,7 +947,7 @@ class DhanFeedService:
                 # Mutate SDK subscription state only on its owning loop. The full
                 # desired list is retained for reconnect even when this send fails.
                 feed.instruments = [
-                    (segment, sid, MarketFeed.Full)
+                    (segment, sid, self.data_mode)
                     for segment, sid in sorted(desired)
                 ]
                 if not feed.ws or feed._is_ws_closed():

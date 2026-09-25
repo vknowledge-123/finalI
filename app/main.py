@@ -1224,6 +1224,8 @@ async def fetch_and_cache_dhan_sector_data(user_id: int) -> Dict[str, Any]:
 
     try:
         client = dhanhq(DhanContext(client_id, access_token))
+        from .market_quote_budget import reserve_quote_slot
+        await reserve_quote_slot(app_store, user_id)
         response = await asyncio.to_thread(client.ohlc_data, grouped)
     except Exception as exc:
         return {"ok": False, "error": f"DHAN_SECTOR_FETCH_FAILED:{exc}"}
@@ -3239,6 +3241,15 @@ async def api_subscribe_symbols(payload: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "error": "NO_SYMBOLS"}
     await _runtime_subscribe_symbols(user_id, symbols)
     return {"ok": True, "count": len(symbols), "requested": symbols}
+
+
+@app.get("/api/turnover/top")
+async def get_top_turnover(user_id: int = 1, limit: int = Query(10, ge=1, le=5000)):
+    from .turnover import SNAPSHOT_MAX_AGE
+    snapshot = await store.load_turnover_snapshot(user_id)
+    if not snapshot or not 0 <= time.time() - float(snapshot.get("ts", 0)) <= SNAPSHOT_MAX_AGE:
+        return {"ready": False, "reason": "TURNOVER_RANK_STALE", "rows": [], "covered": 0, "total": 0}
+    return {**snapshot, "rows": snapshot.get("rows", [])[:limit]}
 
 
 @app.get("/api/sectors/top")

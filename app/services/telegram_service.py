@@ -114,7 +114,8 @@ class TelegramService:
             if target is None or not 0 <= age <= 600:
                 await store.delete_telegram_entry(uid, event["trade_id"])
                 continue
-            text = (f"{event['symbol']} | {event['side']} | {event['product']}\n"
+            text = (("PAPER TRADE\n" if event.get("paper_trading") else "LIVE TRADE\n")
+                    + f"{event['symbol']} | {event['side']} | {event['product']}\n"
                     f"Entry: INR {event['entry']:.2f}\nTarget: INR {event['target']:.2f}\n"
                     f"Stop loss: INR {event['stop_loss']:.2f}\nFilled quantity: {event['qty']}\n"
                     f"Strategy: {event['alert_name']}")

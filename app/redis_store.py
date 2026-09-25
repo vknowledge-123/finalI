@@ -450,6 +450,14 @@ class RedisStore:
         except Exception:
             return {}
 
+    async def save_turnover_snapshot(self, user_id: int, payload: Dict[str, Any]) -> None:
+        await self.redis.setex(f"turnover:snapshot:{int(user_id)}", 15, json.dumps(payload, allow_nan=False))
+
+    async def load_turnover_snapshot(self, user_id: int) -> Dict[str, Any]:
+        raw = await self.redis.get(f"turnover:snapshot:{int(user_id)}")
+        data = json.loads(raw) if raw else {}
+        return data if isinstance(data, dict) else {}
+
     # =========================
     # Broker feed health / latest tick
     # =========================

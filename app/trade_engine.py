@@ -718,6 +718,9 @@ def _is_within_entry_window(start_time: str, end_time: str) -> bool:
 class AlertConfig:
     alert_name: str
     enabled: bool = True
+    paper_trading: bool = False
+    turnover_filter_on: bool = False
+    turnover_top_n: int = 10
     exit_alert_enabled: bool = False
     exit_alert_name: str = ""
 
@@ -777,6 +780,9 @@ class AlertConfig:
         return AlertConfig(
             alert_name=normalize_alert_key(raw_name),
             enabled=_as_bool(d.get("enabled"), True),
+            paper_trading=_as_bool(d.get("paper_trading"), False),
+            turnover_filter_on=_as_bool(d.get("turnover_filter_on"), False),
+            turnover_top_n=int(d.get("turnover_top_n", 10)),
             exit_alert_enabled=_as_bool(d.get("exit_alert_enabled"), False),
             exit_alert_name=normalize_alert_key(str(d.get("exit_alert_name") or d.get("exit_alert") or "")),
             direction=direction,  # type: ignore[arg-type]
@@ -820,6 +826,7 @@ class Position:
 
     entry_price: float
     entry_order_id: str = ""
+    paper_trading: bool = False
 
     # monitoring (MIS only)
     target_price: float = 0.0
@@ -1211,8 +1218,14 @@ class TradeEngine:
                 data["user_id"] = int(self.user_id)
                 data["symbol"] = sym
 
+                if _as_bool(data.get("paper_trading")) and data["status"] in {"EXITING", "EXIT_CONDITIONS_MET"}:
+                    data["status"] = "OPEN"
+                    data["pending_reason"] = "PAPER_RECOVERED_MONITORING"
+
                 pos = Position(**data)
                 self.positions[sym] = pos
+                if pos.paper_trading and status in {"EXITING", "EXIT_CONDITIONS_MET"}:
+                    await self._persist_position_state(pos)
                 restored.append(sym)
             except Exception as e:
                 log.debug("REHYDRATE_ROW_FAIL | user=%s err=%s row=%s", self.user_id, e, r)
@@ -1259,6 +1272,27 @@ class TradeEngine:
         if not carry_rows:
             return []
 
+        paper_restored = []
+        for row in carry_rows:
+            if not _as_bool(row.get("paper_trading")) or row.get("status") == "CLOSED":
+                continue
+            data = {key: row.get(key, field.default) for key, field in Position.__dataclass_fields__.items()}
+            data["user_id"] = self.user_id
+            data["product"] = "CNC"
+            if data["status"] in {"EXITING", "EXIT_CONDITIONS_MET"}:
+                data["status"] = "OPEN"
+                data["pending_reason"] = "PAPER_RECOVERED_MONITORING"
+            pos = Position(**data)
+            pos.symbol = norm_symbol(pos.symbol)
+            if pos.qty > 0 and pos.symbol:
+                self.positions[pos.symbol] = pos
+                await self._persist_position_state(pos)
+                await self.store.mark_open(self.user_id, pos.symbol, pos.trade_id, ttl_sec=60 * 60 * 24 * 14)
+                paper_restored.append(pos.symbol)
+        carry_rows = [row for row in carry_rows if not _as_bool(row.get("paper_trading"))]
+        if not carry_rows:
+            return paper_restored
+
         holdings_by_symbol: Dict[str, Dict[str, Any]] = {}
         delivery_positions = None
         try:
@@ -1266,9 +1300,9 @@ class TradeEngine:
             holdings_by_symbol = {norm_symbol(row.get("tradingsymbol", "")): row for row in holdings}
         except Exception as e:
             log.warning("CNC_HOLDINGS_FETCH_FAIL | user=%s err=%s", self.user_id, e)
-            return []
+            return paper_restored
 
-        restored: List[str] = []
+        restored: List[str] = list(paper_restored)
         for row in carry_rows or []:
             try:
                 sym = norm_symbol(row.get("symbol", ""))
@@ -1475,7 +1509,7 @@ class TradeEngine:
         quote_fn = getattr(self.dhan, "quote_data", None)
         if callable(quote_fn):
             try:
-                quote = await self.market_data_worker.submit(quote_fn, payload)
+                quote = await self._dhan_market_quote(quote_fn, payload)
                 reference = _depth_execution_price(quote, side, qty)
                 if reference > 0:
                     source = "DEPTH"
@@ -1516,6 +1550,13 @@ class TradeEngine:
         return limit_price, f"{source}:ref={reference:.2f}:buffer={buffer_pct:.3f}:ticks={extra_ticks}:tick={tick:.2f}"
 
     async def _place_order(self, symbol: str, side: Side, qty: int, product: Product, cfg: Optional[Dict[str, Any]] = None) -> Any:
+        # Last-line guard: simulated orders must never enter a broker adapter.
+        position = self.positions.get(norm_symbol(symbol))
+        saved = await self.store.get_position(self.user_id, norm_symbol(symbol))
+        if (_as_bool((cfg or {}).get("paper_trading"))
+                or (position and position.status != "CLOSED" and position.paper_trading)
+                or (saved and saved.get("status") != "CLOSED" and _as_bool(saved.get("paper_trading")))):
+            raise RuntimeError("PAPER_ORDER_BROKER_SUBMISSION_BLOCKED")
         if self.broker == "DHAN":
             if not await self._ensure_dhan_ready() or not self.dhan:
                 raise RuntimeError("DHAN_NOT_CONNECTED")
@@ -1534,7 +1575,7 @@ class TradeEngine:
                 side = "BUY"
                 option_ltp = 0.0
                 try:
-                    quote = await self.market_data_worker.submit(
+                    quote = await self._dhan_market_quote(
                         self.dhan.ohlc_data,
                         {exchange_segment: [int(security_id)]},
                     )
@@ -1635,6 +1676,13 @@ class TradeEngine:
         async def check():
             if lease_guard:
                 await lease_guard()
+            turnover_symbol = (cfg or {}).get("_turnover_symbol")
+            if turnover_symbol:
+                from .turnover import turnover_decision
+                allowed, reason = turnover_decision(await self.store.load_turnover_snapshot(self.user_id),
+                                                    turnover_symbol, cfg["turnover_top_n"])
+                if not allowed:
+                    raise RuntimeError(reason)
             deadline = (cfg or {}).get("_breakout_deadline")
             if deadline is not None:
                 if time.time() >= float(deadline):
@@ -1894,6 +1942,28 @@ class TradeEngine:
         product: Product,
         cfg: Optional[Dict[str, Any]] = None,
     ) -> OrderExecution:
+        position = self.positions.get(norm_symbol(symbol))
+        if position and position.status != "CLOSED" and "paper_trading" in (cfg or {}):
+            if bool(position.paper_trading) != _as_bool(cfg["paper_trading"]):
+                raise RuntimeError("POSITION_TRADING_MODE_MISMATCH")
+        paper = bool(position.paper_trading) if position and position.status != "CLOSED" else _as_bool((cfg or {}).get("paper_trading"))
+        if paper:
+            await self._submission_guard(cfg)()
+            # Model a full fill at the last observed price, not exchange liquidity.
+            # No order/positions/trade-book API is called on this branch.
+            price = float((cfg or {}).get("_paper_price") or 0)
+            if price <= 0:
+                tick = await self.store.load_latest_tick(self.user_id, symbol)
+                age = float(tick.get("age_sec", 999999))
+                if 0 <= age <= max(0.5, _env_float("ENTRY_FRESH_TICK_MAX_AGE_SEC", 5.0)):
+                    price = float(tick.get("ltp") or 0)
+            if price <= 0:
+                price = float(await self._fetch_ltp(symbol, prefer_cache=False) or 0)
+            if not math.isfinite(price) or price <= 0 or int(qty) <= 0:
+                raise RuntimeError("PAPER_FRESH_PRICE_REQUIRED")
+            return OrderExecution(order_id="PAPER-" + uuid.uuid4().hex, symbol=norm_symbol(symbol),
+                                  side=side, qty=int(qty), status="COMPLETE", avg_price=price,
+                                  filled_qty=int(qty), remaining_qty=0, ltp=price)
         timeout_sec, pending_retries = self._order_confirm_settings(cfg)
         attempts = 0
         last_snapshot: Dict[str, Any] = {}
@@ -2176,13 +2246,13 @@ class TradeEngine:
                         if security_id:
                             segment = DHAN_INSTRUMENTS.exchange_segment_for_symbol(symbol, self.dhan)
                             payload = {segment: [int(security_id)]}
-                            response = await self.market_data_worker.submit(self.dhan.ohlc_data, payload)
+                            response = await self._dhan_market_quote(self.dhan.ohlc_data, payload)
                             last_price = _extract_ltp_from_response(response)
                             if last_price > 0:
                                 return last_price
                             quote_fn = getattr(self.dhan, "quote_data", None)
                             if callable(quote_fn):
-                                quote_response = await self.market_data_worker.submit(quote_fn, payload)
+                                quote_response = await self._dhan_market_quote(quote_fn, payload)
                                 last_price = _extract_ltp_from_response(quote_response)
                                 if last_price > 0:
                                     return last_price
@@ -2222,6 +2292,11 @@ class TradeEngine:
                     pass
             await asyncio.sleep(0.5)
         return 0.0
+
+    async def _dhan_market_quote(self, fn, payload):
+        from .market_quote_budget import reserve_quote_slot
+        await reserve_quote_slot(self.store, self.user_id)
+        return await self.market_data_worker.submit(fn, payload)
 
     async def _submit_history(self, fn, **kwargs):
         # Pace candle reads independently from quotes/exits. This is per engine;
@@ -2732,6 +2807,20 @@ class TradeEngine:
                 custom_settings: Dict[str, Any] = {}
                 ranked: List[tuple] = []
 
+                if cfg.turnover_filter_on:
+                    from .turnover import turnover_decision
+                    if self.broker != "DHAN":
+                        results.append({"symbol": sym, "status": "SKIPPED", "reason": "TURNOVER_REQUIRES_DHAN"})
+                        continue
+                    try:
+                        snapshot = await self.store.load_turnover_snapshot(self.user_id)
+                    except Exception:
+                        snapshot = {}
+                    allowed_turnover, reason = turnover_decision(snapshot, sym, cfg.turnover_top_n)
+                    if not allowed_turnover:
+                        results.append({"symbol": sym, "status": "SKIPPED", "reason": reason})
+                        continue
+
                 # sector filter
                 if cfg.sector_filter_on:
                     sector = self.sym_sector.get(sym, "")
@@ -3001,6 +3090,12 @@ class TradeEngine:
                     continue
                 try:
                     execution_cfg = dict(cfg.custom_settings or {})
+                    execution_cfg["paper_trading"] = cfg.paper_trading
+                    if cfg.turnover_filter_on:
+                        execution_cfg["_turnover_symbol"] = sym
+                        execution_cfg["turnover_top_n"] = cfg.turnover_top_n
+                    if cfg.paper_trading:
+                        execution_cfg["_paper_price"] = ltp
                     if watch:
                         execution_cfg["_breakout_deadline"] = watch["expires_at"]
                     execution = await self._place_order_with_execution(sym, side, qty, cfg.product, execution_cfg)
@@ -3056,6 +3151,7 @@ class TradeEngine:
                     initial_qty=executed_qty,
                     entry_price=entry,
                     entry_order_id=str(oid),
+                    paper_trading=cfg.paper_trading,
                     entry_filled_qty=executed_qty,
                     entry_remaining_qty=int(execution.remaining_qty or 0),
                     order_status=str(execution.status or "COMPLETE"),
@@ -3130,6 +3226,7 @@ class TradeEngine:
                             "trade_id": pos.trade_id, "created_at": time.time(),
                             "alert_name": alert_key, "symbol": execution_symbol,
                             "side": side, "product": pos.product, "qty": executed_qty,
+                            "paper_trading": pos.paper_trading,
                             "entry": entry, "target": target_price, "stop_loss": sl_price,
                         })
                     except Exception as exc:
@@ -3150,7 +3247,8 @@ class TradeEngine:
                         "symbol": sym,
                         "execution_symbol": execution_symbol,
                         "status": "ENTERED",
-                        "reason": "ORDER_EXECUTED",
+                        "reason": "PAPER_ORDER_EXECUTED" if pos.paper_trading else "ORDER_EXECUTED",
+                        "paper_trading": pos.paper_trading,
                         "side": side,
                         "qty": executed_qty,
                         "order_id": str(oid),
@@ -3211,7 +3309,7 @@ class TradeEngine:
                         pos = candidate
                         symbol = candidate.symbol
                         break
-            if not pos:
+            if not pos or pos.paper_trading:
                 return
 
             # Entry order updates
@@ -3327,6 +3425,7 @@ class TradeEngine:
                 exit_qty,
                 pos.product,
                 {
+                    "paper_trading": pos.paper_trading,
                     "order_confirm_timeout_sec": 1.5,
                     "order_pending_retry_count": 1,
                 },
@@ -3392,14 +3491,14 @@ class TradeEngine:
                     self.broadcast_cb(self.user_id, {"type": "pos_refresh"})
             return True
         except Exception as e:
-            pos.status = "ERROR"
+            pos.status = "OPEN" if pos.paper_trading else "ERROR"
             pos.exit_reason = f"{target}_PARTIAL_ORDER_FAIL:{_safe_error(e)}"
             pos.updated_ts = time.time()
             try:
                 await self._persist_position_state(pos)
             except Exception:
                 pass
-            if not _is_broker_validation_error(e):
+            if not pos.paper_trading and not _is_broker_validation_error(e):
                 try:
                     await self._enable_kill_switch(reason=f"PARTIAL_ORDER_FAIL:{symbol}:{target}")
                 except Exception:
@@ -3466,6 +3565,8 @@ class TradeEngine:
                 add_qty,
                 pos.product,
                 {
+                    "paper_trading": pos.paper_trading,
+                    "_paper_price": ltp if pos.paper_trading else 0,
                     "order_confirm_timeout_sec": 1.5,
                     "order_pending_retry_count": 1,
                 },
@@ -3704,7 +3805,7 @@ class TradeEngine:
             pos.pnl = 0.0
 
         # reconcile entry_price once if missing (REST)
-        if pos.entry_price <= 0 and not self._recon_inflight.get(symbol):
+        if pos.entry_price <= 0 and not pos.paper_trading and not self._recon_inflight.get(symbol):
             self._recon_inflight[symbol] = True
 
             async def _recon():
@@ -4071,7 +4172,7 @@ class TradeEngine:
         if not grouped:
             return False
         try:
-            response = await self.market_data_worker.submit(self.dhan.ohlc_data, grouped)
+            response = await self._dhan_market_quote(self.dhan.ohlc_data, grouped)
         except Exception as exc:
             log.warning("DHAN_SECTOR_RANK_REFRESH_FAIL | user=%s err=%s", self.user_id, exc)
             return False
@@ -4221,6 +4322,10 @@ class TradeEngine:
             await self._exit_position(symbol, reason)
             return {"status": "EXIT_TRIGGERED", "symbol": symbol, "reason": reason, "source": "MEMORY"}
 
+        saved = await self.store.get_position(self.user_id, symbol)
+        if saved and _as_bool(saved.get("paper_trading")):
+            return {"status": "NOT_FOUND", "symbol": symbol, "reason": "NO_ACTIVE_PAPER_POSITION"}
+
         acquired = await self.store.acquire_lock(self.user_id, symbol, "exit", ttl_ms=5000)
         if acquired != 1:
             return {"status": "BUSY", "symbol": symbol, "reason": "EXIT_IN_PROGRESS"}
@@ -4230,6 +4335,9 @@ class TradeEngine:
             await self.store.release_lock(self.user_id, symbol, "exit")
 
     async def _manual_squareoff_from_broker(self, symbol: str, reason: str) -> Dict[str, Any]:
+        saved = await self.store.get_position(self.user_id, symbol)
+        if saved and _as_bool(saved.get("paper_trading")):
+            return {"status": "ERROR", "symbol": symbol, "reason": "PAPER_BROKER_FALLBACK_BLOCKED"}
         # Ensure selected broker is ready
         ok = await self._ensure_broker_ready()
         if not ok:
@@ -4387,6 +4495,7 @@ class TradeEngine:
                         requested_exit_qty,
                         pos.product,
                         {
+                            "paper_trading": pos.paper_trading,
                             "order_confirm_timeout_sec": 1.5,
                             "order_pending_retry_count": 1,
                         },
@@ -4400,6 +4509,12 @@ class TradeEngine:
                     pos.exit_remaining_qty = max(0, requested_exit_qty - filled_exit_qty)
                     pos.order_status = str(execution.status or "COMPLETE")
                     pos.updated_ts = time.time()
+
+                    if pos.paper_trading:
+                        fill_price = float(execution.avg_price)
+                        pos.realized_pnl += (fill_price - pos.entry_price) * filled_exit_qty * (1 if pos.side == "BUY" else -1)
+                        pos.ltp = fill_price
+                        pos.pnl = pos.realized_pnl
 
                     if filled_exit_qty < requested_exit_qty:
                         pos.qty = max(0, requested_exit_qty - filled_exit_qty)
@@ -4458,8 +4573,10 @@ class TradeEngine:
                         log.debug("📝 DELETE_POS_FAIL | user=%s symbol=%s err=%s", self.user_id, symbol, e)
 
                 except Exception as e:
-                    pos.status = "ERROR"
+                    pos.status = "OPEN" if pos.paper_trading else "ERROR"
                     pos.exit_reason = f"EXIT_ORDER_FAIL:{_safe_error(e)}"
+                    if pos.paper_trading:
+                        pos.pending_reason = "PAPER_EXIT_PRICE_UNAVAILABLE"
                     pos.updated_ts = time.time()
 
                     log.error(
@@ -4475,7 +4592,7 @@ class TradeEngine:
                     # Broker validation/order rejections should stay local to
                     # the position. Unexpected infrastructure failures can
                     # still activate the kill switch.
-                    if not _is_broker_validation_error(e):
+                    if not pos.paper_trading and not _is_broker_validation_error(e):
                         try:
                             await self._enable_kill_switch(reason=f"EXIT_ORDER_FAIL:{symbol}")
                         except Exception as e3:

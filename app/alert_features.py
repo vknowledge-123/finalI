@@ -22,6 +22,18 @@ def public_config(config):
 
 def prepare_features(payload, existing, store):
     result = {}
+    for key in ("paper_trading", "turnover_filter_on"):
+        value = payload.get(key, existing.get(key, False))
+        if str(value).strip().lower() not in {"true", "false", "1", "0", "on", "off"}:
+            raise ValueError("TRADING_MODE_SETTINGS_INVALID")
+        result[key] = enabled(value)
+    try:
+        top_n = float(payload.get("turnover_top_n", existing.get("turnover_top_n", 10)))
+        if not math.isfinite(top_n) or not top_n.is_integer() or not 1 <= top_n <= 5000:
+            raise ValueError()
+    except (ValueError, TypeError):
+        raise ValueError("TURNOVER_TOP_N_INVALID") from None
+    result["turnover_top_n"] = int(top_n)
     result["high_break_enabled"] = enabled(payload.get("high_break_enabled", False))
     result["high_break_buffer_enabled"] = enabled(payload.get("high_break_buffer_enabled", False))
     try:

@@ -1,0 +1,24 @@
+[Unit]
+Description=AshuChart Read-Only Turnover Ranking Service
+After=network-online.target redis-server.service ashuchart-market-feed.service
+Wants=network-online.target redis-server.service
+PartOf=ashuchart-market-feed.service
+
+[Service]
+Type=simple
+User=ashuchart
+Group=ashuchart
+WorkingDirectory=/opt/finalI
+EnvironmentFile=/etc/ashuchart.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/finalI/myvenv/bin/python -m app.turnover_service
+Restart=on-failure
+RestartSec=35
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target ashuchart-market-feed.service
