@@ -16,7 +16,7 @@ from .dhan_broker import DHAN_SCRIP_MASTER_URL, DhanFeedService, MarketFeed
 from .dhan_feed_policy import equity_session_open
 from .service_bootstrap import configure_logging, init_store, load_user_ids
 from .market_quote_budget import reserve_quote_slot
-from .turnover import TurnoverBook, equity_universe
+from .turnover import QUOTE_MAX_AGE, TurnoverBook, equity_universe
 
 log = logging.getLogger("turnover_service")
 LEASE_KEY = "turnover:worker:lease"
@@ -60,6 +60,9 @@ class TurnoverSession:
         self.generation = 0
         self.last_status = None
         self.last_status_at = 0
+        self.next_refresh = {}
+        self.retries = {}
+        self.blocked_until = 0
 
     async def start(self):
         loop = asyncio.get_running_loop()
@@ -77,53 +80,117 @@ class TurnoverSession:
         self.book.connected = bool(connected)
         self.generation += 1
         self.book.quotes.clear()
+        self.book.rejections.clear()
+        self.next_refresh.clear()
+        self.retries.clear()
         log.info("TURNOVER_CONNECTION | user=%s connected=%s", self.uid, connected)
 
     def on_tick(self, packet):
         if packet.get("exchange_segment") != MarketFeed.NSE or "volume" not in packet:
             return
-        self.book.update(packet.get("security_id"), packet.get("LTP"), packet.get("volume"),
-                         packet.get("received_at"), trade_at=packet.get("exchange_ts"))
+        sid = str(packet.get("security_id"))
+        if self.book.update(sid, packet.get("LTP"), packet.get("volume"),
+                            packet.get("received_at"), trade_at=packet.get("exchange_ts"), source="DHAN_WS"):
+            self.recovered(sid)
 
-    async def refresh_quotes(self):
-        # Warm/revalidate quiet symbols; ticks remain the primary source. Quote
-        # snapshots are batched, never one HTTP request per stock or per tick.
-        while True:
+    def recovered(self, sid):
+        retry = self.retries.pop(sid, None)
+        if retry:
+            log.info("TURNOVER_QUOTE_RECOVERED | user=%s symbol=%s security_id=%s attempts=%s source=%s",
+                     self.uid, self.book.symbols[sid], sid, retry["attempts"],
+                     self.book.quotes[self.book.symbols[sid]]["source"])
+
+    def schedule_retry(self, sid, now):
+        attempts = self.retries.get(sid, {}).get("attempts", 0) + 1
+        delay = (5, 10, 20, 60)[min(attempts - 1, 3)]
+        self.retries[sid] = {"attempts": attempts, "due": now + delay}
+
+    async def refresh_once(self):
+        now = time.time()
+        if not self.book.connected or not equity_session_open() or now < self.blocked_until:
+            return
+        priority = set()
+        redis = getattr(self.store, "redis", None)
+        if redis is not None:
+            key = f"turnover:refresh:{self.uid}"
+            async with redis.pipeline(transaction=True) as pipe:
+                pipe.zrangebyscore(key, now - 10, now)
+                pipe.zremrangebyscore(key, "-inf", now)
+                values, _ = await pipe.execute()
+            priority = {self.book.universe[s] for s in values if s in self.book.universe}
+        pending = {r["security_id"] for r in self.book.pending(now)}
+        ids = [sid for sid in self.book.universe.values()
+               if (self.retries.get(sid, {}).get("due", 0) <= now
+                   if sid in pending or sid in self.retries else self.next_refresh.get(sid, 0) <= now)]
+        ids.sort(key=lambda sid: (sid not in priority, sid not in pending))
+        for offset in range(0, len(ids), 1000):
+            if not self.book.connected or not equity_session_open():
+                return
+            # Background refreshes always yield to foreground order/exit quotes.
+            if not await reserve_quote_slot(self.store, self.uid, background=True):
+                return
+            batch = ids[offset:offset + 1000]
+            started, generation = time.time(), self.generation
             try:
-                if self.book.connected and equity_session_open():
-                    ids = list(self.book.universe.values())
-                    for offset in range(0, len(ids), 1000):
-                        # Risk/order quote requests take precedence over ranking.
-                        if not await reserve_quote_slot(self.store, self.uid, background=True):
-                            await asyncio.sleep(2)
-                            continue
-                        started, generation = time.time(), self.generation
-                        response = await self.client.post("https://api.dhan.co/v2/marketfeed/quote",
-                            headers={"client-id": self.credentials["client_id"],
-                                     "access-token": self.credentials["access_token"]},
-                            json={"NSE_EQ": [int(sid) for sid in ids[offset:offset + 1000]]})
-                        if response.status_code == 429:
-                            log.warning("TURNOVER_QUOTE_THROTTLED | user=%s", self.uid)
-                            await asyncio.sleep(60)
-                            break
-                        response.raise_for_status()
-                        payload = response.json()
-                        if payload.get("status") != "success":
-                            raise ValueError("TURNOVER_QUOTE_FAILED")
-                        rows = (payload.get("data") or {}).get("NSE_EQ")
-                        if not isinstance(rows, dict):
-                            raise ValueError("TURNOVER_QUOTE_SCHEMA_INVALID")
-                        if generation == self.generation and self.book.connected:
-                            for sid, quote in rows.items():
-                                if isinstance(quote, dict):
-                                    self.book.update(sid, quote.get("last_price"), quote.get("volume"), started,
-                                                     trade_at=rest_trade_epoch(quote.get("last_trade_time")))
-                        await asyncio.sleep(1.25)
-                await asyncio.sleep(45)
+                response = await self.client.post("https://api.dhan.co/v2/marketfeed/quote",
+                    headers={"client-id": self.credentials["client_id"],
+                             "access-token": self.credentials["access_token"]},
+                    json={"NSE_EQ": [int(sid) for sid in batch]})
+                if response.status_code == 429:
+                    self.blocked_until = time.time() + 60
+                    log.warning("TURNOVER_QUOTE_THROTTLED | user=%s", self.uid)
+                    return
+                response.raise_for_status()
+                payload = response.json()
+                if payload.get("status") != "success":
+                    raise ValueError("TURNOVER_QUOTE_FAILED")
+                rows = (payload.get("data") or {}).get("NSE_EQ")
+                if not isinstance(rows, dict):
+                    raise ValueError("TURNOVER_QUOTE_SCHEMA_INVALID")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 log.warning("TURNOVER_QUOTE_FAILED | user=%s type=%s", self.uid, type(exc).__name__)
+                if generation == self.generation:
+                    for sid in batch:
+                        self.book.reject(sid, "REST_REQUEST_FAILED")
+                        self.schedule_retry(sid, time.time())
+                self.blocked_until = time.time() + 5
+                return
+            if generation != self.generation or not self.book.connected:
+                return
+            failed = []
+            for sid in batch:
+                quote = rows.get(sid)
+                if isinstance(quote, dict):
+                    accepted = self.book.update(sid, quote.get("last_price"), quote.get("volume"), started,
+                        trade_at=rest_trade_epoch(quote.get("last_trade_time")), source="DHAN_REST")
+                else:
+                    accepted = self.book.reject(sid, "REST_QUOTE_MISSING")
+                self.next_refresh[sid] = time.time() + 45
+                # A newer websocket quote may have overtaken this REST request.
+                current = self.book.quotes.get(self.book.symbols[sid])
+                fresh = current and 0 <= time.time() - current["ts"] <= QUOTE_MAX_AGE
+                if accepted or fresh:
+                    self.recovered(sid)
+                else:
+                    self.schedule_retry(sid, time.time())
+                    failed.append({"symbol": self.book.symbols[sid], "security_id": sid,
+                                   "reason": self.book.rejections.get(self.book.symbols[sid]),
+                                   **self.retries[sid]})
+            if failed:
+                log.warning("TURNOVER_RETRY_PENDING | user=%s count=%s sample=%s", self.uid, len(failed), failed[:20])
+            await asyncio.sleep(1.25)
+
+    async def refresh_quotes(self):
+        while True:
+            try:
+                await self.refresh_once()
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("TURNOVER_REFRESH_FAILED | user=%s type=%s", self.uid, type(exc).__name__)
                 await asyncio.sleep(30)
 
     async def stop(self):
@@ -193,8 +260,9 @@ async def run_worker(store, client):
                     raise RuntimeError("TURNOVER_WORKER_LEASE_LOST")
                 status = (snapshot["ready"], snapshot["reason"])
                 if status != session.last_status or time.monotonic() - session.last_status_at >= 60:
-                    log.info("TURNOVER_RANK_STATUS | user=%s ready=%s covered=%s total=%s reason=%s",
-                             uid, snapshot["ready"], snapshot["covered"], snapshot["total"], snapshot["reason"])
+                    log.info("TURNOVER_RANK_STATUS | user=%s ready=%s covered=%s total=%s reason=%s state=%s missing=%s stale=%s sample=%s",
+                             uid, snapshot["ready"], snapshot["covered"], snapshot["total"], snapshot["reason"],
+                             snapshot["state"], snapshot["missing_count"], snapshot["stale_count"], snapshot["missing"][:20])
                     session.last_status, session.last_status_at = status, time.monotonic()
             await asyncio.sleep(2)
     finally:

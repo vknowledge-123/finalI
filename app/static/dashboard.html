@@ -2559,8 +2559,9 @@
         const response = await fetch(`/api/turnover/top?user_id=${USER_ID}&limit=${limit}`);
         const data = await readJsonResponse(response);
         if (data.error) throw new Error(data.error);
-        status.textContent = `${data.ready ? 'Ready' : data.reason || 'Not ready'} | ${data.covered || 0}/${data.total || 0} stocks`;
-        ranks.innerHTML = (data.rows || []).map(row => `<li>#${Number(row.rank)} ${escapeHtml(row.symbol)}: INR ${Number(row.turnover).toLocaleString('en-IN', {maximumFractionDigits: 2})}</li>`).join('');
+        const state = data.state || (data.ready ? 'COMPLETE' : 'UNAVAILABLE');
+        status.textContent = `${state} | ${data.covered || 0}/${data.total || 0} stocks | Missing: ${data.missing_count || 0} | Stale: ${data.stale_count || 0}${state === 'PARTIAL' ? ' | Ranking among observed stocks' : ''}${!data.ready ? ' | ' + (data.reason || 'Not ready') : ''}`;
+        ranks.innerHTML = (data.rows || []).map(row => `<li>#${Number(row.rank)} ${escapeHtml(row.symbol)}: INR ${Number(row.turnover).toLocaleString('en-IN', {maximumFractionDigits: 2})}${row.stale ? ' (STALE)' : ''}</li>`).join('');
       } catch (error) {
         status.textContent = 'Turnover ranking unavailable';
       }

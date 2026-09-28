@@ -93,9 +93,19 @@ def main():
                         "rows": [{"symbol": "TESTSTOCK", "rank": 1, "turnover": 2500000}],
                     }))
                     page.get_by_role("button", name="Refresh Turnover Ranking", exact=True).click()
-                    expect(page.locator("#turnover_status")).to_have_text("Ready | 3200/3200 stocks")
+                    expect(page.locator("#turnover_status")).to_have_text("COMPLETE | 3200/3200 stocks | Missing: 0 | Stale: 0")
                     expect(page.locator("#turnover_ranks")).to_contain_text("TESTSTOCK")
                     page.screenshot(path=str(artifacts / f"paper-turnover-{width}.png"))
+                    page.unroute("**/api/turnover/top?*")
+                    page.route("**/api/turnover/top?*", lambda route: route.fulfill(json={
+                        "ready": True, "state": "PARTIAL", "covered": 2960, "total": 2961,
+                        "missing_count": 1, "stale_count": 0,
+                        "rows": [{"symbol": "TESTSTOCK", "rank": 1, "turnover": 2500000}],
+                    }))
+                    page.get_by_role("button", name="Refresh Turnover Ranking", exact=True).click()
+                    expect(page.locator("#turnover_status")).to_contain_text("PARTIAL | 2960/2961")
+                    expect(page.locator("#turnover_status")).to_contain_text("Ranking among observed stocks")
+                    page.screenshot(path=str(artifacts / f"turnover-partial-{width}.png"))
                     page.unroute("**/api/turnover/top?*")
                     page.locator("#cfg_prod").select_option("CNC")
                     page.locator("#cfg_qtymode").select_option("QTY")

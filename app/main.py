@@ -3248,7 +3248,7 @@ async def get_top_turnover(user_id: int = 1, limit: int = Query(10, ge=1, le=500
     from .turnover import SNAPSHOT_MAX_AGE
     snapshot = await store.load_turnover_snapshot(user_id)
     if not snapshot or not 0 <= time.time() - float(snapshot.get("ts", 0)) <= SNAPSHOT_MAX_AGE:
-        return {"ready": False, "reason": "TURNOVER_RANK_STALE", "rows": [], "covered": 0, "total": 0}
+        return {"ready": False, "state": "UNAVAILABLE", "reason": "TURNOVER_RANK_STALE", "rows": [], "covered": 0, "total": 0}
     return {**snapshot, "rows": snapshot.get("rows", [])[:limit]}
 
 

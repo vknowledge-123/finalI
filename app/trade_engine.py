@@ -2808,7 +2808,7 @@ class TradeEngine:
                 ranked: List[tuple] = []
 
                 if cfg.turnover_filter_on:
-                    from .turnover import turnover_decision
+                    from .turnover import candidate_turnover_decision
                     if self.broker != "DHAN":
                         results.append({"symbol": sym, "status": "SKIPPED", "reason": "TURNOVER_REQUIRES_DHAN"})
                         continue
@@ -2816,7 +2816,8 @@ class TradeEngine:
                         snapshot = await self.store.load_turnover_snapshot(self.user_id)
                     except Exception:
                         snapshot = {}
-                    allowed_turnover, reason = turnover_decision(snapshot, sym, cfg.turnover_top_n)
+                    allowed_turnover, reason = await candidate_turnover_decision(
+                        self.store, self.user_id, snapshot, sym, cfg.turnover_top_n)
                     if not allowed_turnover:
                         results.append({"symbol": sym, "status": "SKIPPED", "reason": reason})
                         continue

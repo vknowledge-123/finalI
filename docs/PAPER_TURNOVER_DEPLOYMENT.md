@@ -94,19 +94,67 @@ poll, normally within 10 seconds. Disconnect, token change, day rollover, config
 disable and process failure invalidate ranking availability. A process crash
 leaves at most a short lease/snapshot TTL, not a permanent stale rank.
 
-The ranking requires coverage for the entire eligible universe, not just alert
-stocks. Every quote must be at most 120 seconds old. Nonzero volume must have a
+The service subscribes to the entire eligible universe, not just alert stocks.
+Each valid websocket quote updates the book; REST continues to fill gaps.
+Every qualifying quote must be at most 120 seconds old. Nonzero volume must have a
 same-day exchange trade timestamp. Zero-volume REST quotes may establish quiet
 stocks with turnover zero, but those cannot qualify for entry. Out-of-order
 updates and decreasing same-day cumulative volumes are rejected.
 
 Snapshots expire in Redis after 15 seconds; the entry gate requires age <=10
 seconds and today's IST date/session. It checks again immediately before
-submission. Missing/stale/incomplete/disconnected data skips entries; it never
-silently disables the filter. If even one eligible stock has no valid quote,
-coverage remains incomplete: check the ranking status instead of loosening
-safety automatically. Individual rank ordering is as-of the last received
-quotes, not a simultaneous exchange-wide snapshot.
+submission. Stale snapshots and disconnected feeds block entries. Individual
+rank ordering is as-of the last received quotes, not a simultaneous exchange-wide
+snapshot.
+
+### Partial coverage and missing-stock retries
+
+The default policy now permits partial rankings at **99% fresh coverage**.
+For example, 2,953 valid quotes out of 2,961 are sufficient; the remaining eight
+do not block unrelated fresh candidates. Missing data is never treated as zero
+volume. Partial rankings are explicitly **among observed stocks**, not guaranteed
+Top N across the entire eligible market: an unobserved stock might rank higher.
+
+The deployment-wide policy is configurable in `/etc/ashuchart.env`:
+
+```dotenv
+TURNOVER_ALLOW_PARTIAL=1
+TURNOVER_MIN_COVERAGE_PCT=99
+```
+
+These defaults apply without adding variables. Set `TURNOVER_ALLOW_PARTIAL=0`
+or the threshold to `100` for the old full-coverage-only policy. A percentage
+outside 1..100, nonfinite number or malformed toggle is rejected. Restart the
+turnover service after changing policy; all alerts use the worker's policy.
+
+States are `WARMING_UP` (insufficient coverage), `PARTIAL` (threshold met),
+`COMPLETE` (100%) and `UNAVAILABLE` (closed session or disconnected/stale worker).
+The configuration ranking display reports state, coverage, missing count and
+stale count. It updates when Refresh Turnover Ranking is clicked; the worker
+continues publishing independently every two seconds.
+
+Missing/invalid quotes get targeted REST retries with 5, 10, 20, then 60-second
+backoff. The retry timer starts after each response; these are earliest retry
+times, not guaranteed deadlines. Healthy quotes retain the roughly 45-second
+REST refresh. Batches stay at or below 1,000 IDs and use the shared quote budget;
+foreground order/exit requests take precedence. A 429 pauses requests for at
+least 60 seconds. Broker/API errors never manufacture a quote. A successful
+websocket or REST update removes the stock from the retry list.
+
+Previously observed stale stocks remain in rank order with a `stale` flag. They
+cannot silently disappear and promote another stock. An otherwise qualifying
+candidate is blocked with `TURNOVER_TOP_N_STALE` if any retained Top N record
+is stale. Stale lower-ranked records can coexist with usable fresh leaders,
+subject to minimum coverage; their actual current rank is still uncertain.
+The candidate's own quote must always be fresh.
+
+An alert whose candidate is missing requests a targeted refresh through Redis
+and waits at most five seconds for a usable snapshot, without fetching quotes
+inside the execution service. Existing retry backoff and rate limits still
+apply; if no valid result arrives, the alert is skipped, not placed blindly or
+queued indefinitely. A stale Top N blocker is also requested for refresh. The
+turnover gate is checked again at submission. Existing position exits are not
+changed or triggered by turnover rank changes.
 
 Turnover filtering currently requires Dhan as the selected data broker. With
 Zerodha selected it returns `TURNOVER_REQUIRES_DHAN`. Paper execution itself
@@ -163,18 +211,26 @@ systemctl show ashuchart-turnover -p PartOf -p ActiveState --no-pager
 
 Press Ctrl+C to stop following logs. Expected log events include
 `TURNOVER_UNIVERSE_READY`, `TURNOVER_SUBSCRIBED`, `TURNOVER_CONNECTION` and
-`TURNOVER_RANK_STATUS`. Subscription sent is not proof of complete quote coverage.
+`TURNOVER_RANK_STATUS`. Status logs include a bounded sample of missing/stale
+symbols, security IDs and the last validation reason. `TURNOVER_RETRY_PENDING`
+reports retry attempts/due timestamps; `TURNOVER_QUOTE_RECOVERED` identifies
+recovery source. Subscription sent is not proof of complete quote coverage.
 
 While logged into the dashboard, the authenticated endpoint
 `/api/turnover/top?user_id=1&limit=10` returns `ready`, `reason`, `covered`,
 `total`, timestamp and rows containing rank, symbol, security ID, LTP, cumulative
-volume and turnover. A plain terminal curl without the admin cookie returns
+volume, turnover, `source` (`DHAN_WS` or `DHAN_REST`) and `stale`. It also returns
+`state`, `coverage_pct`, `missing_count`, `stale_count`, `ranking_scope` and a
+`missing` list with reasons. `missing_count` means never observed; `stale_count`
+means previously observed but currently too old. The `missing` list includes
+both categories for retries. A plain terminal curl without the admin cookie returns
 `ADMIN_AUTH_REQUIRED` as expected. The Redis key is `turnover:snapshot:1`.
 Never paste environment files, broker access tokens or Redis passwords in logs.
 
 Common skip reasons: `TURNOVER_RANK_STALE`, `TURNOVER_RANK_NOT_READY`,
 `TURNOVER_FEED_DISCONNECTED`, `TURNOVER_FNO_EXCLUDED`,
-`TURNOVER_SYMBOL_NOT_IN_UNIVERSE`, `TURNOVER_FILTER`, `TURNOVER_SESSION_CLOSED`.
+`TURNOVER_SYMBOL_NOT_IN_UNIVERSE`, `TURNOVER_FILTER`, `TURNOVER_SESSION_CLOSED`,
+`TURNOVER_QUOTE_MISSING`, `TURNOVER_TOP_N_STALE`.
 
 ## References and verification scope
 
