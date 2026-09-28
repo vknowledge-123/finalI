@@ -7,6 +7,8 @@ function element(value = '') {
   return {value, innerHTML: '', textContent: '', children: [], style: {}, dataset: {},
     classList: {add() {}, remove() {}, toggle() {}, contains() {return false;}},
     appendChild(child) {this.children.push(child);}, setAttribute() {},
+    append(...children) {this.children.push(...children);},
+    replaceChildren(...children) {this.children = children;},
     addEventListener() {}, querySelectorAll() {return [];}, remove() {}, focus() {}};
 }
 const elements = Object.fromEntries(Object.entries(fixture.fields).map(([k,v]) => [k, element(v)]));
@@ -19,11 +21,11 @@ const context = vm.createContext({
   WebSocket: class {constructor(url) {this.url = url;}},
   window: {location: {href: ''}, addEventListener() {}}, navigator: {},
   document: {getElementById: id => elements[id] || null, createElement: () => element(),
-    addEventListener() {}, querySelectorAll() {return [];}, body: element()},
+    addEventListener() {}, querySelector() {return element();}, querySelectorAll() {return [];}, body: element()},
   fetch: async (url, options = {}) => {
     if (url.startsWith('/api/alert-config')) {
       if (options.method === 'POST') saved.push(JSON.parse(options.body));
-      return response(options.method === 'POST' ? {ok: true} : fixture.configs);
+      return response(options.method === 'POST' ? {status: 'saved', config: {alert_name: Object.keys(fixture.configs.configs)[0]}} : fixture.configs);
     }
     if (url.startsWith('/api/positions')) return response({positions: []});
     return response({ok: true, config: {}});

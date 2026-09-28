@@ -46,7 +46,7 @@ def main():
                     page = context.new_page()
                     errors = []
                     page.on("pageerror", lambda error: errors.append(str(error)))
-                    loaded = page.goto(f"http://127.0.0.1:{port}/dashboard", wait_until="domcontentloaded")
+                    loaded = page.goto(f"http://127.0.0.1:{port}/dashboard", wait_until="load")
                     assert loaded.status == 200, (loaded.status, page.url)
                     page.wait_for_function("typeof openCfg === 'function' && typeof formatPrice === 'function'")
                     assert page.evaluate("typeof formatPrice") == "function", (page.url, errors, page.title(), page.locator('body').inner_text()[:200])
@@ -56,12 +56,17 @@ def main():
                     if width < 640:
                         page.locator("#topbarMoreBtn").click()
                     page.locator('button[onclick="openCfg()"]').click()
+                    expect(page.locator('#cfgHome')).to_be_visible()
+                    expect(page.locator('#cfgEditor')).to_be_hidden()
+                    expect(page.locator('#cfgSaved')).to_be_hidden()
+                    page.screenshot(path=str(artifacts / f'strategy-choice-{width}.png'), animations='disabled')
                     webhook_route = "**/api/webhook-url?*"
                     page.route(webhook_route, lambda route: route.fulfill(json={
                         "ok": True, "url": "http://192.0.2.10/webhook/chartink?user_id=1&secret=test-secret",
                         "base_url_source": "PUBLIC_BASE_URL", "secret_required": True,
                     }))
                     page.evaluate("openCfg()")
+                    page.get_by_role('button', name='Create New Strategy', exact=True).click()
                     expect(page.locator("#webhook_url_status")).to_contain_text("Verify PUBLIC_BASE_URL")
                     expect(page.locator("#webhook_url_status")).to_contain_text("http://192.0.2.10")
                     assert "test-secret" not in page.locator("#webhook_url_status").inner_text()
@@ -70,6 +75,7 @@ def main():
                     page.route(webhook_route, lambda route: route.fulfill(
                         status=502, content_type="text/html", body="<h1>Bad Gateway</h1>"))
                     page.evaluate("openCfg()")
+                    page.get_by_role('button', name='Create New Strategy', exact=True).click()
                     expect(page.locator("#webhook_copy")).to_be_disabled()
                     expect(page.locator("#webhook_url")).to_have_value("")
                     expect(page.locator("#webhook_url_status")).to_contain_text("Could not load")
@@ -79,6 +85,7 @@ def main():
                         "base_url_source": "REQUEST", "secret_required": True,
                     }))
                     page.evaluate("openCfg()")
+                    page.get_by_role('button', name='Create New Strategy', exact=True).click()
                     expect(page.locator("#webhook_copy")).to_be_enabled()
                     expect(page.locator("#webhook_url_status")).to_be_hidden()
                     page.unroute(webhook_route)
@@ -138,9 +145,11 @@ def main():
                     assert geometry and geometry["width"] <= width, geometry
                     with page.expect_response(lambda response: "/api/alert-config" in response.url
                                               and response.request.method == "POST") as response:
-                        page.get_by_role("button", name="Save Configuration", exact=True).click()
+                        page.get_by_role("button", name="Create Strategy", exact=True).click()
                     saved = response.value.json()
                     assert response.value.status == 200 and saved.get("status") == "saved", saved
+                    expect(page.locator('#cfgSaved')).to_be_visible()
+                    expect(page.locator('#cfgNotice')).to_contain_text('created')
                     configs = context.request.get(f"http://127.0.0.1:{port}/api/alert-config?user_id=1").json()
                     serialized = json.dumps(configs)
                     assert f"Browser Smoke {width}" in serialized, configs
@@ -163,7 +172,11 @@ def main():
                     page.wait_for_function("typeof openCfg === 'function' && typeof formatPrice === 'function'")
                     assert page.evaluate("typeof openCfg") == "function", (page.url, errors, page.title())
                     page.evaluate("openCfg()")
-                    page.evaluate("name => fillCfg(name)", config_key)
+                    page.get_by_role('button', name='Edit Existing Strategy', exact=True).click()
+                    page.get_by_role('searchbox', name='Search strategies').fill(f'Browser Smoke {width}')
+                    page.get_by_role('button', name=f'Edit Browser Smoke {width}', exact=True).click()
+                    expect(page.locator('#cfg_alert')).to_have_attribute('readonly', '')
+                    expect(page.get_by_role('button', name='Save Changes', exact=True)).to_be_visible()
                     expect(page.locator("#cfg_paper_on")).to_be_checked()
                     expect(page.locator("#cfg_turnover_on")).to_be_checked()
                     expect(page.locator("#cfg_turnover_topn")).to_have_value("10")
@@ -185,7 +198,59 @@ def main():
                     expect(page.locator("#cfg_telegram_token")).to_be_disabled()
                     assert page.locator("#cfg_cost_sl_on").input_value() == "true"
                     assert page.locator("#cfg_exit_alert_name").input_value() == f"Browser Exit {width}"
+                    page.once('dialog', lambda dialog: dialog.dismiss())
+                    page.get_by_role('button', name='Back', exact=True).click()
+                    expect(page.locator('#cfgEditor')).to_be_visible()
+                    expect(page.locator('#cfg_turnover_on')).not_to_be_checked()
+                    page.locator('#cfg_enabled').select_option('false')
+                    with page.expect_response(lambda response: '/api/alert-config' in response.url
+                                              and response.request.method == 'POST') as updated_response:
+                        page.get_by_role('button', name='Save Changes', exact=True).click()
+                    updated = updated_response.value.json()
+                    assert updated['status'] == 'saved', updated
+                    assert updated['config']['alert_name'] == config_key, updated
+                    assert updated['config']['enabled'] is False and updated['config']['qty'] == 2, updated
+                    expect(page.locator('#cfgNotice')).to_contain_text('updated')
+                    page.locator('#cfg_status_filter').select_option('active')
+                    expect(page.locator('#cfgList')).to_have_text('No matching strategies.')
+                    page.locator('#cfg_status_filter').select_option('paused')
+                    expect(page.get_by_role('button', name=f'Edit Browser Smoke {width}', exact=True)).to_be_visible()
+                    page.locator('#cfg_search').fill('no matching strategy')
+                    expect(page.locator('#cfgList')).to_have_text('No matching strategies.')
+                    page.locator('#cfg_search').fill(f'Browser Smoke {width}')
+                    page.screenshot(path=str(artifacts / f'strategy-list-{width}.png'), animations='disabled')
+                    page.get_by_role('button', name=f'Edit Browser Smoke {width}', exact=True).click()
+                    expect(page.locator('#cfg_enabled')).to_have_value('false')
+                    expect(page.locator('#cfg_qty')).to_have_value('2')
+                    page.get_by_role('button', name='Back', exact=True).click()
+                    expect(page.locator('#cfgSaved')).to_be_visible()
+                    page.get_by_role('button', name='Back', exact=True).click()
+                    expect(page.locator('#cfgHome')).to_be_visible()
+                    page.get_by_role('button', name='Create New Strategy', exact=True).click()
+                    expect(page.locator('#cfg_alert')).to_have_value('')
+                    expect(page.locator('#cfg_paper_on')).not_to_be_checked()
+                    expect(page.locator('#cfg_enabled')).to_have_value('true')
+                    expect(page.locator('#cfg_tgt')).to_have_value('')
+                    expect(page.locator('#cfg_telegram_token_status')).to_have_text('')
+                    expect(page.locator('#cfg_high_break_on')).not_to_be_checked()
+                    expect(page.locator('#cfgFields')).not_to_be_disabled()
+                    page.locator('#cfg_alert').fill(f'Browser Smoke {width}')
+                    page.locator('#cfg_qtymode').select_option('QTY')
+                    page.locator('#cfg_qty').fill('1')
+                    page.get_by_role('button', name='Create Strategy', exact=True).click()
+                    expect(page.locator('#cfgNotice')).to_contain_text('already exists')
+                    expect(page.locator('#cfgEditor')).to_be_visible()
+                    page.locator('#cfg_alert').fill(f'Unsaved {width}')
+                    page.route('**/api/alert-config', lambda route: route.fulfill(
+                        status=500, json={'error': 'TEST_SAVE_FAILURE'}) if route.request.method == 'POST' else route.continue_())
+                    page.get_by_role('button', name='Create Strategy', exact=True).click()
+                    expect(page.locator('#cfgNotice')).to_contain_text('TEST_SAVE_FAILURE')
+                    expect(page.locator('#cfg_alert')).to_have_value(f'Unsaved {width}')
+                    expect(page.get_by_role('button', name='Create Strategy', exact=True)).to_be_enabled()
+                    page.unroute('**/api/alert-config')
+                    page.once('dialog', lambda dialog: dialog.accept())
                     page.evaluate("closeCfg()")
+                    expect(page.locator('#cfgModal')).to_be_hidden()
                     watch = {"id": f"browser-watch-{width}", "user_id": 1, "symbol": "WATCHTEST",
                              "side": "BUY", "level": "100.10", "expires_at": time.time() + 120, "phase": "WAITING"}
 

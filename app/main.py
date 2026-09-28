@@ -2788,6 +2788,11 @@ async def save_alert_config(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     # Normalize key consistently
     alert_name = normalize_alert_name(raw_name)
+    config_action = payload.get("config_action")
+    if config_action is not None and config_action not in ("create", "update"):
+        return {"error": "CONFIG_ACTION_INVALID"}
+    if config_action == "update" and normalize_alert_name(payload.get("original_alert_name") or "") != alert_name:
+        return {"error": "STRATEGY_IDENTITY_MISMATCH", "message": "Strategy names cannot be changed while editing."}
     exit_alert_enabled = str(payload.get("exit_alert_enabled", "false")).lower() in {"1", "true", "yes", "on"}
     exit_alert_raw = str(payload.get("exit_alert_name_raw") or payload.get("exit_alert_name") or payload.get("exit_alert") or "").strip()
     exit_alert_name = normalize_alert_name(exit_alert_raw) if exit_alert_raw else ""
@@ -2915,7 +2920,13 @@ async def save_alert_config(payload: Dict[str, Any]) -> Dict[str, Any]:
     try:
         existing = await store.get_alert_config(user_id, alert_name)
     except Exception:
+        if config_action:
+            return {"error": "CONFIG_READ_FAILED", "message": "Could not verify the saved strategy. Please retry."}
         existing = None
+    if config_action == "create" and existing:
+        return {"error": "STRATEGY_ALREADY_EXISTS", "message": "This strategy already exists. Use Edit Existing Strategy."}
+    if config_action == "update" and not existing:
+        return {"error": "STRATEGY_NOT_FOUND", "message": "This strategy no longer exists. Refresh the saved-strategy list."}
     if existing:
         existing_raw = str(existing.get("alert_name_raw") or existing.get("alert_name") or "").strip()
         incoming_raw = str(raw_name or "").strip()
@@ -2933,6 +2944,8 @@ async def save_alert_config(payload: Dict[str, Any]) -> Dict[str, Any]:
     except ValueError as exc:
         return {"error": str(exc)}
     payload2 = dict(payload)
+    payload2.pop("config_action", None)
+    payload2.pop("original_alert_name", None)
     payload2.pop("telegram_bot_token", None)
     payload2.pop("telegram_token_set", None)
     payload2.update(features)
@@ -2952,7 +2965,13 @@ async def save_alert_config(payload: Dict[str, Any]) -> Dict[str, Any]:
     payload2["cost_sl_enabled"] = cost_sl_enabled
     payload2["cost_sl_rr"] = cost_sl_rr
 
-    await store.save_alert_config(user_id, payload2)
+    try:
+        if config_action:
+            await store.save_alert_config(user_id, payload2, action=config_action)
+        else:
+            await store.save_alert_config(user_id, payload2)
+    except ValueError as exc:
+        return {"error": str(exc)}
     
     # Log top sectors if sector filter is enabled
     if str(payload2.get("sector_filter_on", payload2.get("sector_on", "false"))).lower() == "true":

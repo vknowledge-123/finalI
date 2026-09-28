@@ -889,13 +889,27 @@ class RedisStore:
 
         return out
 
-    async def save_alert_config(self, user_id: int, cfg: Dict[str, Any]) -> None:
+    async def save_alert_config(self, user_id: int, cfg: Dict[str, Any], *, action=None) -> None:
         key = normalize_alert_name(cfg.get("alert_name", ""))
         if not key:
             return
         # ensure enabled is bool
         cfg["enabled"] = bool(cfg.get("enabled", True))
         data = json.dumps(cfg)
+        if action is not None:
+            if action not in ("create", "update"):
+                raise ValueError("CONFIG_ACTION_INVALID")
+            result = await self.redis.eval("""
+                local exists = redis.call('HEXISTS', KEYS[1], ARGV[1]) == 1
+                    or redis.call('HEXISTS', KEYS[2], ARGV[1]) == 1
+                if ARGV[3] == 'create' and exists then return -1 end
+                if ARGV[3] == 'update' and not exists then return -2 end
+                redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+                return 1
+            """, 2, k_alert_cfg(user_id), k_alert_cfg_legacy(user_id), key, data, action)
+            if result != 1:
+                raise ValueError("STRATEGY_ALREADY_EXISTS" if result == -1 else "STRATEGY_NOT_FOUND")
+            return
         await self.redis.hset(k_alert_cfg(user_id), key, data)
 
     async def delete_alert_config(self, user_id: int, alert_name: str) -> bool:

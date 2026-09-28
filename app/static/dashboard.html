@@ -550,6 +550,23 @@
       overflow: auto;
     }
 
+    #cfgModal .cfg-header { gap: 12px; padding-right: 40px; }
+    #cfgModal .cfg-header h3 { overflow-wrap: anywhere; }
+    .cfg-choice { display: flex; align-items: center; gap: 14px; width: 100%; padding: 20px 12px; text-align: left; border-bottom: 1px solid #334155; }
+    .cfg-choice:hover, .cfg-choice:focus-visible { background: #164e6326; }
+    .cfg-choice i { width: 24px; color: #67e8f9; text-align: center; }
+    .cfg-strategy-row { display: flex; align-items: center; gap: 8px; border-bottom: 1px solid #334155; }
+    .cfg-strategy-open { min-width: 0; flex: 1; padding: 14px 4px; text-align: left; }
+    .cfg-strategy-open:hover, .cfg-strategy-open:focus-visible { background: #164e6326; }
+    .cfg-strategy-name { font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
+    .cfg-strategy-meta { display: flex; flex-wrap: wrap; gap: 6px 12px; margin-top: 6px; font-size: 12px; color: #cbd5e1; }
+    #cfgSaved .cfg-list-tools { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0 8px; }
+    #cfg_search { flex: 1 1 180px; min-width: 0; }
+    #cfg_status_filter { flex: 0 1 120px; }
+    #cfgEditor, #cfgFields { min-width: 0; }
+    #cfgModal [hidden] { display: none !important; }
+    #cfgModal[data-view="home"] > .relative { align-items: center !important; }
+
     #cfgModal .input-field {
       padding: 0.4rem 0.6rem;
       font-size: 0.8rem;
@@ -1458,20 +1475,35 @@
   </div>
 
   <!-- Config Modal -->
-  <div id="cfgModal" class="fixed inset-0 z-[100] hidden overflow-y-auto">
+  <div id="cfgModal" role="dialog" aria-modal="true" aria-labelledby="cfgTitle" class="fixed inset-0 z-[100] hidden overflow-y-auto">
     <div class="fixed inset-0 bg-black/80 backdrop-blur-sm transition-opacity" onclick="closeCfg()"></div>
     <div class="relative min-h-screen flex items-center justify-center p-3">
       <div
         class="cfg-card rounded-2xl p-3 border border-white/10 shadow-2xl w-full max-w-3xl relative animate-enter my-3 bg-[#0f172a]">
         <div class="cfg-header flex items-center justify-between mb-2">
           <button onclick="closeCfg()" aria-label="Close strategy configuration" class="absolute top-5 right-5 text-slate-400 hover:text-white">✕</button>
-          <div>
-            <h3 class="text-base font-bold text-white">Strategy Configuration</h3>
-            <p class="text-[9px] text-slate-400">Define parameters for your Chartink alerts.</p>
+          <button id="cfgBack" type="button" onclick="backCfg()" hidden title="Back" aria-label="Back" class="btn btn-secondary px-3 py-2"><i class="fa-solid fa-arrow-left" aria-hidden="true"></i></button>
+          <div class="flex-1 min-w-0">
+            <h3 id="cfgTitle" class="text-base font-bold text-white">Configure Alert</h3>
+            <p id="cfgSubtitle" class="text-xs text-slate-400"></p>
           </div>
         </div>
 
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-2">
+        <div id="cfgNotice" role="status" class="text-sm text-emerald-300 my-3 break-words" hidden></div>
+        <div id="cfgHome">
+          <button type="button" class="cfg-choice" onclick="showSavedCfg()"><i class="fa-solid fa-pen-to-square" aria-hidden="true"></i><span class="flex-1">Edit Existing Strategy</span><i class="fa-solid fa-chevron-right" aria-hidden="true"></i></button>
+          <button type="button" class="cfg-choice" onclick="newCfg()"><i class="fa-solid fa-plus" aria-hidden="true"></i><span class="flex-1">Create New Strategy</span><i class="fa-solid fa-chevron-right" aria-hidden="true"></i></button>
+        </div>
+        <div id="cfgSaved" hidden>
+          <div class="cfg-list-tools">
+            <input id="cfg_search" type="search" class="input-field" placeholder="Search strategies" aria-label="Search strategies" oninput="renderCfgList()">
+            <select id="cfg_status_filter" class="input-field" aria-label="Strategy status" onchange="renderCfgList()"><option value="all">All statuses</option><option value="active">Active</option><option value="paused">Paused</option></select>
+            <button type="button" onclick="loadCfgList()" class="btn btn-secondary px-3" title="Refresh strategies" aria-label="Refresh strategies"><i class="fa-solid fa-rotate-right" aria-hidden="true"></i></button>
+          </div>
+          <div id="cfgList" aria-live="polite"></div>
+        </div>
+        <div id="cfgEditor" hidden>
+        <fieldset id="cfgFields" class="grid grid-cols-1 md:grid-cols-2 gap-2">
           <div class="col-span-2">
             <label class="block text-xs font-semibold text-cyan-400 uppercase mb-1.5">Chartink Webhook URL</label>
             <div class="flex gap-2">
@@ -1991,18 +2023,12 @@
             </div>
             <p class="text-[10px] text-slate-500 mt-2">Default mode enters only on confirmed bullish/bearish ribbon flips. Trend Mode allows continuation entries while the ribbon remains in confirmed mode.</p>
           </div>
-        </div>
+        </fieldset>
 
         <div class="cfg-actions flex gap-2 mt-6 pt-4 border-t border-white/10">
-          <button onclick="saveCfg()" class="btn btn-primary flex-1 py-2 text-sm">Save Configuration</button>
-          <button onclick="loadCfgList()" class="btn btn-secondary py-2 text-sm">Reload</button>
+          <button id="cfgSave" onclick="saveCfg()" class="btn btn-primary flex-1 py-2 text-sm">Create Strategy</button>
+          <button id="cfgCancel" onclick="backCfg()" class="btn btn-secondary py-2 text-sm">Cancel</button>
         </div>
-
-        <div class="mt-4">
-          <h4 class="text-[10px] font-bold text-slate-500 uppercase mb-2">Saved Strategies</h4>
-          <div id="cfgList" class="space-y-1.5 max-h-32 overflow-y-auto pr-2">
-            <!-- Items injected by JS -->
-          </div>
         </div>
       </div>
 
@@ -2263,9 +2289,117 @@
     document.getElementById("cfg_topn").addEventListener("change", fetchTopSectors);
     document.getElementById("cfg_topn").addEventListener("keyup", fetchTopSectors);
 
-    function closeCfg() { document.getElementById("cfgModal").classList.add("hidden"); }
+    let cfgView = 'home', cfgEditingKey = null, cfgBaseline = '', cfgSaving = false, cfgNavigation = 0, cfgWebhookRequest = 0;
+    let cfgReturnFocus = null;
+    const cfgDefaults = [...document.querySelectorAll('#cfgEditor input[id^="cfg_"], #cfgEditor select')]
+      .map(el => ({ id: el.id, value: el.value, checked: el.checked }));
+    function cfgFormState() {
+      return JSON.stringify(cfgDefaults.map(({id}) => {
+        const el = document.getElementById(id);
+        return [id, el.value, el.type === 'checkbox' ? el.checked : null];
+      }));
+    }
+    function cfgCanLeave() {
+      return !cfgSaving && (document.getElementById('cfgModal').classList.contains('hidden') || cfgView !== 'editor' || cfgFormState() === cfgBaseline || confirm('Discard unsaved strategy changes?'));
+    }
+    function cfgMessage(text, error = false) {
+      const el = document.getElementById('cfgNotice');
+      el.textContent = text;
+      el.hidden = !text;
+      el.classList.toggle('text-rose-300', error);
+    }
+    function setCfgView(view) {
+      cfgView = view;
+      document.getElementById('cfgModal').dataset.view = view;
+      for (const [id, name] of [['cfgHome', 'home'], ['cfgSaved', 'saved'], ['cfgEditor', 'editor']]) {
+        document.getElementById(id).hidden = view !== name;
+      }
+      document.getElementById('cfgBack').hidden = view === 'home';
+      document.getElementById('cfgTitle').textContent = view === 'home' ? 'Configure Alert' : view === 'saved' ? 'Edit Existing Strategy' : cfgEditingKey ? 'Edit Strategy' : 'Create New Strategy';
+      document.getElementById('cfgSubtitle').textContent = view === 'editor' && cfgEditingKey ? document.getElementById('cfg_alert').value : '';
+      document.getElementById('cfgSave').textContent = cfgEditingKey ? 'Save Changes' : 'Create Strategy';
+      document.querySelector('#cfgModal .cfg-card').scrollTop = 0;
+      document.getElementById('cfgModal').scrollTop = 0;
+    }
+    function closeCfg() {
+      if (!cfgCanLeave()) return;
+      cfgNavigation++;
+      cfgWebhookRequest++;
+      document.getElementById('cfgModal').classList.add('hidden');
+      document.getElementById('cfg_telegram_token').value = '';
+      setCfgView('home');
+      cfgReturnFocus?.focus();
+    }
+    function backCfg() {
+      if (!cfgCanLeave()) return;
+      cfgNavigation++;
+      cfgMessage('');
+      const destination = cfgView === 'editor' && cfgEditingKey ? 'saved' : 'home';
+      setCfgView(destination);
+      if (destination === 'saved') renderCfgList();
+      document.querySelector(destination === 'saved' ? '#cfg_search' : '#cfgHome button').focus();
+    }
+    async function showSavedCfg() {
+      if (!cfgCanLeave()) return;
+      cfgNavigation++;
+      cfgMessage('');
+      setCfgView('saved');
+      document.getElementById('cfg_search').focus();
+      await loadCfgList();
+    }
+    function resetCfgForm() {
+      cfgEditingKey = null;
+      for (const saved of cfgDefaults) {
+        const el = document.getElementById(saved.id);
+        el.value = saved.value;
+        if (el.type === 'checkbox') el.checked = saved.checked;
+      }
+      document.getElementById('cfg_alert').readOnly = false;
+      document.getElementById('cfg_telegram_token_status').textContent = '';
+      document.getElementById('cfg_telegram_token').placeholder = 'BotFather token';
+      document.getElementById('turnover_status').textContent = '';
+      document.getElementById('turnover_ranks').replaceChildren();
+      toggleExitAlertFields(); toggleStrategyMode(); togglePartialProfitFields();
+    }
+    async function newCfg() {
+      if (!cfgCanLeave()) return;
+      const navigation = ++cfgNavigation;
+      cfgMessage('Loading settings...');
+      try {
+        const pnl = await loadPnlExitCfg();
+        if (navigation !== cfgNavigation) return;
+        resetCfgForm();
+        fillPnlExitForm(pnl);
+        cfgBaseline = cfgFormState();
+        setCfgView('editor');
+        cfgMessage('');
+        document.getElementById('cfg_alert').focus();
+      } catch (e) { if (navigation === cfgNavigation) cfgMessage(e.message || 'Could not load settings', true); }
+    }
+    window.addEventListener('beforeunload', event => {
+      if (cfgView === 'editor' && !document.getElementById('cfgModal').classList.contains('hidden') && cfgFormState() !== cfgBaseline) {
+        event.preventDefault(); event.returnValue = '';
+      }
+    });
+    document.getElementById('cfgModal').addEventListener('keydown', event => {
+      if (event.key === 'Escape') { event.preventDefault(); closeCfg(); }
+      if (event.key === 'Tab') {
+        const controls = [...document.querySelectorAll('#cfgModal button, #cfgModal input, #cfgModal select')]
+          .filter(el => !el.disabled && el.getClientRects().length);
+        const first = controls[0], last = controls[controls.length - 1];
+        if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+        else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+      }
+    });
     async function openCfg() {
+      if (!cfgCanLeave()) return;
+      cfgReturnFocus = document.activeElement;
+      cfgNavigation++;
+      const request = ++cfgWebhookRequest;
       document.getElementById("cfgModal").classList.remove("hidden");
+      cfgMessage('');
+      setCfgView('home');
+      document.querySelector('#cfgHome button').focus();
 
       const el = document.getElementById("webhook_url");
       const copyButton = document.getElementById("webhook_copy");
@@ -2279,6 +2413,7 @@
       try {
         const resp = await fetch(`/api/webhook-url?user_id=${USER_ID}`, { cache: "no-store" });
         const d = await readJsonResponse(resp);
+        if (request !== cfgWebhookRequest) return;
         if (!d || d.ok !== true || !d.url) throw new Error("WEBHOOK_URL_UNAVAILABLE");
         const destination = new URL(d.url);
         if (!["http:", "https:"].includes(destination.protocol) || destination.username || destination.password) {
@@ -2295,16 +2430,12 @@
           status.classList.remove("hidden");
         }
       } catch (e) {
+        if (request !== cfgWebhookRequest) return;
         el.placeholder = "Webhook URL unavailable";
         status.textContent = "Could not load the webhook URL. Check PUBLIC_BASE_URL and your admin session, then reopen Configure Alert.";
         status.classList.remove("hidden");
       }
 
-      loadCfgList();
-      loadPnlExitCfg();
-      toggleExitAlertFields();
-      toggleStrategyMode();
-      togglePartialProfitFields();
     }
 
     async function copyTextToClipboard(value) {
@@ -2621,14 +2752,11 @@
     }
 
     async function loadPnlExitCfg() {
-      try {
         const resp = await fetch(`/api/pnl-exit-config?user_id=${USER_ID}`);
         const d = await readJsonResponse(resp);
+        if (!resp.ok || d.error) throw new Error(d.detail || d.error || 'Could not load account risk settings');
         PNL_EXIT_CFG = d.config || null;
-        fillPnlExitForm(PNL_EXIT_CFG);
-      } catch (e) {
-        console.error("Failed to load P&L exit config", e);
-      }
+        return PNL_EXIT_CFG;
     }
 
     async function savePnlExitCfg() {
@@ -2643,94 +2771,86 @@
           method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload)
         });
         const d = await readJsonResponse(r);
-        if (d.error) throw new Error(d.detail || d.error);
+        if (!r.ok || d.error) throw new Error(d.detail || d.error || 'Account risk settings were not saved');
         PNL_EXIT_CFG = d.config || payload;
       } catch (e) {
         console.error("Failed to save P&L exit config", e);
+        throw e;
       }
     }
 
-      async function loadCfgList() {
-      const resp = await fetch(`/api/alert-config?user_id=${USER_ID}`);
-      const d = await readJsonResponse(resp);
-      const list = document.getElementById("cfgList");
-      list.innerHTML = "";
-      const cfgs = d.configs || {};
-      BACKTEST_CONFIGS = cfgs;
-      fillBacktestConfigOptions();
-
-      if (Object.keys(cfgs).length === 0) {
-        list.innerHTML = `<div class="text-xs text-slate-500 text-center py-4">No saved strategies found.</div>`;
-        return;
+    let cfgListRequest = 0;
+    async function loadCfgList() {
+      const request = ++cfgListRequest;
+      const list = document.getElementById('cfgList');
+      list.textContent = 'Loading strategies...';
+      try {
+        const resp = await fetch(`/api/alert-config?user_id=${USER_ID}`, {cache: 'no-store'});
+        const d = await readJsonResponse(resp);
+        if (request !== cfgListRequest) return;
+        if (!resp.ok || d.error || !d.configs) throw new Error(d.detail || d.error || 'Could not load strategies');
+        BACKTEST_CONFIGS = d.configs;
+        fillBacktestConfigOptions();
+        renderCfgList();
+      } catch (e) {
+        if (request === cfgListRequest) list.textContent = e.message || 'Could not load strategies';
       }
-
-      Object.keys(cfgs).sort().forEach(k => {
-        const c = cfgs[k];
-        const div = document.createElement("div");
-        div.className = "group relative flex items-center justify-between p-4 rounded-xl bg-gradient-to-br from-slate-900/80 to-slate-800/80 border border-white/5 hover:border-cyan-500/30 hover:shadow-lg hover:shadow-cyan-900/20 transition-all duration-300 cursor-pointer overflow-hidden";
-
-        // Active indicator strip
-        const activeStrip = c.enabled ? `<div class="absolute left-0 top-0 bottom-0 w-1 bg-emerald-500 shadow-[0_0_10px_rgba(16,185,129,0.5)]"></div>` : `<div class="absolute left-0 top-0 bottom-0 w-1 bg-slate-700"></div>`;
-
-        div.onclick = () => fillCfg(k);
-        div.innerHTML = `
-          ${activeStrip}
-          <div class="pl-3">
-            <div class="flex items-center gap-2">
-               <div class="text-sm font-bold text-white group-hover:text-cyan-400 transition-colors">${escapeHtml(k)}</div>
-               ${c.enabled ? '<span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">ACTIVE</span>' : '<span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-slate-700/30 text-slate-500 border border-white/5">PAUSED</span>'}
-            </div>
-            <div class="text-[10px] text-slate-400 mt-1 font-mono flex flex-wrap gap-x-3 gap-y-1">
-              <span><span class="${c.direction === 'LONG' ? 'text-emerald-400' : 'text-rose-400'}">${c.direction}</span> • <span class="text-cyan-200">${c.product}</span></span>
-              <span>Engine: <span class="text-cyan-300">${c.strategy_mode === 'PRECISION_SNIPER' ? `SNIPER ${c.strategy_timeframe_minutes || 5}M` : c.strategy_mode === 'GMMA_OBV' ? `GMMA OBV ${c.strategy_timeframe_minutes || 5}M` : c.strategy_mode === 'GMMA_GOLD_CROSS' ? `GMMA GC ${c.strategy_timeframe_minutes || 5}M` : c.strategy_mode === 'LIQUIDITY_SWEEP' ? `LIQ SWEEP ${c.strategy_timeframe_minutes || 5}M` : c.strategy_mode === 'PURE_LIQUIDITY_SWEEP' ? `PURE LIQ ${c.strategy_timeframe_minutes || 5}M` : c.strategy_mode === 'GVK_TREND' ? `GVK ${c.strategy_timeframe_minutes || 5}M` : 'CLASSIC'}</span></span>
-              <span>Target: <span class="text-white">${c.target_pct}%</span></span>
-              <span>SL: <span class="text-rose-300">${c.stop_loss_pct}%</span></span>
-              <span>TSL: <span class="text-blue-300">${c.trailing_sl_enabled === false ? 'OFF' : `${c.trailing_sl_pct}%`}</span></span>
-              <span>Mode: <span class="text-slate-200">${c.tsl_stepwise ? 'STEP' : 'CONT'}</span></span>
-              ${c.cost_sl_enabled ? `<span>Cost SL: <span class="text-emerald-300">1:${c.cost_sl_rr ?? 2}</span></span>` : ''}
-              <span>Limit: <span class="text-yellow-200">${c.trade_limit_per_day}/day</span></span>
-              ${c.exit_alert_enabled ? `<span>Exit Alert: <span class="text-rose-300">${escapeHtml(c.exit_alert_name_raw || c.exit_alert_name)}</span></span>` : ''}
-              ${c.pyramid_enabled ? `<span>Pyramid: <span class="text-fuchsia-300">${c.pyramid_step_pct ?? 0.8}% x ${c.pyramid_max_adds ?? 3}</span></span>` : ''}
-              ${c.custom_partial_profit_enabled ? `<span>Partial: <span class="text-emerald-300">${c.custom_partial_tp1_pct ?? 50}%/${c.custom_partial_tp2_pct ?? 25}%/${c.custom_partial_tp3_pct ?? 25}%</span></span>` : ''}
-              ${c.sector_filter_on ? `<span>Sector: <span class="text-fuchsia-300">Top ${c.top_n_sector}</span></span>` : ''}
-              <span>${c.paper_trading ? 'PAPER' : 'LIVE'} TRADING</span>
-              ${c.turnover_filter_on ? `<span>Turnover: Top ${Number(c.turnover_top_n || 10)}</span>` : ''}
-            </div>
-          </div>
-        `;
-
-        // Wrapper for click handling separation
-        const wrapper = document.createElement("div");
-        wrapper.className = "flex items-center gap-2 w-full";
-
-        // Trash button
-        const delBtn = document.createElement("button");
-        delBtn.className = "p-1.5 rounded-md hover:bg-rose-500/20 text-slate-500 hover:text-rose-400 transition-colors z-10";
-        delBtn.innerHTML = `<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>`;
-        delBtn.onclick = (e) => {
-          e.stopPropagation(); // prevent filling form
-          deleteCfg(k);
-        };
-
-        div.appendChild(delBtn); // Append delete button
-
-        // Re-structure to have [Info Area (Clickable)] + [Delete Btn]
-        // But simply appending to div (relative) works if styled right. 
-        // Let's use flex in parent.
-        list.appendChild(div);
+    }
+    function renderCfgList() {
+      const list = document.getElementById('cfgList');
+      list.replaceChildren();
+      const search = document.getElementById('cfg_search').value.trim().toLowerCase();
+      const filter = document.getElementById('cfg_status_filter').value;
+      const keys = Object.keys(BACKTEST_CONFIGS).sort().filter(key => {
+        const c = BACKTEST_CONFIGS[key];
+        const active = c.enabled !== false;
+        return (c.alert_name_raw || key).toLowerCase().includes(search) && (filter === 'all' || (filter === 'active') === active);
       });
+      if (!keys.length) list.textContent = Object.keys(BACKTEST_CONFIGS).length ? 'No matching strategies.' : 'No saved strategies yet.';
+      for (const key of keys) {
+        const c = BACKTEST_CONFIGS[key], name = c.alert_name_raw || c.alert_name || key;
+        const row = document.createElement('div'); row.className = 'cfg-strategy-row';
+        const edit = document.createElement('button'); edit.type = 'button'; edit.className = 'cfg-strategy-open';
+        edit.setAttribute('aria-label', `Edit ${name}`); edit.onclick = () => fillCfg(key);
+        const title = document.createElement('div'); title.className = 'cfg-strategy-name'; title.textContent = name;
+        const meta = document.createElement('div'); meta.className = 'cfg-strategy-meta';
+        const labels = [c.enabled !== false ? 'ACTIVE' : 'PAUSED', c.paper_trading ? 'PAPER' : 'LIVE',
+          `${c.direction || 'LONG'} / ${c.product || 'MIS'}`, c.strategy_mode || 'CLASSIC',
+          `Target: ${c.target_pct ?? 0}%`, `SL: ${c.stop_loss_pct ?? 0}%`];
+        labels.forEach((text, index) => {
+          const span = document.createElement('span'); span.textContent = text;
+          if (index === 0) span.style.color = c.enabled !== false ? '#6ee7b7' : '#cbd5e1';
+          if (index === 1) span.style.color = c.paper_trading ? '#fcd34d' : '#fda4af';
+          meta.appendChild(span);
+        });
+        edit.append(title, meta);
+        const del = document.createElement('button'); del.type = 'button'; del.className = 'btn btn-secondary px-3 py-3';
+        del.title = `Delete ${name}`; del.setAttribute('aria-label', `Delete ${name}`);
+        del.innerHTML = '<i class="fa-solid fa-trash" aria-hidden="true"></i>';
+        del.onclick = () => deleteCfg(key);
+        row.append(edit, del); list.appendChild(row);
+      }
     }
 
     async function fillCfg(name) {
+      if (!cfgCanLeave()) return;
+      const navigation = ++cfgNavigation;
+      cfgMessage('Loading strategy...');
+      try {
       const resp = await fetch(`/api/alert-config?user_id=${USER_ID}`);
       const d = await readJsonResponse(resp);
       const c = (d.configs || {})[name];
-      if (!c) return;
+      if (!resp.ok || d.error || !c) throw new Error(d.detail || d.error || 'Strategy no longer exists. Refresh the list.');
+      const pnl = await loadPnlExitCfg();
+      if (navigation !== cfgNavigation) return;
+      resetCfgForm();
+      cfgEditingKey = name;
+      fillPnlExitForm(pnl);
 
       // Populate fields
       const displayName = c.alert_name_raw || c.alert_name || name;
       const sets = {
-        "cfg_alert": displayName, "cfg_enabled": String(!!c.enabled), "cfg_dir": c.direction,
+        "cfg_alert": displayName, "cfg_enabled": String(c.enabled !== false), "cfg_dir": c.direction,
         "cfg_exit_alert_on": String(!!c.exit_alert_enabled),
         "cfg_exit_alert_name": c.exit_alert_name_raw || c.exit_alert_name || "",
         "cfg_high_break_tf": c.high_break_timeframe_minutes ?? 1,
@@ -2867,7 +2987,7 @@
       };
       for (let k in sets) {
         const el = document.getElementById(k);
-        if (el) el.value = sets[k];
+        if (el && sets[k] !== undefined && sets[k] !== null) el.value = sets[k];
       }
       document.getElementById("cfg_high_break_on").checked = c.high_break_enabled === true;
       document.getElementById("cfg_paper_on").checked = c.paper_trading === true;
@@ -2880,11 +3000,20 @@
       toggleExitAlertFields();
       toggleStrategyMode();
       togglePartialProfitFields();
+      document.getElementById('cfg_alert').readOnly = true;
+      cfgBaseline = cfgFormState();
+      setCfgView('editor');
+      cfgMessage('');
+      document.getElementById('cfg_enabled').focus();
+      } catch (e) { if (navigation === cfgNavigation) cfgMessage(e.message || 'Could not load strategy', true); }
     }
 
     async function saveCfg() {
+      if (cfgSaving || cfgView !== 'editor') return;
       const payload = {
         user_id: USER_ID,
+        config_action: cfgEditingKey ? 'update' : 'create',
+        original_alert_name: cfgEditingKey,
         alert_name: document.getElementById("cfg_alert").value.trim(),
         enabled: document.getElementById("cfg_enabled").value === "true",
         paper_trading: document.getElementById("cfg_paper_on").checked,
@@ -3075,18 +3204,37 @@
         }
       }
 
+      cfgSaving = true;
+      document.getElementById('cfgFields').disabled = true;
+      document.getElementById('cfgSave').disabled = true;
+      document.getElementById('cfgSave').textContent = 'Saving...';
+      let strategySaved = false;
       try {
         const r = await fetch("/api/alert-config", {
           method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload)
         });
         const d = await readJsonResponse(r);
-        if (d.error) throw new Error(d.detail || d.error);
+        if (!r.ok || d.error || d.status !== 'saved') throw new Error(d.detail || d.message || d.error || 'Strategy was not saved');
+        strategySaved = true;
+        cfgEditingKey = d.config.alert_name;
+        document.getElementById('cfg_alert').readOnly = true;
         await savePnlExitCfg();
-        toast(`Strategy '${payload.alert_name}' Saved`);
-        loadCfgList();
+        const message = `Strategy '${payload.alert_name}' ${payload.config_action === 'create' ? 'created' : 'updated'}.`;
+        toast(message);
         document.getElementById("cfg_telegram_token").value = "";
-        closeCfg(); // Auto close on save
-      } catch (e) { toast((e && e.message) ? e.message : String(e), 'error'); }
+        cfgBaseline = cfgFormState();
+        setCfgView('saved');
+        cfgMessage(message);
+        await loadCfgList();
+      } catch (e) {
+        const message = (strategySaved ? 'Strategy saved, but account risk settings were not saved. ' : '') + (e.message || String(e));
+        cfgMessage(message, true); toast(message, 'error');
+      } finally {
+        cfgSaving = false;
+        document.getElementById('cfgFields').disabled = false;
+        document.getElementById('cfgSave').disabled = false;
+        document.getElementById('cfgSave').textContent = cfgEditingKey ? 'Save Changes' : 'Create Strategy';
+      }
     }
 
     async function deleteCfg(name) {

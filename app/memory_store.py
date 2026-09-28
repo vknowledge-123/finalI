@@ -353,11 +353,18 @@ class InMemoryStore:
         value = self._alert_configs.get(int(user_id), {}).get(norm_alert_name(alert_name))
         return dict(value) if value else None
 
-    async def save_alert_config(self, user_id: int, payload: Dict[str, Any]) -> None:
+    async def save_alert_config(self, user_id: int, payload: Dict[str, Any], *, action=None) -> None:
         uid = int(user_id)
         alert_name = norm_alert_name(str(payload.get("alert_name") or ""))
         if not alert_name:
             return
+        exists = alert_name in self._alert_configs.get(uid, {})
+        if action is not None and action not in ("create", "update"):
+            raise ValueError("CONFIG_ACTION_INVALID")
+        if action == "create" and exists:
+            raise ValueError("STRATEGY_ALREADY_EXISTS")
+        if action == "update" and not exists:
+            raise ValueError("STRATEGY_NOT_FOUND")
         self._alert_configs.setdefault(uid, {})[alert_name] = dict(payload)
 
     async def delete_alert_config(self, user_id: int, alert_name: str) -> bool:
