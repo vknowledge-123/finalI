@@ -14,6 +14,17 @@ from ..alert_features import IST, enabled
 
 log = logging.getLogger(__name__)
 
+WELCOME_MESSAGE = (
+    "शुभ सकाळ, सर्व मित्रांना नमस्कार!\n\n"
+    "Good Morning Traders\n\n"
+    "Disclaimer\n\n"
+    "We do not provide stock tips, buy/sell calls, or investment recommendations.\n\n"
+    "objective is purely to educate and enhance traders understanding of the stock market. "
+    "All investment decisions are made solely at your own discretion and risk. "
+    "Therefore, we shall not be held responsible for any profit or loss arising from "
+    "your trading or investment activities."
+)
+
 
 class TelegramURLFilter(logging.Filter):
     def filter(self, record):
@@ -114,10 +125,13 @@ class TelegramService:
             if target is None or not 0 <= age <= 600:
                 await store.delete_telegram_entry(uid, event["trade_id"])
                 continue
-            text = (("PAPER TRADE\n" if event.get("paper_trading") else "LIVE TRADE\n")
-                    + f"{event['symbol']} | {event['side']} | {event['product']}\n"
-                    f"Entry: INR {event['entry']:.2f}\nTarget: INR {event['target']:.2f}\n"
-                    f"Stop loss: INR {event['stop_loss']:.2f}\nFilled quantity: {event['qty']}\n"
+            product = str(event['product']).upper()
+            order_type = {"MIS": "MIS intraday", "INTRADAY": "MIS intraday", "CNC": "CNC delivery"}.get(product, product)
+            # Telegram presentation is independent of the actual execution mode.
+            text = ("PAPER TRADE\n\n"
+                    f"stock name : {event['symbol']}\n\nView: {event['side']}\n\nOrder Type: {order_type}\n\n"
+                    f"Entry: INR {event['entry']:.2f}\n\nTarget: INR {event['target']:.2f}\n\n"
+                    f"Stop loss: INR {event['stop_loss']:.2f}\n\nFilled quantity: {event['qty']}\n\n"
                     f"Strategy: {event['alert_name']}")
             if await self.deliver(uid, target, f"entry:{event['trade_id']}", text):
                 await store.delete_telegram_entry(uid, event["trade_id"])
@@ -129,7 +143,7 @@ class TelegramService:
         day = now.strftime("%Y%m%d")
         if 545 <= minute < 550:
             for target in unique.values():
-                await self.deliver(uid, target, f"welcome:{day}", "Welcome dear traders!\n" + now.strftime("%d %b %Y | 09:05 IST"))
+                await self.deliver(uid, target, f"welcome:{day}", WELCOME_MESSAGE)
         if now.weekday() >= 5 or not 555 <= minute <= 930:
             return
         # Claim the five-minute slots before making a broker call. All groups

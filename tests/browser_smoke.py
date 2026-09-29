@@ -42,13 +42,27 @@ def main():
             browser = playwright.chromium.launch(channel="chrome", headless=True)
             try:
                 for width, height in [(1440, 1000), (768, 1024), (390, 844)]:
+                    async def reset_positions():
+                        await application.store.delete_position(1, 'SBIN')
+                        await application.store.delete_position(1, 'LIVEOLD')
+                        await application.store.delete_position(1, 'LIVENEW')
+                        await application.store.delete_alerts(1)
+                        application.store._closed_positions.clear()
+                    asyncio.run_coroutine_threadsafe(reset_positions(), application.APP_LOOP).result(5)
                     context = browser.new_context(viewport={"width": width, "height": height})
                     page = context.new_page()
+                    mtm_response = {'ok': True, 'status': 'FRESH', 'broker': 'DHAN', 'total': 300,
+                                    'realized': 100, 'unrealized': 200, 'as_of': time.time()}
+                    page.route('**/api/account-mtm?*', lambda route: route.fulfill(json=mtm_response))
                     errors = []
                     page.on("pageerror", lambda error: errors.append(str(error)))
                     loaded = page.goto(f"http://127.0.0.1:{port}/dashboard", wait_until="load")
                     assert loaded.status == 200, (loaded.status, page.url)
                     page.wait_for_function("typeof openCfg === 'function' && typeof formatPrice === 'function'")
+                    expect(page.locator('#accountMtmValue')).to_have_text('\u20b9 +300.00')
+                    sizes = page.locator('.pnl-summary .pnl-value').evaluate_all(
+                        '(nodes) => nodes.map(node => getComputedStyle(node).fontSize)')
+                    assert sizes == ['16px', '16px', '16px'], sizes
                     assert page.evaluate("typeof formatPrice") == "function", (page.url, errors, page.title(), page.locator('body').inner_text()[:200])
                     assert page.evaluate("formatPrice(427.5 * 1.01)") == "431.78"
                     assert page.evaluate("alertPosition({alert_name:'second'}, {status:'ENTERED'}, {alert_name:'first'})") is None
@@ -286,6 +300,8 @@ def main():
                             "alert_name": position["alert_name"], "time": datetime.now(timezone.utc).isoformat(),
                             "result": [
                                 {"symbol": "SBIN", "status": "ENTERED", "side": "BUY", "reason": "ORDER_EXECUTED"},
+                                {"symbol": "SBIN", "status": "SKIPPED", "reason": "ALREADY_OPEN"},
+                                {"symbol": "SBIN", "status": "SKIPPED", "reason": "ALREADY_OPEN"},
                                 {"symbol": "SBIN", "status": "SKIPPED", "reason": "HIGH_BREAK_CANDLE_NOT_READY"},
                                 {"symbol": "SBIN", "status": "ERROR", "reason": "ORDER_REJECTED_INSUFFICIENT_FUNDS"},
                                 {"symbol": "SBIN", "side": "BUY", "status": "WAITING_FOR_BREAKOUT",
@@ -304,28 +320,33 @@ def main():
                     }), application.APP_LOOP).result(5)
                     expect(ltp).to_have_text("101.50")
                     expect(pnl).to_have_text("3.00")
-                    expect(page.locator("#alertsBody")).to_contain_text("PAPER OPEN")
-                    expect(page.locator("#alertsBody")).to_contain_text("PAPER / CNC")
-                    expect(page.locator("#totalPnlBadge")).to_contain_text("Paper:")
-                    assert page.locator("#totalPnlBadge .pnl-value").first.inner_text().strip() == "\u20b9 0.00"
+                    expect(page.locator("#posBody")).to_contain_text("PAPER OPEN")
+                    expect(page.locator("#posBody")).to_contain_text("PAPER / CNC")
+                    expect(page.locator('#posBody tr')).to_have_count(1)
+                    repeats = page.locator('#alertsBody tr').filter(has_text='ALREADY_OPEN')
+                    expect(repeats).to_have_count(2)
+                    expect(repeats.locator('[data-label="P&L"]')).to_have_count(0)
+                    expect(repeats.locator('button')).to_have_count(0)
+                    expect(page.locator('#strategyPnlValue')).to_have_text('\u20b9 0.00')
+                    expect(page.locator('#paperPnlValue')).to_have_text('\u20b9 +3.00')
                     strategy_rows = page.locator('#alertsBody tr').filter(has_text=f'Browser Smoke {width}')
                     skipped = strategy_rows.filter(has_text='HIGH_BREAK_CANDLE_NOT_READY')
                     expect(skipped.locator('[data-label="Status"]')).to_contain_text('SKIPPED')
-                    expect(skipped.locator('[data-label="P&L"]')).to_have_text('--')
-                    expect(skipped.locator('[data-label="TSL"]')).to_have_text('--')
+                    expect(skipped.locator('[data-label="P&L"]')).to_have_count(0)
+                    expect(skipped.locator('[data-label="TSL"]')).to_have_count(0)
                     expect(skipped.locator('button')).to_have_count(0)
                     rejected = strategy_rows.filter(has_text='ORDER_REJECTED_INSUFFICIENT_FUNDS')
                     expect(rejected.locator('[data-label="Status"]')).to_contain_text('ERROR')
-                    expect(rejected.locator('[data-label="Qty"]')).to_have_text('--')
+                    expect(rejected.locator('[data-label="Qty"]')).to_have_count(0)
                     pending_candle = strategy_rows.filter(has_text='WAITING FOR CANDLE')
                     expect(pending_candle).to_have_count(1)
-                    expect(pending_candle.locator('[data-label="P&L"]')).to_have_text('--')
+                    expect(pending_candle.locator('[data-label="P&L"]')).to_have_count(0)
                     expect(page.locator(".atsl-SBIN").first).to_have_text("99.00")
                     assert page.evaluate("POS_SNAPSHOT.SBIN.ltp") == 101.5
                     # Clearing alert history must not remove access to an open position.
                     page.evaluate("window.savedSmokeAlerts = [...ALERTS]; ALERTS.length = 0; renderAlerts()")
-                    expect(page.locator('#alertsBody')).to_contain_text('OPEN_POSITION')
-                    expect(page.locator('#alertsBody button[data-squareoff="SBIN"]')).to_have_count(1)
+                    expect(page.locator('#posBody')).to_contain_text('OPEN_POSITION')
+                    expect(page.locator('#posBody button[data-squareoff="SBIN"]')).to_have_count(1)
                     page.evaluate("ALERTS.push(...window.savedSmokeAlerts); renderAlerts()")
                     page.evaluate("window.scrollTo(0, 0)")
                     layout = page.evaluate("""() => {
@@ -340,6 +361,7 @@ def main():
                     assert layout["brandBottom"] <= layout["navBottom"], layout
                     assert layout["mainTop"] >= layout["navBottom"], layout
                     assert layout["pageWidth"] <= width, layout
+                    page.evaluate("document.getElementById('toast-container').replaceChildren()")
                     page.screenshot(path=str(artifacts / f"dashboard-{width}.png"), full_page=True)
 
                     async def close_position():
@@ -349,8 +371,51 @@ def main():
 
                     asyncio.run_coroutine_threadsafe(close_position(), application.APP_LOOP).result(5)
                     expect(page.locator("#posCount")).to_have_text("0 Active Pos")
-                    expect(page.locator("#alertsBody")).to_contain_text("EXITED")
-                    expect(page.locator('#alertsBody button[onclick*="squareoff"]')).to_have_count(0)
+                    expect(page.locator('#paperPnlValue')).to_have_text('\u20b9 +3.00')
+                    expect(page.locator("#posBody")).to_contain_text("EXITED")
+                    expect(page.locator('#posBody tr')).to_have_count(1)
+                    expect(page.locator('#posBody button[onclick*="squareoff"]')).to_have_count(0)
+                    expect(repeats.locator('[data-label="Status"]').first).to_have_text('SKIPPED')
+                    expect(page.locator('#alertsBody')).not_to_contain_text('EXITED')
+                    # The next trade in the same stock must not overwrite the closed one.
+                    next_position = dict(position, trade_id='NEXT', entry_price=200, ltp=200, pnl=0)
+                    async def reopen_position():
+                        await application.store.upsert_position(1, 'SBIN', next_position)
+                        await application.ws_mgr.broadcast(1, {'type': 'pos', 'position': next_position})
+                    asyncio.run_coroutine_threadsafe(reopen_position(), application.APP_LOOP).result(5)
+                    expect(page.locator('#posBody tr')).to_have_count(2)
+                    asyncio.run_coroutine_threadsafe(application.ws_mgr.broadcast(1, {
+                        'type': 'tick', 'symbol': 'SBIN', 'ltp': 201, 'close': 200,
+                    }), application.APP_LOOP).result(5)
+                    closed_row = page.locator('#posBody tr').filter(has_text='EXITED')
+                    expect(closed_row.locator('[data-label="P&L"]')).to_have_text('3.00')
+                    expect(closed_row.locator('[data-label="LTP"]')).to_have_text('101.50')
+                    page.evaluate('refreshAll()')
+                    expect(page.locator('#posBody tr')).to_have_count(2)
+                    expect(page.locator('#paperPnlValue')).to_have_text('\u20b9 +3.00')
+                    async def seed_live_totals():
+                        await application.store.upsert_position(1, 'LIVEOLD', {
+                            'symbol': 'LIVEOLD', 'trade_id': 'LIVE-CLOSED', 'status': 'CLOSED',
+                            'alert_name': 'Live Test', 'pnl': 100, 'realized_pnl': 100, 'qty': 0})
+                        await application.store.upsert_position(1, 'LIVENEW', {
+                            'symbol': 'LIVENEW', 'trade_id': 'LIVE-PARTIAL', 'status': 'OPEN',
+                            'alert_name': 'Live Test', 'pnl': 50, 'realized_pnl': 20, 'qty': 1})
+                    asyncio.run_coroutine_threadsafe(seed_live_totals(), application.APP_LOOP).result(5)
+                    page.evaluate('refreshAll()')
+                    expect(page.locator('#strategyPnlValue')).to_have_text('\u20b9 +150.00')
+                    expect(page.locator('#paperPnlValue')).to_have_text('\u20b9 +3.00')
+                    mtm_response.update(status='STALE', ok=False)
+                    page.evaluate('refreshAccountMtm()')
+                    expect(page.locator('#accountMtmState')).to_contain_text('Stale')
+                    expect(page.locator('#accountMtmValue')).to_have_text('\u20b9 +300.00')
+                    mtm_response.update(status='UNAVAILABLE', total=None, as_of=None)
+                    page.evaluate('refreshAccountMtm()')
+                    expect(page.locator('#accountMtmValue')).to_have_text('--')
+                    expect(page.locator('#accountMtmState')).to_have_text('Unavailable')
+                    mtm_response.update(status='FRESH', ok=True, total=300, as_of=time.time())
+                    page.evaluate('refreshAccountMtm()')
+                    expect(page.locator('#accountMtmValue')).to_have_text('\u20b9 +300.00')
+                    expect(page.locator('#accountMtmState')).to_contain_text('Updated')
                     page.evaluate("window.scrollTo(0, 0)")
                     page.screenshot(path=str(artifacts / f"closed-{width}.png"), full_page=True)
                     assert not errors, errors

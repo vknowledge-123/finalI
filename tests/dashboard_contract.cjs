@@ -15,7 +15,7 @@ const elements = Object.fromEntries(Object.entries(fixture.fields).map(([k,v]) =
 const saved = [];
 const response = data => ({ok: true, status: 200, text: async () => JSON.stringify(data)});
 const context = vm.createContext({
-  console: {log() {}, error() {}, warn() {}}, URLSearchParams, URL, Date, Number, String,
+  console: {log() {}, error() {}, warn() {}}, URLSearchParams, URL, Date, Number, String, AbortController,
   setTimeout: () => 1, clearTimeout() {}, setInterval: () => 1, clearInterval() {},
   location: {search: '', protocol: 'http:', host: 'localhost'},
   WebSocket: class {constructor(url) {this.url = url;}},
@@ -42,8 +42,24 @@ const run = code => vm.runInContext(code, context);
   await assert.rejects(context.readJsonResponse({ok: false, status: 401, text: async () => '{"error":"ADMIN_AUTH_REQUIRED"}'}));
   assert.equal(context.window.location.href, '/auth'); checks++;
   run(`ALERTS.push({alert_name:'<img src=x onerror="x">', time:Date.now(), result:[{symbol:'SBIN', ltp:'100.50', status:'ERROR', reason:'<img src=x onerror="x">'}]}); renderAlerts();`);
-  const table = Object.values(elements).find(e => e.innerHTML.includes('100.50') && e.innerHTML.includes('data-label="Alert"'));
+  const table = elements.alertsBody;
   assert(table); assert(!table.innerHTML.includes('<img')); checks++;
+  run(`ALERTS.length=0; ALERTS.push({alert_name:'QA', time:Date.now(), result:[
+    {symbol:'SBIN',status:'ENTERED',trade_id:'T1'},
+    {symbol:'SBIN',status:'SKIPPED',reason:'ALREADY_OPEN'},
+    {symbol:'SBIN',status:'SKIPPED',reason:'ALREADY_OPEN'}]});
+    POS_MAP.SBIN={symbol:'SBIN',alert_name:'QA',trade_id:'T1',status:'OPEN',qty:1,pnl:2.4}; renderAlerts();`);
+  assert.equal((elements.posBody.innerHTML.match(/data-label="P&L"/g) || []).length, 1);
+  assert.equal((elements.alertsBody.innerHTML.match(/ALREADY_OPEN/g) || []).length, 2);
+  assert(!elements.alertsBody.innerHTML.includes('data-label="P&L"'));
+  assert(!elements.alertsBody.innerHTML.includes('data-squareoff'));
+  run(`CLOSED_POSITIONS.T1={...POS_MAP.SBIN,status:'CLOSED',qty:0};
+    POS_MAP.SBIN={...POS_MAP.SBIN,trade_id:'T2',pnl:0}; renderAlerts();`);
+  assert.equal((elements.posBody.innerHTML.match(/data-label="P&L"/g) || []).length, 2);
+  assert.equal((elements.posBody.innerHTML.match(/data-squareoff="SBIN"/g) || []).length, 1);
+  assert.equal((elements.posBody.innerHTML.match(/data-symbol="SBIN" data-field="pnl"/g) || []).length, 1);
+  assert.equal(run("alertPosition({alert_name:'QA'}, {status:'SKIPPED',reason:'ALREADY_OPEN'}, POS_MAP.SBIN)"), null);
+  checks++;
   run(`POS_SNAPSHOT.SBIN={symbol:'SBIN',status:'OPEN',qty:1};`);
   await context.refreshPositions();
   assert.equal(run('Object.keys(POS_SNAPSHOT).length'), 0); checks++;
@@ -58,6 +74,27 @@ const run = code => vm.runInContext(code, context);
   assert.equal(run('POS_MAP.SBIN.pnl'), 5); checks++;
   run(`WS.onmessage({data:JSON.stringify({type:'tick',symbol:'SBIN',ltp:'bad'})});`);
   assert.equal(run('POS_MAP.SBIN.ltp'), 99); checks++;
+  run(`CLOSED_POSITIONS={L1:{symbol:'OLD',trade_id:'L1',status:'CLOSED',pnl:100,realized_pnl:100},
+    P1:{symbol:'PAPEROLD',trade_id:'P1',status:'CLOSED',pnl:20,paper_trading:true}};
+    POS_SNAPSHOT={OLD:{...CLOSED_POSITIONS.L1}};
+    POS_MAP={SBIN:{symbol:'SBIN',trade_id:'L2',status:'OPEN',qty:1,pnl:75,realized_pnl:25},
+    AEQUS:{symbol:'AEQUS',trade_id:'P2',status:'OPEN',qty:1,pnl:-5,paper_trading:true}};
+    renderPositions(Object.values(POS_MAP));`);
+  assert.equal(elements.strategyPnlValue.textContent, '\u20b9 +175.00');
+  assert.equal(elements.paperPnlValue.textContent, '\u20b9 +15.00');
+  run(`CLOSED_POSITIONS.L2={...POS_MAP.SBIN,status:'CLOSED',qty:0,pnl:80};
+    POS_SNAPSHOT.SBIN=CLOSED_POSITIONS.L2; delete POS_MAP.SBIN; renderPositions(Object.values(POS_MAP));`);
+  assert.equal(elements.strategyPnlValue.textContent, '\u20b9 +180.00');
+  run(`POS_MAP.SBIN={symbol:'SBIN',trade_id:'L3',status:'OPEN',pnl:-10}; renderPositions(Object.values(POS_MAP));`);
+  assert.equal(elements.strategyPnlValue.textContent, '\u20b9 +170.00');
+  run(`ACCOUNT_MTM_DATA={status:'FRESH',total:999,as_of:Date.now()/1000}; renderAccountMtm();`);
+  assert.equal(elements.accountMtmValue.textContent, '\u20b9 +999.00');
+  assert.equal(elements.strategyPnlValue.textContent, '\u20b9 +170.00');
+  run(`ACCOUNT_MTM_DATA.as_of-=60; renderAccountMtm();`);
+  assert(elements.accountMtmState.textContent.startsWith('Stale'));
+  run(`ACCOUNT_MTM_DATA={status:'UNAVAILABLE',total:null}; renderAccountMtm();`);
+  assert.equal(elements.accountMtmValue.textContent, '--');
+  assert.equal(elements.accountMtmState.textContent, 'Unavailable'); checks++;
   const key = Object.keys(fixture.configs.configs)[0];
   await context.fillCfg(key);
   assert.equal(String(elements.cfg_tsl_on.value), 'false');

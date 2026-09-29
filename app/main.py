@@ -59,6 +59,7 @@ from .websocket_manager import WebSocketManager
 from .stock_sector import SECTOR_INDEX_INSTRUMENTS, STOCK_INDEX_MAPPING
 from .dhan_broker import DHAN_INSTRUMENTS, DhanContext, DhanFeedService, MarketFeed, dhanhq
 from .services.runtime import ServiceRuntime
+from .services.account_mtm import AccountMtmService
 from .kite_broker import KiteCallbackQueue
 from .service_queues import MARKET_SUBSCRIPTION_QUEUE
 from .auth import AuthService
@@ -68,6 +69,8 @@ import logging
 from .log_safety import install_access_log_filter
 
 install_access_log_filter()
+
+ACCOUNT_MTM = None
 
 # Windows services and scheduled tasks often inherit a legacy console
 # encoding. Console output must never break request processing.
@@ -1806,9 +1809,10 @@ async def start_kite_ticker(user_id: int) -> None:
 # -----------------------------
 async def schedule_auto_squareoff():
     """
-    Runs every 30s. Checks if time >= 15:15 IST.
+    Runs every 20s. Checks for the 15:10 IST square-off window.
     If yes, and enabled, and not run yet today -> triggers exit_all.
     """
+    from .auto_squareoff import AUTO_SQUAREOFF_REASON, squareoff_cutoff_reached
     while True:
         try:
             await asyncio.sleep(20) # check freq
@@ -1817,8 +1821,8 @@ async def schedule_auto_squareoff():
             tz = pytz.timezone("Asia/Kolkata")
             now = datetime.datetime.now(tz)
             
-            # Target: 15:20 (3:20 PM)
-            if now.hour == 15 and now.minute >= 20:
+            # Target: 15:10 (3:10 PM)
+            if now.hour == 15 and squareoff_cutoff_reached(now):
                 # Check all users (currently only 1 supported primarily, but loop capable)
                 user_ids = [1] 
                 
@@ -1827,8 +1831,7 @@ async def schedule_auto_squareoff():
                         if not await store.has_auto_sq_off_run(uid):
                             print(f"⏰ [AUTO_SQ_OFF] Triggering for user={uid} at {now}")
                             eng = await ensure_engine(uid)
-                            # Passing reason AUTO_SQ_OFF_320 to differentiate
-                            cnt = await eng.exit_all_open_positions(reason="AUTO_SQ_OFF_320", products={"MIS"})
+                            cnt = await eng.exit_all_open_positions(reason=AUTO_SQUAREOFF_REASON, products={"MIS"})
                             await store.mark_auto_sq_off_run(uid)
                             
                             # Notify UI
@@ -1847,9 +1850,10 @@ async def schedule_auto_squareoff():
 # -----------------------------
 @app.on_event("startup")
 async def startup():
-    global APP_LOOP, encryption_manager, store, auth_service, SERVICE_RUNTIME, DAILY_DASHBOARD_CLEANUP_TASK
+    global APP_LOOP, encryption_manager, store, auth_service, SERVICE_RUNTIME, DAILY_DASHBOARD_CLEANUP_TASK, ACCOUNT_MTM
     APP_LOOP = asyncio.get_running_loop()
     ws_mgr.set_loop(APP_LOOP)
+    ACCOUNT_MTM = AccountMtmService(lambda: store)
 
     if _is_test_mode():
         from .memory_store import InMemoryStore
@@ -1949,7 +1953,10 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
-    global SERVICE_RUNTIME, DAILY_DASHBOARD_CLEANUP_TASK
+    global SERVICE_RUNTIME, DAILY_DASHBOARD_CLEANUP_TASK, ACCOUNT_MTM
+    if ACCOUNT_MTM is not None:
+        await ACCOUNT_MTM.close()
+        ACCOUNT_MTM = None
     if DAILY_DASHBOARD_CLEANUP_TASK is not None:
         DAILY_DASHBOARD_CLEANUP_TASK.cancel()
         try:
@@ -3356,7 +3363,15 @@ async def api_clear_alerts(user_id: int = 1) -> Dict[str, Any]:
 async def api_positions(user_id: int = 1) -> Dict[str, Any]:
     user_id = int(user_id)
     rows = await store.list_positions(user_id)
-    return {"positions": rows}
+    closed = await store.list_closed_positions(user_id)
+    return {"positions": rows, "closed_positions": closed}
+
+
+@app.get("/api/account-mtm")
+async def api_account_mtm(user_id: int = 1) -> Dict[str, Any]:
+    if ACCOUNT_MTM is None:
+        raise HTTPException(status_code=503, detail="ACCOUNT_MTM_NOT_READY")
+    return await ACCOUNT_MTM.snapshot(int(user_id))
 
 
 #-----------------------------

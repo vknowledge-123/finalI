@@ -661,33 +661,12 @@
       gap: 0.5rem;
     }
 
-    /* Net PnL pill */
-    .net-pnl-pill {
-      background: #e8fff1;
-      color: #0f7a3a;
-      border: 1px solid rgba(16, 185, 129, 0.35);
-      box-shadow: 0 6px 18px rgba(16, 185, 129, 0.25);
-      border-radius: 999px;
-      padding: 5px 10px;
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      font-weight: 800;
-      line-height: 1;
-    }
-
-    .net-pnl-pill .pnl-label {
-      font-size: 10px;
-      font-weight: 700;
-      color: #127c3c;
-      opacity: 0.9;
-    }
-
-    .net-pnl-pill .pnl-value {
-      font-size: 13px;
-      font-weight: 900;
-      letter-spacing: 0.01em;
-    }
+    .pnl-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; padding: 12px 0; border-bottom: 1px solid #ffffff18; }
+    .pnl-metric { min-width: 0; display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 12px; }
+    .pnl-label { font-size: 12px; color: #cbd5e1; }
+    .pnl-value { font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: 0; overflow-wrap: anywhere; }
+    .pnl-state { flex-basis: 100%; font-size: 11px; color: #94a3b8; }
+    @media (max-width: 640px) { .pnl-summary { grid-template-columns: 1fr; gap: 10px; } }
 
     /* Screen-specific sizing to keep top bar compact */
     @media (max-width: 640px) {
@@ -987,7 +966,7 @@
   <!-- Main Content (Stacked) -->
   <main class="max-w-none w-full mx-auto px-0 pt-3 pb-6 space-y-6">
 
-    <!-- Combined Signals + Positions -->
+    <!-- Positions and alert history -->
     <section class="animate-enter">
       <div class="flex items-center justify-between mb-1">
         <div class="flex items-center gap-2">
@@ -1010,10 +989,6 @@
           <span id="sectorCacheBadge"
             class="badge bg-slate-500/10 text-slate-300 border-slate-500/20 px-2.5 py-1 text-[10px] font-bold">Sectors:
             Not Cached</span>
-          <div id="totalPnlBadge" class="net-pnl-pill text-[9px]">
-            <span class="pnl-label">Net P&amp;L:</span>
-            <span class="pnl-value">&#8377; 0.00</span>
-          </div>
           <button onclick="refreshAll()" class="btn btn-light text-[10px] px-3 py-1.5">
             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
@@ -1034,6 +1009,19 @@
         </div>
       </div>
 
+      <div class="pnl-summary">
+        <div id="totalPnlBadge" class="pnl-metric" title="App live trades: realized plus unrealized P&amp;L">
+          <span class="pnl-label">Strategy Live P&amp;L</span><span id="strategyPnlValue" class="pnl-value">--</span>
+        </div>
+        <div id="accountMtmBadge" class="pnl-metric" title="Dhan account positions, including trades placed outside this app">
+          <span class="pnl-label">Dhan Account MTM</span><span id="accountMtmValue" class="pnl-value">--</span>
+          <span id="accountMtmState" class="pnl-state" role="status">Loading</span>
+        </div>
+        <div id="paperPnlBadge" class="pnl-metric" title="Simulated trades: realized plus unrealized P&amp;L">
+          <span class="pnl-label">Paper P&amp;L</span><span id="paperPnlValue" class="pnl-value">--</span>
+        </div>
+      </div>
+      <h3 class="text-sm font-semibold text-slate-200 mt-3 mb-2">Positions</h3>
       <div class="table-container">
         <div class="overflow-x-auto">
           <table>
@@ -1055,16 +1043,27 @@
 <th class="px-3 py-4 text-center font-bold tracking-wide uppercase text-slate-200" style="font-family:'Orbitron', sans-serif;">Action</th>
               </tr>
             </thead>
-            <tbody id="alertsBody">
-              <tr>
-                <td colspan="14" class="text-center py-12 text-slate-400 italic">Waiting for incoming signals...</td>
-              </tr>
-            </tbody>
             <tbody id="posBody">
               <tr>
                 <td colspan="14" class="text-center py-12 text-slate-500 italic">No active positions currently.</td>
               </tr>
             </tbody>
+          </table>
+        </div>
+      </div>
+      <h3 class="text-sm font-semibold text-slate-200 mt-4 mb-2">Alert History</h3>
+      <div class="table-container">
+        <div class="overflow-x-auto">
+          <table>
+            <thead><tr class="text-xs text-slate-300 border-b border-white/5">
+              <th class="px-3 py-3 text-left">Alert Name</th>
+              <th class="px-3 py-3 text-left">Time</th>
+              <th class="px-3 py-3 text-left">Symbol</th>
+              <th class="px-3 py-3 text-left">Side</th>
+              <th class="px-3 py-3 text-left">Status</th>
+              <th class="px-3 py-3 text-left">Reason</th>
+            </tr></thead>
+            <tbody id="alertsBody"><tr><td colspan="6" class="px-3 py-6 text-slate-400">No alerts yet.</td></tr></tbody>
           </table>
         </div>
       </div>
@@ -3746,6 +3745,8 @@
     let WS = null;
     let POS_MAP = {}; // Global map: symbol -> position object
     let POS_SNAPSHOT = {}; // Keep last known position data to avoid UI clearing
+    let CLOSED_POSITIONS = {};
+    let ACCOUNT_MTM_DATA = null, accountMtmPending = false;
     let _alertsRenderTimer = null;
     let _lastLtpUiUpdate = 0;
 
@@ -3763,7 +3764,7 @@
 
     function alertPosition(alert, result, position) {
       if (!position) return null;
-      if (!['ENTERED', 'PENDING_ENTRY', 'PENDING ENTRY'].includes(result.status) && result.reason !== 'ALREADY_OPEN') return null;
+      if (!['ENTERED', 'PENDING_ENTRY', 'PENDING ENTRY'].includes(result.status) || result.reason === 'ALREADY_OPEN') return null;
       const key = value => String(value || '').replace(/[\u200B-\u200D\uFEFF]/g, '')
         .toLowerCase().replace(/[_-]/g, ' ').replace(/\s+/g, ' ').trim();
       if (key(alert.alert_name) !== key(position.alert_name)) return null;
@@ -3773,6 +3774,11 @@
     }
 
     function renderAlerts() {
+      renderAlertHistory();
+      renderPositionRows();
+    }
+
+    function renderAlertHistory() {
       const tbody = document.getElementById('alertsBody');
       const countEl = document.getElementById('alertCount');
       if (!tbody) return;
@@ -3786,21 +3792,55 @@
         countEl.textContent = `${count} Alert${count !== 1 ? 's' : ''}`;
       }
 
-      const displayAlerts = ALERTS.slice(0, 100);
-      Object.values({ ...POS_SNAPSHOT, ...POS_MAP }).forEach(position => {
-        if (!['PENDING_ENTRY', 'OPEN', 'EXITING', 'EXIT_CONDITIONS_MET', 'ERROR'].includes(position.status)) return;
-        const represented = displayAlerts.some(alert => (alert.result || []).some(result =>
-          (result.execution_symbol || result.symbol) === position.symbol && alertPosition(alert, result, position)));
-        if (!represented) {
-          displayAlerts.unshift({
-            alert_name: position.alert_name, time: position.alert_time || Number(position.created_ts || 0) * 1000,
-            result: [{symbol: position.symbol, status: 'ENTERED', side: position.side,
-              trade_id: position.trade_id, order_id: position.entry_order_id, reason: 'OPEN_POSITION'}]
-          });
-        }
+      tbody.innerHTML = ALERTS.slice(0, 100).map(alert => {
+        const time = alert.time ? new Date(alert.time).toLocaleTimeString('en-IN', {timeZone: 'Asia/Kolkata', hour12: false}) : '--';
+        const results = alert.result?.length ? alert.result : [{status: 'ERROR', reason: 'NO_SYMBOLS_PARSED'}];
+        return results.map(result => {
+          let status = result.reason === 'ALREADY_OPEN' ? 'SKIPPED' : result.status;
+          let reason = result.reason || '';
+          if (status === 'WAITING_FOR_BREAKOUT') {
+            status = result.break_level == null ? 'WAITING FOR CANDLE' : 'WAITING FOR BREAKOUT';
+            const until = new Date(Number(result.breakout_expires_at) * 1000).toLocaleTimeString('en-IN', {timeZone: 'Asia/Kolkata', hour12: false});
+            reason = result.break_level == null ? `${result.candle_reason || 'Candle data pending'} | until ${until}`
+              : `${result.side === 'SELL' ? 'Below' : 'Above'} ${formatPrice(result.break_level)} | until ${until}`;
+          }
+          return `<tr class="border-b border-white/5">
+            <td data-label="Alert" class="px-3 py-3 text-blue-300">${escapeHtml(alert.alert_name)}</td>
+            <td data-label="Time" class="px-3 py-3 whitespace-nowrap">${time}</td>
+            <td data-label="Symbol" class="px-3 py-3 font-semibold">${escapeHtml(result.symbol || '--')}</td>
+            <td data-label="Side" class="px-3 py-3">${escapeHtml(result.side || '--')}</td>
+            <td data-label="Status" class="px-3 py-3 ${status === 'ERROR' ? 'text-rose-400' : status === 'SKIPPED' ? 'text-amber-300' : 'text-cyan-300'}">${escapeHtml(status || '--')}</td>
+            <td data-label="Reason" class="px-3 py-3 break-words">${escapeHtml(reason)}</td>
+          </tr>`;
+        }).join('');
+      }).join('') || '<tr><td colspan="6" class="px-3 py-6 text-slate-400">No alerts yet.</td></tr>';
+    }
+
+    function positionIdentity(position) {
+      return String(position.trade_id || position.entry_order_id || `${position.symbol}:${position.alert_name}:${position.created_ts || position.alert_time || ''}`);
+    }
+
+    function uniquePositions() {
+      const unique = new Map();
+      [...Object.values(CLOSED_POSITIONS), ...Object.values({...POS_SNAPSHOT, ...POS_MAP})].forEach(position => {
+        if (position?.symbol) unique.set(positionIdentity(position), position);
       });
+      return [...unique.values()];
+    }
+
+    function renderPositionRows() {
+      const tbody = document.getElementById('posBody');
+      if (!tbody) return;
+      const displayAlerts = uniquePositions().sort((a, b) => {
+        const closed = p => ['CLOSED', 'EXITED'].includes(p.status) ? 1 : 0;
+        return closed(a) - closed(b) || Number(b.created_ts || 0) - Number(a.created_ts || 0);
+      }).map(position => ({
+        position, alert_name: position.alert_name,
+        time: position.alert_time || Number(position.created_ts || 0) * 1000,
+        result: [{symbol: position.symbol, status: 'ENTERED', side: position.side, reason: 'OPEN_POSITION'}]
+      }));
       if (displayAlerts.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="14" class="text-center py-12 text-slate-500 italic">Waiting for incoming signals...</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="14" class="text-center py-12 text-slate-500 italic">No positions yet.</td></tr>`;
         return;
       }
 
@@ -3821,7 +3861,7 @@
           // Check for live position updates
           const sym = (r.symbol || '').trim();
           const symLabel = sym || '--';
-          const livePos = alertPosition(a, r, POS_MAP[r.execution_symbol || sym] || POS_SNAPSHOT[r.execution_symbol || sym]);
+          const livePos = a.position;
           let statusLabel = r.status;
           let statusReason = r.reason;
           let sideLabel = r.side; // keep original side
@@ -3905,6 +3945,7 @@
           const pnlClass = p ? (pnlNum > 0 ? 'text-emerald-400 font-bold' : pnlNum < 0 ? 'text-rose-400 font-bold' : 'text-slate-400') : 'text-slate-600';
           const sector = p ? (p.sector || '') : '';
           const canSquareOff = p && ['PENDING_ENTRY', 'OPEN', 'EXITING', 'EXIT_CONDITIONS_MET', 'ERROR'].includes(p.status);
+          const liveSymbol = canSquareOff ? p.symbol : '';
 
           // TSL calc if we have position
           let tslVal = null;
@@ -3954,7 +3995,7 @@
                   ${sector ? `<span class="inline-flex items-center px-2 py-0.5 mt-1 rounded text-[9px] font-black uppercase tracking-widest bg-cyan-500/15 text-cyan-300 border border-cyan-500/25 w-fit">${escapeHtml(sector)}</span>` : ''}
                 </div>
               </td>
-              <td data-label="LTP" class="px-3 py-3 whitespace-nowrap text-right font-mono font-bold text-5xl text-cyan-400" data-symbol="${escapeHtml(sym)}" data-field="ltp">
+              <td data-label="LTP" class="px-3 py-3 whitespace-nowrap text-right font-mono font-bold text-5xl text-cyan-400" data-symbol="${escapeHtml(liveSymbol)}" data-field="ltp">
                 ${p && p.ltp ? Number(p.ltp).toFixed(2) : (r.ltp ? Number(r.ltp).toFixed(2) : '--')}
               </td>
               <td data-label="Type" class="px-3 py-3 text-center ${p ? 'text-slate-200' : 'text-slate-300'}">${prod || '--'}</td>
@@ -3968,8 +4009,8 @@
               <td data-label="Entry" class="px-3 py-3 text-right ${p ? 'text-slate-200' : 'text-slate-300'}">${entry ?? '--'}</td>
               <td data-label="Target" class="px-3 py-3 text-right ${p ? 'text-emerald-400 font-bold' : 'text-slate-600'}">${tgt ?? '--'}</td>
               <td data-label="SL" class="px-3 py-3 text-right ${p ? 'text-rose-400 font-bold' : 'text-slate-600'}">${sl ?? '--'}</td>
-              <td data-label="TSL" class="px-3 py-3 text-right ${p ? `text-amber-400 font-bold atsl-${safeId(p.symbol)}` : 'text-slate-600'}">${tslVal ?? '--'}</td>
-              <td data-label="P&L" class="px-3 py-3 text-right ${p ? pnlClass : 'text-slate-600'}" data-symbol="${p ? escapeHtml(p.symbol) : ''}" data-field="pnl">${pnl ?? '--'}</td>
+              <td data-label="TSL" class="px-3 py-3 text-right text-amber-400 font-bold ${liveSymbol ? `atsl-${safeId(liveSymbol)}` : ''}">${tslVal ?? '--'}</td>
+              <td data-label="P&L" class="px-3 py-3 text-right ${p ? pnlClass : 'text-slate-600'}" data-symbol="${escapeHtml(liveSymbol)}" data-field="pnl">${pnl ?? '--'}</td>
               <td data-label="Status" class="px-3 py-3 text-center">
                 <div class="flex flex-col items-center gap-1">
                   <span class="px-2.5 py-1 rounded-full ${statusLabel === 'LIVE' ? 'text-[10px]' : 'text-[8px]'} font-black tracking-widest ${getStatusClass(statusLabel)}">
@@ -4052,6 +4093,7 @@
         return;
       }
       const pos = d.positions || [];
+      CLOSED_POSITIONS = Object.fromEntries((d.closed_positions || []).map(p => [positionIdentity(p), p]));
       const activePos = pos.filter(p => ['PENDING_ENTRY', 'OPEN', 'EXITING', 'EXIT_CONDITIONS_MET', 'ERROR'].includes(p.status));
       activePos.sort((a, b) => a.symbol.localeCompare(b.symbol));
       POS_MAP = {};
@@ -4065,32 +4107,18 @@
     }
 
     async function refreshAll() {
+      refreshAccountMtm();
       await refreshPositions();
       await loadAlerts();
       await loadSectorCacheStatus();
       renderAlerts();
     }
 
-    function renderPositions(rows) {
+    function renderPositions(rows, updateTable = true) {
       const tbody = document.getElementById("posBody");
       const countEl = document.getElementById("posCount");
-      const pnlEl = document.getElementById("totalPnlBadge");
-
-      let totalPnl = 0.0;
-      let paperPnl = 0.0;
-      if (rows) {
-        rows.forEach(p => { if (p.paper_trading) paperPnl += Number(p.pnl || 0); else totalPnl += Number(p.pnl || 0); });
-      }
 
       if (countEl) countEl.textContent = `${rows ? rows.length : 0} Active Pos`;
-
-      if (pnlEl) {
-        const val = totalPnl.toFixed(2);
-        const colorClass = totalPnl > 0 ? "text-emerald-400 drop-shadow-[0_0_8px_rgba(52,211,153,0.4)]" : totalPnl < 0 ? "text-rose-400 drop-shadow-[0_0_8px_rgba(251,113,133,0.4)]" : "text-white";
-        const sign = totalPnl > 0 ? '+' : '';
-        pnlEl.className = `net-pnl-pill`;
-        pnlEl.innerHTML = `<span class="pnl-label">Live P&amp;L:</span><span class="pnl-value">&#8377; ${sign}${val}</span><span class="pnl-label">Paper:</span><span class="pnl-value">&#8377; ${paperPnl.toFixed(2)}</span>`;
-      }
 
       if (rows && rows.length) {
         rows.forEach(p => {
@@ -4098,9 +4126,62 @@
         });
       }
 
-      if (tbody) {
-        // Positions are rendered into alert rows; keep this body empty to avoid duplicates.
-        tbody.innerHTML = "";
+      const totals = {live: 0, paper: 0};
+      uniquePositions().forEach(p => {
+        const bucket = p.paper_trading ? 'paper' : 'live';
+        // Position pnl already contains booked partial exits; do not add them twice.
+        const raw = p.pnl ?? p.realized_pnl;
+        const value = raw == null ? NaN : Number(raw);
+        totals[bucket] += value;
+      });
+      setPnlValue('strategyPnlValue', totals.live);
+      setPnlValue('paperPnlValue', totals.paper);
+
+      if (tbody && updateTable) {
+        scheduleRenderAlerts();
+      }
+    }
+
+    function setPnlValue(id, value, stale = false) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      const valid = typeof value === 'number' && Number.isFinite(value);
+      el.textContent = valid ? `\u20b9 ${value > 0 ? '+' : ''}${value.toFixed(2)}` : '--';
+      el.className = `pnl-value ${stale ? 'text-amber-300' : !valid ? 'text-slate-400' : value > 0 ? 'text-emerald-300' : value < 0 ? 'text-rose-400' : 'text-slate-200'}`;
+    }
+
+    function renderAccountMtm() {
+      const data = ACCOUNT_MTM_DATA;
+      const state = document.getElementById('accountMtmState');
+      if (!data || !state) return;
+      const asOf = Number(data.as_of);
+      const timedOut = asOf > 0 && Date.now() / 1000 - asOf > 15;
+      const stale = data.status === 'STALE' || (data.status === 'FRESH' && timedOut);
+      const usable = ['FRESH', 'STALE'].includes(data.status) && typeof data.total === 'number' && Number.isFinite(data.total);
+      setPnlValue('accountMtmValue', usable ? data.total : null, stale);
+      const time = asOf > 0 ? new Date(asOf * 1000).toLocaleTimeString('en-IN', {timeZone: 'Asia/Kolkata', hour12: false}) + ' IST' : '';
+      state.textContent = usable ? `${stale ? 'Stale - last updated' : 'Updated'} ${time}`
+        : data.status === 'NOT_APPLICABLE' ? 'Dhan not selected'
+        : data.status === 'NOT_CONNECTED' ? 'Dhan not connected' : 'Unavailable';
+    }
+
+    async function refreshAccountMtm() {
+      if (accountMtmPending) return;
+      accountMtmPending = true;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 8000);
+      try {
+        const response = await fetch(`/api/account-mtm?user_id=${USER_ID}`, {signal: controller.signal});
+        const data = await readJsonResponse(response);
+        if (!response.ok || data.error || !data.status) throw new Error('MTM unavailable');
+        ACCOUNT_MTM_DATA = data;
+      } catch (e) {
+        ACCOUNT_MTM_DATA = ACCOUNT_MTM_DATA?.as_of
+          ? {...ACCOUNT_MTM_DATA, status: 'STALE'} : {status: 'UNAVAILABLE'};
+      } finally {
+        clearTimeout(timer);
+        accountMtmPending = false;
+        renderAccountMtm();
       }
     }
 
@@ -4214,7 +4295,7 @@
               }
               POS_SNAPSHOT[s] = { ...pSnap };
               renderPositions(Object.values(POS_MAP).filter(p =>
-                ['PENDING_ENTRY', 'OPEN', 'EXITING', 'EXIT_CONDITIONS_MET', 'ERROR'].includes(p.status)));
+                ['PENDING_ENTRY', 'OPEN', 'EXITING', 'EXIT_CONDITIONS_MET', 'ERROR'].includes(p.status)), false);
             }
             if (pSnap && typeof pSnap.pnl !== "undefined") {
               const pnlVal = Number(pSnap.pnl || 0).toFixed(2);
@@ -4254,6 +4335,9 @@
 
           if (d.type === 'pos' || d.type === 'pos_refresh') {
             if (d.type === 'pos' && d.position) {
+              if (['CLOSED', 'EXITED'].includes(d.position.status)) {
+                CLOSED_POSITIONS[positionIdentity(d.position)] = { ...d.position };
+              }
               POS_SNAPSHOT[d.position.symbol] = { ...d.position };
               // Update or remove from map based on status
               if (['PENDING_ENTRY', 'OPEN', 'EXITING', 'EXIT_CONDITIONS_MET', 'ERROR'].includes(d.position.status)) {
@@ -4315,6 +4399,11 @@
       refreshZ();
       // checkAutoSqOff(); // Removed as we switched to manual button
       setInterval(refreshZ, 5000);
+      refreshAccountMtm();
+      setInterval(() => {
+        renderAccountMtm();
+        if (!document.hidden) refreshAccountMtm();
+      }, 5000);
       let breakoutRefreshPending = false;
       setInterval(async () => {
         const waiting = ALERTS.some(a => (a.result || []).some(r =>

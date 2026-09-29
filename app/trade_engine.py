@@ -2727,6 +2727,12 @@ class TradeEngine:
             return [{"symbol": "", "status": "SKIPPED", "reason": "NO_SYMBOLS_PARSED", "exit_alert": exit_alert_key}]
         return results
 
+    async def _auto_squareoff_blocks_entry(self, product: str) -> bool:
+        from .auto_squareoff import squareoff_cutoff_reached
+        if str(product).upper() not in {"MIS", "INTRADAY"} or not squareoff_cutoff_reached():
+            return False
+        return bool(await self.store.is_auto_sq_off_enabled(self.user_id))
+
     async def on_chartink_alert(self, alert_name: str, symbols: List[str], ts: str = "", *,
                                 breakout_watch_id: str = "", monitor_owner: str = "api") -> List[Dict[str, Any]]:
         monitor_started_at = time.time()
@@ -2747,6 +2753,9 @@ class TradeEngine:
         received_at = alert_time(ts)
         if not cfg.enabled:
             return [{"symbol": s, "status": "SKIPPED", "reason": "DISABLED"} for s in symbols]
+
+        if await self._auto_squareoff_blocks_entry(cfg.product):
+            return [{"symbol": s, "status": "SKIPPED", "reason": "AUTO_SQ_OFF_CUTOFF"} for s in symbols]
 
         if not _is_within_entry_window(cfg.entry_start_time, cfg.entry_end_time):
             return [{"symbol": s, "status": "SKIPPED", "reason": "ENTRY_WINDOW"} for s in symbols]
@@ -3053,6 +3062,10 @@ class TradeEngine:
                         qty = max(1, int(capital / float(ltp)))
                 if qty <= 0:
                     results.append({"symbol": sym, "status": "ERROR", "reason": "ZERO_QTY"})
+                    continue
+
+                if await self._auto_squareoff_blocks_entry(cfg.product):
+                    results.append({"symbol": sym, "status": "SKIPPED", "reason": "AUTO_SQ_OFF_CUTOFF"})
                     continue
 
                 if watch:
@@ -3555,6 +3568,9 @@ class TradeEngine:
         if not should_add:
             return False
         if await self.store.is_kill(self.user_id):
+            return False
+
+        if await self._auto_squareoff_blocks_entry(pos.product):
             return False
 
         self._pyramid_inflight[symbol] = True

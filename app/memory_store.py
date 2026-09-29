@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from .models import OTP, Session, User, utc_now
-from .redis_store import norm_alert_name, norm_symbol
+from .redis_store import norm_alert_name, norm_symbol, now_ist_date
 from .order_locks import OrderLockLeases
 from .breakout_state import project_alerts
 
@@ -37,6 +37,7 @@ class InMemoryStore:
         self._breakout_watches = {}
         self._alerts: Dict[int, List[Dict[str, Any]]] = {}
         self._positions: Dict[int, Dict[str, Dict[str, Any]]] = {}
+        self._closed_positions = {}
         self._cnc_carry_positions: Dict[int, Dict[str, Dict[str, Any]]] = {}
         self._pnl_exit_cfg: Dict[int, Dict[str, Any]] = {}
         self._sector_cache: Dict[int, Dict[str, Any]] = {}
@@ -442,6 +443,8 @@ class InMemoryStore:
                 and previous.get("status") == "CLOSED" and position.get("status") != "CLOSED"):
             raise RuntimeError("STALE_POSITION_REOPEN_BLOCKED")
         self._positions.setdefault(uid, {})[sym] = dict(position)
+        if position.get("trade_id") and position.get("status") in {"CLOSED", "EXITED"}:
+            self._closed_positions.setdefault((uid, now_ist_date()), {})[position["trade_id"]] = dict(position)
 
     async def get_position(self, user_id: int, symbol: str) -> Dict[str, Any]:
         return dict(self._positions.get(int(user_id), {}).get(norm_symbol(symbol), {}))
@@ -449,6 +452,9 @@ class InMemoryStore:
     async def list_positions(self, user_id: int) -> List[Dict[str, Any]]:
         uid = int(user_id)
         return list(self._positions.get(uid, {}).values())
+
+    async def list_closed_positions(self, user_id: int) -> List[Dict[str, Any]]:
+        return list(self._closed_positions.get((int(user_id), now_ist_date()), {}).values())
 
     async def delete_position(self, user_id: int, symbol: str) -> None:
         self._positions.get(int(user_id), {}).pop(norm_symbol(symbol), None)

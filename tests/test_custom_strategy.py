@@ -1084,11 +1084,11 @@ class TradeEngineIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         engine._exit_position = AsyncMock()
 
-        count = await engine.exit_all_open_positions(reason="AUTO_SQ_OFF_320", products={"MIS"})
+        count = await engine.exit_all_open_positions(reason="AUTO_SQ_OFF_310", products={"MIS"})
         await asyncio.sleep(0)
 
         self.assertEqual(count, 1)
-        engine._exit_position.assert_awaited_once_with("MISSTOCK", "AUTO_SQ_OFF_320")
+        engine._exit_position.assert_awaited_once_with("MISSTOCK", "AUTO_SQ_OFF_310")
 
     async def test_squareoff_all_positions_filters_cnc_for_mis_risk(self) -> None:
         store = InMemoryStore()

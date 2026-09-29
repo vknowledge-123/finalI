@@ -145,6 +145,10 @@ def k_positions(user_id: int) -> str:
     return f"positions:{int(user_id)}"
 
 
+def k_closed_positions(user_id: int) -> str:
+    return f"positions:closed:{int(user_id)}:{now_ist_date()}"
+
+
 def k_cnc_carry_positions(user_id: int) -> str:
     return f"positions:cnc_carry:{int(user_id)}"
 
@@ -940,9 +944,13 @@ class RedisStore:
                 end
             end
             redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+            if ARGV[3] ~= '' and (ARGV[4] == 'CLOSED' or ARGV[4] == 'EXITED') then
+                redis.call('HSET', KEYS[2], ARGV[3], ARGV[2])
+                redis.call('EXPIRE', KEYS[2], ARGV[5])
+            end
             return 1
-        """, 1, k_positions(user_id), sym, json.dumps(payload),
-            str(payload.get("trade_id") or ""), str(payload.get("status") or ""))
+        """, 2, k_positions(user_id), k_closed_positions(user_id), sym, json.dumps(payload),
+            str(payload.get("trade_id") or ""), str(payload.get("status") or ""), seconds_until_next_ist_day())
         if not saved:
             raise RuntimeError("STALE_POSITION_REOPEN_BLOCKED")
 
@@ -963,6 +971,10 @@ class RedisStore:
             except Exception:
                 continue
         return out
+
+    async def list_closed_positions(self, user_id: int) -> List[Dict[str, Any]]:
+        rows = await self.redis.hgetall(k_closed_positions(user_id))
+        return [json.loads(raw) for raw in rows.values()]
 
     async def save_cnc_carry_position(self, user_id: int, symbol: str, pos: Dict[str, Any]) -> None:
         sym = norm_symbol(symbol)

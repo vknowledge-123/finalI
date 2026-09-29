@@ -168,20 +168,6 @@
     white-space: nowrap;
   }
 
-  body #totalPnlBadge {
-    padding: 4px 8px !important;
-    gap: 6px !important;
-    white-space: nowrap;
-  }
-
-  body #totalPnlBadge .pnl-label {
-    font-size: 9px !important;
-  }
-
-  body #totalPnlBadge .pnl-value {
-    font-size: 11px !important;
-  }
-
   /* Main trade table becomes scan-friendly cards instead of a 14-column strip */
   body .table-container {
     border: 0 !important;

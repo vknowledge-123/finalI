@@ -4,7 +4,7 @@ import unittest
 from datetime import datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import httpx
 from cryptography.fernet import Fernet
@@ -41,6 +41,10 @@ def config(store, **extra):
 
 
 class FeatureApiTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(patch.object(main, '_is_test_mode', return_value=True))
+        self.enterContext(patch.object(main, '_admin_auth_enabled', return_value=False))
+
     def test_save_reload_encrypts_token_and_preserves_existing_secret(self):
         with TestClient(main.app) as client:
             main.store.encryption = EncryptionManager(Fernet.generate_key().decode())
@@ -185,7 +189,10 @@ class TelegramTests(unittest.IsolatedAsyncioTestCase):
         await self.service.poll_user(1, at)
         await self.service.poll_user(1, at)
         self.service.send.assert_awaited_once()
-        self.assertIn("Welcome dear traders", self.service.send.await_args.args[2])
+        from app.services.telegram_service import WELCOME_MESSAGE
+        self.assertEqual(self.service.send.await_args.args[2], WELCOME_MESSAGE)
+        self.assertIn("Good Morning Traders", WELCOME_MESSAGE)
+        self.assertIn("We do not provide stock tips", WELCOME_MESSAGE)
         restarted = TelegramService(lambda: self.store, self.ensure)
         restarted.send = AsyncMock(return_value=True)
         await restarted.poll_user(1, at)
@@ -223,13 +230,29 @@ class TelegramTests(unittest.IsolatedAsyncioTestCase):
         await self.service.poll_user(1, at)
         await self.service.poll_user(1, at)
         self.service.send.assert_awaited_once()
+
         self.assertIn("Entry: INR 100.00", self.service.send.await_args.args[2])
+        self.assertIn("Order Type: CNC delivery", self.service.send.await_args.args[2])
         self.assertEqual(await self.store.list_telegram_entries(1), [])
         await self.store.save_alert_config(1, dict(self.cfg, telegram_enabled=False))
         await self.store.queue_telegram_entry(1, dict(event, trade_id="T2"))
         await self.service.poll_user(1, at)
         self.assertEqual(await self.store.list_telegram_entries(1), [])
         self.service.send.assert_awaited_once()
+
+    async def test_trade_message_format_is_same_for_paper_and_live(self):
+        at = NOW.replace(hour=8)
+        for paper in (True, False):
+            event = {"trade_id": f"FORMAT-{paper}", "created_at": at.timestamp(), "alert_name": "feature test",
+                     "symbol": "AEQUS", "side": "BUY", "product": "MIS", "qty": 1,
+                     "entry": 259.89, "target": 262.49, "stop_loss": 258.59, "paper_trading": paper}
+            await self.store.queue_telegram_entry(1, event)
+            await self.service.poll_user(1, at)
+            self.assertEqual(self.service.send.await_args.args[2],
+                "PAPER TRADE\n\nstock name : AEQUS\n\nView: BUY\n\nOrder Type: MIS intraday\n\n"
+                "Entry: INR 259.89\n\nTarget: INR 262.49\n\nStop loss: INR 258.59\n\n"
+                "Filled quantity: 1\n\nStrategy: feature test")
+            self.assertEqual(event["paper_trading"], paper)
 
     async def test_failed_delivery_keeps_event_and_does_not_hot_loop(self):
         self.service.send.return_value = False
