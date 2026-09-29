@@ -52,13 +52,35 @@ async def _reconcile_position(store, registry: EngineRegistry, user_id: int, row
     local_qty = int(float(row.get("qty") or 0))
     if local_qty <= 0:
         return
+    if await store.acquire_lock(user_id, symbol, "exit", ttl_ms=5000) != 1:
+        return
+    try:
+        await _reconcile_locked_position(store, registry, user_id, symbol, row)
+    finally:
+        await store.release_lock(user_id, symbol, "exit")
+
+
+async def _reconcile_locked_position(store, registry, user_id, symbol, row):
+    current = await store.get_position(user_id, symbol)
+    if (not current or current.get("trade_id") != row.get("trade_id")
+            or str(current.get("paper_trading", False)).lower() in {"true", "1", "on"}
+            or current.get("status") not in {"OPEN", "EXIT_CONDITIONS_MET"}):
+        return
+    before = dict(current)
     engine = await registry.get(user_id)
-    broker_qty_signed = await engine._fetch_broker_symbol_qty(symbol, product=str(row.get("product") or "MIS"))
+    broker_qty_signed = await engine._fetch_broker_symbol_qty(symbol, product=str(before.get("product") or "MIS"))
     if broker_qty_signed is None:
         return
     current = await store.get_position(user_id, symbol)
-    if current and (current.get("trade_id") != row.get("trade_id") or current.get("paper_trading")):
+    # Quotes may change during the request, but a changed execution snapshot
+    # invalidates this reconciliation pass. Never revive an exited trade.
+    execution_fields = ("trade_id", "paper_trading", "status", "qty", "entry_price",
+                        "realized_pnl", "exit_order_id", "pyramid_last_order_id", "product", "side")
+    if not current or any(current.get(key) != before.get(key) for key in execution_fields):
         return
+    row.clear()
+    row.update(current)
+    local_qty = int(float(row.get("qty") or 0))
     broker_qty = abs(int(broker_qty_signed))
     expected_sign = -1 if str(row.get("side") or "BUY").upper() == "SELL" else 1
     if int(broker_qty_signed) * expected_sign < 0:
@@ -66,6 +88,14 @@ async def _reconcile_position(store, registry: EngineRegistry, user_id: int, row
         log.error("RECON_DIRECTION_MISMATCH | user=%s symbol=%s", user_id, symbol)
         return
     if broker_qty == local_qty:
+        return
+    if broker_qty > local_qty:
+        # The broker book is account-wide and can include manual trades.
+        # Do not enlarge an app-owned position using unrelated exposure.
+        row["pending_reason"] = f"BROKER_QTY_EXCESS:{local_qty}->{broker_qty}"
+        await store.upsert_position(user_id, symbol, row)
+        log.warning("RECON_QTY_EXCESS | user=%s symbol=%s local_qty=%s broker_qty=%s",
+                    user_id, symbol, local_qty, broker_qty)
         return
     if broker_qty <= 0:
         row.update(qty=0, status="CLOSED", exit_reason="BROKER_POSITION_CLOSED", updated_ts=time.time())

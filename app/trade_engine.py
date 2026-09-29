@@ -3328,6 +3328,11 @@ class TradeEngine:
 
             # Entry order updates
             if order_id and pos.entry_order_id and order_id == pos.entry_order_id:
+                # Confirmed fills are owned by the execution path. A delayed
+                # callback for the original order must not undo pyramiding or
+                # disable monitoring of a partially filled, cancelled entry.
+                if pos.status != "PENDING_ENTRY":
+                    return
                 pos.order_status = status
                 pos.entry_filled_qty = int(snapshot.get("filled_quantity") or pos.entry_filled_qty or 0)
                 pos.entry_remaining_qty = int(snapshot.get("remaining_quantity") or pos.entry_remaining_qty or 0)
@@ -3360,40 +3365,51 @@ class TradeEngine:
 
             # Exit order updates
             if order_id and pos.exit_order_id and order_id == pos.exit_order_id:
-                pos.order_status = status
-                pos.exit_filled_qty = int(snapshot.get("filled_quantity") or pos.exit_filled_qty or 0)
-                pos.exit_remaining_qty = int(snapshot.get("remaining_quantity") or pos.exit_remaining_qty or 0)
-                if status == "COMPLETE":
-                    pos.qty = 0
-                    pos.exit_remaining_qty = 0
-                    pos.status = "CLOSED"
-                    pos.pending_reason = ""
-                    pos.updated_ts = time.time()
-                    await self._persist_position_state(pos)
-                    await self.store.clear_open(self.user_id, symbol)
-                    self.positions.pop(symbol, None)
-                elif status == "PARTIAL":
-                    filled = int(snapshot.get("filled_quantity") or 0)
-                    remaining = int(snapshot.get("remaining_quantity") or 0)
-                    if remaining > 0:
-                        pos.qty = remaining
-                        pos.status = "OPEN"
-                    else:
-                        pos.qty = 0
-                        pos.status = "CLOSED"
-                    pos.pending_reason = f"EXIT_PARTIAL_FILL:{filled}/{filled + max(0, remaining)}"
-                    pos.updated_ts = time.time()
-                    await self._persist_position_state(pos)
-                    if pos.status == "CLOSED":
-                        await self.store.clear_open(self.user_id, symbol)
-                        self.positions.pop(symbol, None)
-                elif status in ("REJECTED", "CANCELLED"):
-                    pos.status = "ERROR"
-                    pos.exit_reason = f"EXIT_{status}"
-                    pos.updated_ts = time.time()
-                    await self._persist_position_state(pos)
+                # Normal exits apply aggregate fills (including retries) while
+                # holding this lock. Only recover an interrupted EXITING state.
+                if pos.status != "EXITING":
+                    return
+                if await self.store.acquire_lock(self.user_id, symbol, "exit", ttl_ms=5000) != 1:
+                    return
+                try:
+                    saved = await self.store.get_position(self.user_id, symbol)
+                    if saved and (saved.get("trade_id") != pos.trade_id or saved.get("status") != "EXITING"):
+                        return
+                    await self._recover_exit_update(pos, snapshot)
+                finally:
+                    await self.store.release_lock(self.user_id, symbol, "exit")
         except Exception as e:
             log.debug("ORDER_UPDATE_FAIL | user=%s err=%s data=%s", self.user_id, e, data)
+
+    async def _recover_exit_update(self, pos: Position, snapshot: Dict[str, Any]) -> None:
+        symbol = pos.symbol
+        status = str(snapshot.get("status") or "").upper()
+        filled = int(snapshot.get("filled_quantity") or 0)
+        price = float(snapshot.get("average_price") or 0)
+        # Do not mutate a position on a nonterminal snapshot; its fills can
+        # still change. Execution/reconciliation must settle that order first.
+        if status not in {"COMPLETE", "CANCELLED", "REJECTED"}:
+            return
+        if filled <= 0 or not math.isfinite(price) or price <= 0:
+            return
+        if filled > pos.qty:
+            await self.store.set_kill(self.user_id, True)
+            return
+        pos.realized_pnl += (price - pos.entry_price) * filled * (1 if pos.side == "BUY" else -1)
+        pos.qty -= filled
+        pos.exit_filled_qty += filled
+        pos.exit_remaining_qty = pos.qty
+        pos.order_status = status
+        pos.pnl = pos.realized_pnl + (float(pos.ltp or price) - pos.entry_price) * pos.qty * (1 if pos.side == "BUY" else -1)
+        pos.status = "OPEN" if pos.qty else "CLOSED"
+        pos.pending_reason = "EXIT_RECOVERED_PARTIAL" if pos.qty else ""
+        pos.updated_ts = time.time()
+        if not pos.qty:
+            pos.ltp = price
+        await self._persist_position_state(pos)
+        if not pos.qty:
+            await self.store.clear_open(self.user_id, symbol)
+            self.positions.pop(symbol, None)
 
     async def _book_partial_profit(self, pos: Position, target: str, requested_qty: int) -> bool:
         symbol = norm_symbol(pos.symbol)
@@ -3421,6 +3437,16 @@ class TradeEngine:
             if lk != 1:
                 return False
             lock_acquired = True
+
+            saved = await self.store.get_position(self.user_id, symbol)
+            if saved:
+                if saved.get("trade_id") != pos.trade_id or saved.get("status") != "OPEN":
+                    return False
+                for field in ("qty", "entry_price", "realized_pnl", "exit_filled_qty", booked_field, order_field):
+                    if field in saved:
+                        setattr(pos, field, saved[field])
+                if bool(getattr(pos, booked_field)):
+                    return True
 
             exit_qty = min(max(0, int(requested_qty)), max(0, int(pos.qty)))
             if target == "TP3":
@@ -3460,6 +3486,10 @@ class TradeEngine:
             )
             pos.realized_pnl += booked_pnl
             pos.qty = max(0, int(pos.qty) - actual_exit_qty)
+            mark_price = float(pos.ltp or exit_price)
+            pos.pnl = pos.realized_pnl + (mark_price - pos.entry_price) * pos.qty * (1 if pos.side == "BUY" else -1)
+            if pos.qty == 0:
+                pos.ltp = exit_price
             pos.exit_filled_qty = int(pos.exit_filled_qty or 0) + actual_exit_qty
             pos.exit_remaining_qty = max(0, exit_qty - actual_exit_qty)
             pos.updated_ts = time.time()
@@ -3574,7 +3604,18 @@ class TradeEngine:
             return False
 
         self._pyramid_inflight[symbol] = True
+        locked = False
         try:
+            if await self.store.acquire_lock(self.user_id, symbol, "exit", ttl_ms=5000) != 1:
+                return False
+            locked = True
+            saved = await self.store.get_position(self.user_id, symbol)
+            if saved and any(saved.get(key) != getattr(pos, key) for key in (
+                "trade_id", "status", "qty", "entry_price", "realized_pnl", "pyramid_add_count",
+            )):
+                return False
+            if await self.store.is_kill(self.user_id):
+                return False
             add_qty = int(pos.pyramid_base_qty)
             execution = await self._place_order_with_execution(
                 symbol,
@@ -3662,6 +3703,8 @@ class TradeEngine:
             return False
         finally:
             self._pyramid_inflight[symbol] = False
+            if locked:
+                await self.store.release_lock(self.user_id, symbol, "exit")
 
     # =========================
     # Tick ingestion + monitoring (HOT PATH)
@@ -4486,6 +4529,9 @@ class TradeEngine:
                         return
                     if saved:
                         pos.qty = max(0, int(saved.get("qty") or 0))
+                        for field in ("entry_price", "realized_pnl", "exit_filled_qty"):
+                            if field in saved:
+                                setattr(pos, field, saved[field])
                         if pos.qty == 0:
                             return
                 pos.status = "EXITING"
@@ -4527,11 +4573,14 @@ class TradeEngine:
                     pos.order_status = str(execution.status or "COMPLETE")
                     pos.updated_ts = time.time()
 
-                    if pos.paper_trading:
-                        fill_price = float(execution.avg_price)
-                        pos.realized_pnl += (fill_price - pos.entry_price) * filled_exit_qty * (1 if pos.side == "BUY" else -1)
+                    fill_price = float(execution.avg_price or execution.ltp or pos.ltp)
+                    direction = 1 if pos.side == "BUY" else -1
+                    pos.realized_pnl += (fill_price - pos.entry_price) * filled_exit_qty * direction
+                    remaining_qty = max(0, requested_exit_qty - filled_exit_qty)
+                    mark_price = float(pos.ltp or fill_price)
+                    pos.pnl = pos.realized_pnl + (mark_price - pos.entry_price) * remaining_qty * direction
+                    if remaining_qty == 0:
                         pos.ltp = fill_price
-                        pos.pnl = pos.realized_pnl
 
                     if filled_exit_qty < requested_exit_qty:
                         pos.qty = max(0, requested_exit_qty - filled_exit_qty)
